@@ -1,0 +1,1 @@
+return num_cells, [(int(prop.centroid[1]), int(prop.centroid[0])) for prop in props]

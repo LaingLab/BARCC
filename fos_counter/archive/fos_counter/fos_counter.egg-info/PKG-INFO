@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: fos_counter
+Version: 0.1.2
+Summary: A package to count fluorescent FOS-positive cells in grayscale images and annotate them.
+Author: Grok
+License: MIT
+Requires-Dist: numpy
+Requires-Dist: scikit-image
+Requires-Dist: Pillow
+Requires-Dist: scipy
+Dynamic: author
+Dynamic: license
+Dynamic: requires-dist
+Dynamic: summary
