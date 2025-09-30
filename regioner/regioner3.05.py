@@ -4,9 +4,9 @@ import tkinter as tk
 from tkinter import filedialog as fd
 from tkinter import ttk, messagebox, simpledialog
 import numpy as np
-from scipy.ndimage import binary_dilation, binary_erosion, label, gaussian_filter, binary_closing
 from skimage import filters, morphology, measure, util, feature, segmentation, color
-from scipy import ndimage as ndi
+from skimage.morphology import binary_closing
+from scipy.ndimage import distance_transform_edt
 import pandas as pd
 import copy
 #temp for print(X, file=sys.stderr) debug checking
@@ -370,10 +370,10 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
             self.zone_counters = {}
             self.zone_names = {}
             self.show_page()
-            #temp: page.rect.{width, height} does not output 1200 as expected, is this because the overall window is 1200x1200 and those variables are only denoting the "workable space" where we can put a picture. (total space - top and bottom bar - scroll bars etc...)
-            print("pw ", pw, file=sys.stderr)
-            print("ph ", ph, file=sys.stderr)
-            print("self.zoom ", self.zoom, file=sys.stderr)
+            # temp: page.rect.{width, height} does not output 1200 as expected, is this because the overall window is 1200x1200 and those variables are only denoting the "workable space" where we can put a picture. (total space - top and bottom bar - scroll bars etc...)
+            # print("pw ", pw, file=sys.stderr)
+            # print("ph ", ph, file=sys.stderr)
+            # print("self.zoom ", self.zoom, file=sys.stderr)
 
     def load_page_image(self):
         if self.doc:
@@ -518,7 +518,7 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
         binary = morphology.remove_small_objects(binary, min_size=20)
         
         # Distance transform for watershed
-        distance = ndi.distance_transform_edt(binary)
+        distance = distance_transform_edt(binary)
         
         # Find local maxima as markers (adjust min_distance for cell spacing in fluorescent images)
         coords = feature.peak_local_max(distance, min_distance=5, exclude_border=True)
