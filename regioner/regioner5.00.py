@@ -310,7 +310,8 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
         self.photo = ImageTk.PhotoImage(img)
         self.output.delete("all")
         if self.background_image:
-            self.background_photo = ImageTk.PhotoImage(self.background_image)
+            display_bg = self.adjust_image(self.background_image)
+            self.background_photo = ImageTk.PhotoImage(display_bg)
             self.output.create_image(0, 0, image=self.background_photo, anchor='nw')
         self.output.create_image(self.img_x, self.img_y, image=self.photo, anchor='nw')
         self.output.config(scrollregion=self.output.bbox(tk.ALL))
