@@ -2,7 +2,7 @@
 import fitz
 import tkinter as tk
 from tkinter import filedialog as fd, ttk, messagebox, simpledialog
-from PIL import Image, ImageTk, ImageDraw, ImageFont
+from PIL import Image, ImageTk, ImageDraw, ImageFont, ImageEnhance
 import numpy as np
 import copy
 from skimage import filters, morphology, measure, util, feature, segmentation, color
