@@ -887,12 +887,17 @@ def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_
     else:
         img2d = bg_arr.astype(float) / 255.0
     intensity = util.img_as_float(img2d)
-    intensity = filters.gaussian(intensity, sigma=2.0)
+    print("intensity: ", intensity, file=sys.stderr)
+    intensity = filters.gaussian(intensity, sigma=1.0)
+    print("intensity: ", intensity, file=sys.stderr)
     thresh = filters.threshold_otsu(intensity)
+    print("thresh: ", thresh, file=sys.stderr)
 
     # implements the sensitivity for cell detection
-    multiplier = 2.0 - (sensitivity / 100.0) * 1.5  # 2.0 at 0, 0.5 at 100
+    multiplier = 1.1 - (sensitivity / 100.0) * 0.2  # 1.1 at 0, 0.9 at 100
+    print("multiplier: ", multiplier, file=sys.stderr)
     effective_thresh = thresh * multiplier
+    print("effective_thresh: ", effective_thresh, file=sys.stderr)
     binary = intensity > effective_thresh
 
     # Remove small objects (adjust min_size based on image resolution/cell size, e.g., for small fluorescent spots)
@@ -952,6 +957,9 @@ def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_
     except Exception:
         font = ImageFont.load_default()
 
+# and this
+    binary = Image.fromarray(binary)
+    binary = binary.convert('RGBA')
 
     for i, prop in enumerate(filtered_props, start=1):
         r, c = prop.centroid
@@ -963,7 +971,9 @@ def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_
         zone_list.append(name)
         count_list.append(counts[zid])
     df = pd.DataFrame({'Zone': zone_list, 'Cell_Count': count_list})
-    return annotated, df, counts
+#   return annotated, df, counts
+# This is just for testing, remove all of this before moving on
+    return binary, df, counts
 
 
 
