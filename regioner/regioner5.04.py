@@ -24,8 +24,8 @@ class PDFViewer:
         self.master = self.root
         self.master.bind('<q>', self.quit)
         self.master.title('Regional IF Analyzer')
-#       self.master.geometry('%dx%d' % (self.master.winfo_screenwidth(), self.master.winfo_screenheight()))
-        self.master.geometry('1200x1200')
+        self.master.geometry('%dx%d' % (self.master.winfo_screenwidth(), self.master.winfo_screenheight()))
+#       self.master.geometry('1200x1200')
         self.master.resizable(True, True)
         self.master.rowconfigure(0, weight=1)
         self.master.rowconfigure(1, weight=0)
@@ -62,7 +62,7 @@ class PDFViewer:
         self.undo_stack = self.state_manager.undo_stack  # just access if needed, use methods
 
         # Paint variables
-        self.DEFAULT_PEN_SIZE = 5.0
+        self.DEFAULT_PEN_SIZE = 3.0
         self.DEFAULT_COLOR = 'black'
 
         # Crop / edit variables
@@ -240,7 +240,7 @@ class PDFViewer:
         # Hides background
         self.output.itemconfig(self.bg_photo_id, state='hidden')
         # Captures the drawing
-#       self.output.postscript(file='test.ps', colormode='color')
+        self.output.postscript(file='test.ps', colormode='color')
         ps = self.output.postscript(colormode='color')
         # Shows background
         self.output.itemconfig(self.bg_photo_id, state='normal')
@@ -250,10 +250,19 @@ class PDFViewer:
         img = draw.convert(mode='RGBA') 
         # Processes and sets photo to be displayed
         self.img = self.img_white_to_transparent(img)
+        print(img.width, file=sys.stderr)
+        print(img.height, file=sys.stderr)
+        print(self.img.width, file=sys.stderr)
+        print(self.img.height, file=sys.stderr)
         self.photo = ImageTk.PhotoImage(self.img)
         self.atlas_filetype = 'img'
         # Removes the drawing from the canvas
         self.output.delete('paint')
+
+
+        # READ HERE
+        # The painting scale issue is due to the cavas.postscript() method using 96 dpi as the default instead of 72 dpi, SO we have to scale the image after converting it to img so it displays "at scale"
+        # https://stackoverflow.com/questions/53509131/tkinter-saving-canvas-at-wrong-scale
 
     def use_pen(self):
         self.activate_button(self.pen_button)
@@ -386,19 +395,12 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
             page = self.pdf_handler.doc[0]
             pw = page.rect.width
             ph = page.rect.height
-            ww = 1200
-            wh = 1200
-            print(pw, file=sys.stderr)
-            print(ph, file=sys.stderr)
-            print(ph, file=sys.stderr)
-            print(self.output.coords(self.output), file=sys.stderr)
-            # ww and wh are hardcoded and not based on the size of the canvas, causing improper scaling
-            # Use something like self.output.winfo_width() and self.output.winfo_height()
-            # Or self.output.winfo_reqwidth() and self.output.winfo_reqheight()
+            ww = self.output.winfo_width()
+            wh = self.output.winfo_height()
             try:
                 self.zoom = min(ww / pw, wh / ph)
             except Exception:
-                self.zoom = 4.0
+                self.zoom = 1.0
             self.current_page = 0
             self.page_images = {}
             self.mask_images = {}
@@ -606,7 +608,7 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
             else:
                 bg_RGBA = bg.convert('RGBA')
 
-            ww, wh = self.master.winfo_width(), self.master.winfo_height() - self.bottom_frame.winfo_height()
+            ww, wh = self.output.winfo_width(), self.output.winfo_height()
             bw, bh = bg_RGBA.size
             scale = min(ww / bw, wh / bh)
             new_size = (int(bw * scale), int(bh * scale))
