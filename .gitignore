@@ -7,3 +7,8 @@ regioner/test/
 
 # collection of thoughts
 NOTES
+
+
+# Data
+*.jpg
+regioner/Data/
