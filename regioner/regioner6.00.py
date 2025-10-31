@@ -21,7 +21,10 @@ import sys
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    # level=logging.INFO,       # For normal operations and major steps
+    # level=logging.WARNING,    # For recoverable errors
+    level=logging.DEBUG,        # For detailed operational information
+    # level=logging.ERROR,      # For critical issues
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
