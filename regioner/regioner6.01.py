@@ -579,6 +579,24 @@ class PDFViewer:
         threshold_menu.pack(pady=5)
 
         # Cell detection
+        def create_setter(entry_widget, config_obj, attr_name):
+            def setter(event):
+                val = entry_widget.get()
+                try:
+                    current_type = type(getattr(config_obj, attr_name))
+                    if current_type == int:
+                        val = int(val)
+                    elif current_type == float:
+                        val = float(val)
+                    setattr(config_obj, attr_name, val)
+                    logger.debug(f"Successfully set {attr_name} to {val}")
+                except ValueError as e:
+                    logger.error(f"Invalid input for {attr_name}: {e}")
+                    messagebox.showerror("Invalid Input", 
+                                       f"Please enter a valid {current_type.__name__} for {attr_name}.")
+            return setter
+
+        # Cell detection settings
         for attr, value in self.image_processor.cell_config.__dict__.items():
             if attr == 'threshold_method':
                 continue  # Skip threshold_method as it's handled separately
@@ -588,24 +606,14 @@ class PDFViewer:
             entry = ttk.Entry(frame)
             entry.insert(0, str(value))
             entry.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+            
+            # Create unique setter for this entry
+            setter = create_setter(entry, self.image_processor.cell_config, attr)
+            entry.bind("<FocusOut>", setter)
+            # Also bind Return key for better UX
+            entry.bind("<Return>", setter)
 
-            def create_setter(attr_name):
-                def setter(event):
-                    val = entry.get()
-                    try:
-                        current_type = type(getattr(self.image_processor.cell_config, attr_name))
-                        if current_type == int:
-                            val = int(val)
-                        elif current_type == float:
-                            val = float(val)
-                        setattr(self.image_processor.cell_config, attr_name, val)
-                    except ValueError:
-                        messagebox.showerror("Invalid Input", f"Please enter a valid {current_type.__name__} for {attr_name}.")
-                return setter
-
-            entry.bind("<FocusOut>", create_setter(attr))
-
-        # Preprocessing
+        # Preprocessing settings
         for attr, value in self.image_processor.preprocess_config.__dict__.items():
             frame = ttk.Frame(settings_win)
             frame.pack(pady=5, fill=tk.X, padx=10)
@@ -613,22 +621,12 @@ class PDFViewer:
             entry = ttk.Entry(frame)
             entry.insert(0, str(value))
             entry.pack(side=tk.RIGHT, fill=tk.X, expand=True)
-
-            def create_setter(attr_name):
-                def setter(event):
-                    val = entry.get()
-                    try:
-                        current_type = type(getattr(self.image_processor.preprocess_config, attr_name))
-                        if current_type == int:
-                            val = int(val)
-                        elif current_type == float:
-                            val = float(val)
-                        setattr(self.image_processor.preprocess_config, attr_name, val)
-                    except ValueError:
-                        messagebox.showerror("Invalid Input", f"Please enter a valid {current_type.__name__} for {attr_name}.")
-                return setter
-
-            entry.bind("<FocusOut>", create_setter(attr))
+            
+            # Create unique setter for this entry
+            setter = create_setter(entry, self.image_processor.preprocess_config, attr)
+            entry.bind("<FocusOut>", setter)
+            # Also bind Return key for better UX
+            entry.bind("<Return>", setter)
 
 
 
