@@ -2,6 +2,7 @@
 import fitz
 import tkinter as tk
 from tkinter import filedialog as fd, ttk, messagebox, simpledialog, Toplevel
+import functools
 from PIL import Image, ImageTk, ImageDraw, ImageFont, ImageEnhance
 import numpy as np
 import copy
@@ -18,12 +19,13 @@ import io
 import logging
 import yaml
 import sys
+import gc
 
 # Configure logging
 logging.basicConfig(
-    # level=logging.INFO,       # For normal operations and major steps
+    level=logging.INFO,       # For normal operations and major steps
     # level=logging.WARNING,    # For recoverable errors
-    level=logging.DEBUG,        # For detailed operational information
+    # level=logging.DEBUG,        # For detailed operational information
     # level=logging.ERROR,      # For critical issues
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
@@ -86,9 +88,16 @@ class ImageProcessor:
                 try:
                     config = yaml.safe_load(f)
                     if 'cell_detection' in config:
-                        for key, value in config['cell_detection'].items():
+                        cell_config = config['cell_detection']
+                        # Handle threshold_method specially
+                        if 'threshold_method' in cell_config:
+                            threshold_value = cell_config['threshold_method']
+                            cell_config['threshold_method'] = ThresholdMethod(threshold_value)
+                        
+                        for key, value in cell_config.items():
                             if hasattr(self.cell_config, key):
                                 setattr(self.cell_config, key, value)
+                                
                     if 'preprocessing' in config:
                         for key, value in config['preprocessing'].items():
                             if hasattr(self.preprocess_config, key):
@@ -99,8 +108,12 @@ class ImageProcessor:
     def save_config(self):
         """Save current configuration to file"""
         try:
+            # Convert enum to string before saving
+            cell_config_dict = self.cell_config.__dict__.copy()
+            cell_config_dict['threshold_method'] = self.cell_config.threshold_method.value
+            
             config = {
-                'cell_detection': self.cell_config.__dict__,
+                'cell_detection': cell_config_dict,
                 'preprocessing': self.preprocess_config.__dict__
             }
             with open("regioner_config.yaml", 'w') as f:
@@ -251,8 +264,9 @@ class ImageProcessor:
 def clear_preprocess_cache():
     _PREPROCESS_CACHE.clear()
 
+@functools.lru_cache(maxsize=8)
 def binary_mask_cell_count(background_pil, sensitivity):
-    """Enhanced cell detection using ImageProcessor class"""
+    """Enhanced cell detection using ImageProcessor class with caching"""
     processor = ImageProcessor()
     img, labels = processor.detect_cells(background_pil, sensitivity)
     return img, labels > 0
@@ -262,6 +276,28 @@ class PDFViewer:
         logger.info("Initializing PDFViewer")
         self.root = tk.Tk()
         self.master = self.root
+        
+    def _reset_state(self):
+        """Reset application state variables"""
+        self.img_x = 0
+        self.img_y = 0
+        self.current_page = 0
+        self.zone_counters = {}
+        self.zone_names = {}
+        self.last_df = None
+        
+    def _clear_memory(self):
+        """Clear cached images and large objects"""
+        clear_preprocess_cache()
+        if hasattr(self, 'doc') and self.doc:
+            self.doc.close()
+        self.background_image = None
+        self.original_background = None
+        self.img = None
+        self.atlas_filetype = None
+        self.doc = None
+        self.page_images = {}
+        self.mask_images = {}
         self.master.bind('<q>', self.quit)
         self.master.title('Regional IF Analyzer')
         self.master.geometry('%dx%d' % (self.master.winfo_screenwidth(), self.master.winfo_screenheight()))
@@ -397,7 +433,8 @@ class PDFViewer:
         # Paint buttons
         ttk.Button(self.right_frame, text="Start Paint", command=self.start_paint).grid(row=3, column=0, pady=5)
         ttk.Button(self.right_frame, text="Stop Paint", command=self.stop_paint).grid(row=4, column=0, pady=5)
-        ttk.Button(self.right_frame, text="Show Mask", command=self.show_cell_mask_threshold).grid(row=6, column=0, pady=5)
+        ttk.Button(self.right_frame, text="Show Mask", command=self.show_cell_mask_threshold).grid(row=5, column=0, pady=5)
+        ttk.Button(self.right_frame, text="Show Mask Settings", command=self.show_mask_settings).grid(row=6, column=0, pady=5)
 
     def _build_control_buttons(self):
         # Crop Button
@@ -520,6 +557,84 @@ class PDFViewer:
     def reset(self, event):
         self.old_x, self.old_y = None, None
 
+    def show_mask_settings(self):
+        settings_win = Toplevel(self.master)
+        settings_win.title("Mask Settings")
+        # settings_win.geometry("400x400")
+
+        # Add settings widgets here
+        ttk.Label(settings_win, text="Cell Detection Settings").pack(pady=10)
+
+        # Example: Threshold Method
+        ttk.Label(settings_win, text="Threshold Method:").pack(pady=5)
+        threshold_var = tk.StringVar(value=self.image_processor.cell_config.threshold_method.value)
+        threshold_menu = ttk.OptionMenu(settings_win, threshold_var, self.image_processor.cell_config.threshold_method.value,
+                                        *[method.value for method in ThresholdMethod])
+        threshold_menu.pack(pady=5)
+
+        # Cell detection
+        for attr, value in self.image_processor.cell_config.__dict__.items():
+            if attr == 'threshold_method':
+                continue  # Skip threshold_method as it's handled separately
+            frame = ttk.Frame(settings_win)
+            frame.pack(pady=5, fill=tk.X, padx=10)
+            ttk.Label(frame, text=f"{attr.replace('_', ' ').title()}:").pack(side=tk.LEFT)
+            entry = ttk.Entry(frame)
+            entry.insert(0, str(value))
+            entry.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+
+            def create_setter(attr_name):
+                def setter(event):
+                    val = entry.get()
+                    try:
+                        current_type = type(getattr(self.image_processor.cell_config, attr_name))
+                        if current_type == int:
+                            val = int(val)
+                        elif current_type == float:
+                            val = float(val)
+                        setattr(self.image_processor.cell_config, attr_name, val)
+                    except ValueError:
+                        messagebox.showerror("Invalid Input", f"Please enter a valid {current_type.__name__} for {attr_name}.")
+                return setter
+
+            entry.bind("<FocusOut>", create_setter(attr))
+
+        # Preprocessing
+        for attr, value in self.image_processor.preprocess_config.__dict__.items():
+            frame = ttk.Frame(settings_win)
+            frame.pack(pady=5, fill=tk.X, padx=10)
+            ttk.Label(frame, text=f"{attr.replace('_', ' ').title()}:").pack(side=tk.LEFT)
+            entry = ttk.Entry(frame)
+            entry.insert(0, str(value))
+            entry.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+
+            def create_setter(attr_name):
+                def setter(event):
+                    val = entry.get()
+                    try:
+                        current_type = type(getattr(self.image_processor.preprocess_config, attr_name))
+                        if current_type == int:
+                            val = int(val)
+                        elif current_type == float:
+                            val = float(val)
+                        setattr(self.image_processor.preprocess_config, attr_name, val)
+                    except ValueError:
+                        messagebox.showerror("Invalid Input", f"Please enter a valid {current_type.__name__} for {attr_name}.")
+                return setter
+
+            entry.bind("<FocusOut>", create_setter(attr))
+
+        def save_settings():
+            self.image_processor.cell_config.threshold_method = ThresholdMethod(threshold_var.get())
+            self.image_processor.save_config()
+            settings_win.destroy()
+
+        def load_settings():
+            self.image_processor.load_config()
+
+        ttk.Button(settings_win, text="Save", command=save_settings).pack(pady=5)
+        ttk.Button(settings_win, text="Load", command=load_settings).pack(pady=5)
+
     def update_brightness(self, value):
         self.brightness = float(value)
         self.show_page()
@@ -605,16 +720,35 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
                 self.zone_names[self.current_page] = {}
             return self.page_images[self.current_page]
 
-    def show_page(self):
+    def show_page(self, mask=None):
         img = self.load_page_image() or Image.new('RGBA', (1, 1), (0, 0, 0, 0))
         self.photo = ImageTk.PhotoImage(img)
         self.output.delete("all")
+        
         if self.background_image:
+            # Display original image on the left
             display_bg = self.adjust_image(self.background_image)
             self.background_photo = ImageTk.PhotoImage(display_bg)
-            self.bg_photo_id = self.output.create_image(0, 0, image=self.background_photo, anchor='nw')
-        self.output.create_image(self.img_x, self.img_y, image=self.photo, anchor='nw')
+            self.bg_photo_id = self.output.create_image(0, 0, 
+                                                       image=self.background_photo, 
+                                                       anchor='nw')
+            
+            # If mask exists, display it on the right
+            if mask is not None:
+                self.mask_photo = ImageTk.PhotoImage(mask)
+                offset_x = display_bg.width + 10  # 10 pixels spacing
+                self.mask_photo_id = self.output.create_image(offset_x, 0, 
+                                                             image=self.mask_photo, 
+                                                             anchor='nw')
+                
+        # Display atlas overlay
+        self.output.create_image(self.img_x, self.img_y, 
+                               image=self.photo, 
+                               anchor='nw')
+        
+        # Update scroll region to include both images
         self.output.config(scrollregion=self.output.bbox(tk.ALL))
+
 
     def img_white_to_transparent(self, img):
         img_array = np.array(img)
@@ -651,12 +785,20 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
             self.show_page()
 
     def import_tiff(self):
+        """Import and process TIFF image with enhanced error handling"""
         logger.info("Opening file dialog for TIFF selection")
-        tiff_path = fd.askopenfilename(filetypes=[("TIFF files", "*.tiff *.tif")])
-        if tiff_path:
+        try:
+            tiff_path = fd.askopenfilename(filetypes=[("TIFF files", "*.tiff *.tif")])
+            if not tiff_path:
+                return
+                
             logger.info(f"Opening TIFF file: {tiff_path}")
+            if not os.path.exists(tiff_path):
+                raise FileNotFoundError(f"Selected file does not exist: {tiff_path}")
+                
             self.tiff_filename = os.path.splitext(os.path.basename(tiff_path))[0]
-            bg = Image.open(tiff_path)
+            try:
+                bg = Image.open(tiff_path)
             array = np.array(bg)
             if array.ndim == 2 or (array.ndim == 3 and array.shape[2] == 1):
                 array = np.squeeze(array)
@@ -975,14 +1117,37 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
             messagebox.showinfo("Cell Counts", f"Cell counts per zone: {dict(zip(df['Zone'], df['Cell_Count']))}")
 
     def show_cell_mask_threshold(self):
-        _, binary = binary_mask_cell_count(
-            self.original_background,
+        # Convert to grayscale if image is RGB/RGBA
+        background = self.original_background
+        if background.mode in ['RGB', 'RGBA']:
+            background = background.convert('L')
+            
+        img2d, binary = binary_mask_cell_count(
+            background,
             self.sensitivity_slider.get()
         )
-        binary = Image.fromarray(binary)
-        binary = binary.convert('RGBA')
-        self.background_image = binary
-        self.show_page()
+        
+        # Convert original background to RGB
+        original_rgb = self.original_background.convert('RGB')
+        vis_array = np.array(original_rgb)
+        
+        # Create cell overlay - red cells with 50% transparency
+        cell_overlay = np.zeros((*binary.shape, 3), dtype=np.uint8)
+        cell_overlay[binary] = [255, 0, 0]  # Red for detected cells
+        
+        # Blend the cell overlay with the original image
+        alpha = 0.5  # 50% transparency
+        vis_array[binary] = (
+            (1 - alpha) * vis_array[binary] + 
+            alpha * cell_overlay[binary]
+        ).astype(np.uint8)
+        
+        # Convert to PIL Image and ensure it matches the background size
+        mask_img = Image.fromarray(vis_array)
+        mask_img = mask_img.resize(self.original_background.size, Image.NEAREST)
+        
+        # Keep original background image and show mask alongside it
+        self.show_page(mask=mask_img)
 
     def next_image(self):
         logger.info("Processing next image")
@@ -999,19 +1164,10 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
         if self.last_df is not None:
             self.last_df.to_excel(excel_path, index=False)
 
-        clear_preprocess_cache()
-        self.background_image = None
-        self.original_background = None
-        self.img = None
-        self.atlas_filetype = None
-        self.doc = None
-        self.page_images = {}
-        self.mask_images = {}
-        self.zone_counters = {}
-        self.zone_names = {}
-        self.last_df = None
-        self.img_x = 0
-        self.img_y = 0
+        # Clear memory and reset state
+        self._reset_state()
+        self._clear_memory()
+        gc.collect()  # Force garbage collection
 
         self.show_page()
         messagebox.showinfo("Next Image", f"Autosaved image to {image_path}\nAutosaved counts to {excel_path}" if self.last_df is not None else f"Autosaved image to {image_path}")

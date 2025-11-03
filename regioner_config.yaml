@@ -1,0 +1,28 @@
+cell_detection:
+  adaptive_block_size: 101
+  base_multiplier: 1.1
+  circularity_threshold: 0.7
+  local_radius: 15
+  manual_threshold: 0.5
+  max_cell_size: 100
+  min_cell_size: 20
+  min_peak_distance: 5
+  peak_min_intensity: 0.1
+  sensitivity_range: 0.2
+  threshold_method: otsu
+  watershed_compactness: 0.0
+preprocessing:
+  background_method: tophat
+  ball_radius: 15
+  bilateral_sigma_color: 0.1
+  bilateral_sigma_space: 1.0
+  clahe_clip_limit: 2.0
+  clahe_kernel: 8
+  contrast_method: stretch
+  denoise_method: gaussian
+  enhance_method: unsharp_mask
+  gamma: 1.0
+  gaussian_sigma: 1.0
+  median_kernel: 3
+  unsharp_amount: 2.0
+  unsharp_radius: 1.0
