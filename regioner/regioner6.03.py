@@ -366,6 +366,7 @@ class PDFViewer:
         # Create File menu dropdown
         filemenu = tk.Menu(self.menu)
         self.menu.add_cascade(label="File", menu=filemenu)
+        filemenu.add_command(label="Next Image", command=self.next_image)
         filemenu.add_command(label="Import Atlas Section", command=self.open_file)
         filemenu.add_command(label="Save Flattened Image", command=self.save_flattened_image)
         filemenu.add_command(label="Help", command=self.show_help)
@@ -374,30 +375,77 @@ class PDFViewer:
         # Create Edit menu dropdown
         editmenu = tk.Menu(self.menu)
         self.menu.add_cascade(label="Edit", menu=editmenu)
-            # Put misc/visual things in here (brightness, save pictures, save paint)
+            # Add save paint command and create toplevels with widgets
+        editmenu.add_command(label="Brightness", command=self.show_brightness_settings)
+        editmenu.add_command(label="Save Picture", command=self.save_flattened_image)
+        # editmenu.add_command(label="Save Paint", command=print("Save Paint", file=sys.stderr))
 
         # Create Atlas menu dropdown
         atlasmenu = tk.Menu(self.menu)
         self.menu.add_cascade(label="Atlas", menu=atlasmenu)
-            # Put all atlas manipulation functions in here (crop, move, rotate, scale)
+        atlasmenu.add_command(label="Crop", command=self.toggle_crop_mode)
+        atlasmenu.add_command(label="Move", command=self.toggle_edit_mode)
+        atlasmenu.add_command(label="Rotate", command=self.show_rotate_settings)
+        atlasmenu.add_command(label="Scale", command=self.show_scale_settings)
         
-        self.menu.add_separator()
         # Create Paint menu dropdown
         paintmenu = tk.Menu(self.menu)
         self.menu.add_cascade(label="Paint", menu=paintmenu)
             # All paint functions (start, stop, pen, eraser, brushsize)
+        paintmenu.add_command(label="Start Paint", command=self.start_paint)
+        paintmenu.add_command(label="Stop Paint", command=self.stop_paint)
+        paintmenu.add_command(label="Pen", command=self.use_pen)
+        paintmenu.add_command(label="Eraser", command=self.use_eraser)
+        # Spawn new windows with widgets
+        # paintmenu.add_command(label="Brushsize", command=lambda: print('Brushsize', file=sys.stderr))
         
         # Create Mask menu dropdown
         maskmenu = tk.Menu(self.menu)
         self.menu.add_cascade(label="Mask", menu=maskmenu)
-            # All mask functions (mask settings, show mask, add cell, remove cell, finish mask edit)
+        maskmenu.add_command(label="Show Mask", command=self.show_cell_mask_threshold)
+        maskmenu.add_command(label="Show Mask Settings", command=self.show_mask_settings)
+        maskmenu.add_command(label="Add Cell", command=self.start_add_cells)
+        maskmenu.add_command(label="Remove Cell", command=self.start_remove_cells)
+        maskmenu.add_command(label="Finish Mask Edit", command=self.stop_mask_edit)
+        maskmenu.add_command(label="Sensitivity", command=self.show_sensitivity_settings)
 
         # Create Cell menu dropdown
         cellmenu = tk.Menu(self.menu)
         self.menu.add_cascade(label="Cell", menu=cellmenu)
             # This might turn into a command that counts the cells
-        
 
+        # Add highlight regions button to manually enable this
+
+        # This works as a labeling scheme, but how do I have it update?
+        # self.menu.add_command(label="Pen: "+str(self.choose_size_button.get()))
+
+        # Frames
+        self.top_frame = ttk.Frame(self.master)
+        self.top_frame.grid(row=0, column=0, sticky='nsew')
+        self.top_frame.rowconfigure(0, weight=1)
+        self.top_frame.columnconfigure(0, weight=1)
+
+        # Scrollbars and canvas
+        self.scrolly = ttk.Scrollbar(self.top_frame, orient=tk.VERTICAL)
+        self.scrolly.grid(row=0, column=1, sticky='ns')
+        self.scrollx = ttk.Scrollbar(self.top_frame, orient=tk.HORIZONTAL)
+        self.scrollx.grid(row=1, column=0, sticky='ew')
+
+        self.output = tk.Canvas(self.top_frame, bg='#ECE8F3')
+        self.output.configure(yscrollcommand=self.scrolly.set, xscrollcommand=self.scrollx.set)
+        self.output.grid(row=0, column=0, sticky='nsew')
+        self.scrolly.configure(command=self.output.yview)
+        self.scrollx.configure(command=self.output.xview)
+
+        
+        # Bind click event for highlighting
+        self.output.bind("<Button-1>", self.highlight_region)
+
+        # Keyboard shortcuts
+        self.master.bind('<Control-z>', self._undo_event)
+        self.master.bind('<Control-s>', self.save_flattened_image)
+
+    def neverCallingThisFunction():
         # Frames
         self.top_frame = ttk.Frame(self.master)
         self.top_frame.grid(row=0, column=0, sticky='nsew')
@@ -602,33 +650,81 @@ class PDFViewer:
     def reset(self, event):
         self.old_x, self.old_y = None, None
 
+
+    def show_scale_settings(self):
+        scale_win = Toplevel(self.master)
+        scale_win.title("Scale Settings")
+        scale_win.attributes('-topmost', 'true')
+        # Scale controls
+        self.scale_label = ttk.Label(scale_win, text="Scale:")
+        self.scale_label.pack(side=tk.LEFT, padx=10, pady=10)
+        self.scale_entry = ttk.Entry(scale_win, width=10)
+        self.scale_entry.pack(side=tk.LEFT, padx=5, pady=10)
+        # Resize buttons
+        ttk.Button(scale_win, text="Resize", command=self.resize_custom).pack(side=tk.LEFT, padx=8, pady=8)
+        ttk.Button(scale_win, text="Resize X", command=self.resize_x).pack(side=tk.LEFT, padx=8, pady=8)
+        ttk.Button(scale_win, text="Resize Y", command=self.resize_y).pack(side=tk.LEFT, padx=8, pady=8)
+
+    def show_rotate_settings(self):
+        rotate_win = Toplevel(self.master)
+        rotate_win.title("Rotate Settings")
+        rotate_win.attributes('-topmost', 'true')
+        self.rotation_label = ttk.Label(rotate_win, text="Rotate (degrees):")
+        self.rotation_label.pack(side=tk.LEFT, padx=10, pady=10)
+        self.rotation_entry = ttk.Entry(rotate_win, width=10)
+        self.rotation_entry.pack(side=tk.LEFT, padx=5, pady=10)
+        ttk.Button(rotate_win, text="Rotate", command=self.rotate_custom).pack(side=tk.LEFT, padx=10, pady=10)
+
+    def show_brightness_settings(self):
+        brightness_win = Toplevel(self.master)
+        brightness_win.title("Brightness Settings")
+        brightness_win.attributes('-topmost', 'true')
+        self.brightness_label = ttk.Label(brightness_win, text="Brightness:")
+        self.brightness_label.pack(side=tk.LEFT, padx=8, pady=8)
+        self.brightness_slider = ttk.Scale(brightness_win, from_=-100, to=400, orient=tk.HORIZONTAL, command=self.update_brightness)
+        self.brightness_slider.pack(side=tk.LEFT, padx=4, pady=8)
+        self.brightness_slider.set(0)
+
+    def show_sensitivity_settings(self):
+        sensitivity_win = Toplevel(self.master)
+        sensitivity_win.title("Sensitivity Settings")
+        sensitivity_win.attributes('-topmost', 'true')
+        self.sensitivity_label = ttk.Label(sensitivity_win, text="Sensitivity:")
+        self.sensitivity_label.pack(side=tk.LEFT, padx=8, pady=8)
+        self.sensitivity_var = tk.IntVar(value=50)
+        self.sensitivity_slider = tk.Scale(sensitivity_win, from_=0, to=100, orient=tk.HORIZONTAL, variable=self.sensitivity_var)
+        self.sensitivity_slider.pack(side=tk.LEFT, padx=4, pady=8)
+        self.sensitivity_value_entry = ttk.Entry(sensitivity_win, textvariable=self.sensitivity_var, width=4)
+        self.sensitivity_value_entry.pack(side=tk.LEFT, padx=4, pady=8)
+
     def show_mask_settings(self):
-        settings_win = Toplevel(self.master)
-        settings_win.title("Mask Settings")
-        # settings_win.geometry("600x800")
+        mask_settings_win = Toplevel(self.master)
+        mask_settings_win.title("Mask Settings")
+        mask_settings_win.attributes('-topmost', 'true')
+        # mask_settings_win.geometry("600x800")
 
         # Configure grid layout
-        settings_win.columnconfigure(0, weight=1)
-        settings_win.columnconfigure(1, weight=1)
+        mask_settings_win.columnconfigure(0, weight=1)
+        mask_settings_win.columnconfigure(1, weight=1)
 
         def save_settings():
             self.image_processor.cell_config.threshold_method = ThresholdMethod(threshold_var.get())
             self.image_processor.save_config()
-            settings_win.destroy()
+            mask_settings_win.destroy()
 
         def load_settings():
             self.image_processor.load_config()
-            settings_win.destroy()  # Reopen to refresh values
+            mask_settings_win.destroy()  # Reopen to refresh values
             self.show_mask_settings()
 
         # Control buttons at the top
-        control_frame = ttk.Frame(settings_win)
+        control_frame = ttk.Frame(mask_settings_win)
         control_frame.grid(row=0, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
         ttk.Button(control_frame, text="Save", command=save_settings).grid(row=0, column=0, padx=5)
         ttk.Button(control_frame, text="Load", command=load_settings).grid(row=0, column=1, padx=5)
 
         # Cell Detection Settings in left column
-        cell_detect_frame = ttk.LabelFrame(settings_win, text="Cell Detection Settings")
+        cell_detect_frame = ttk.LabelFrame(mask_settings_win, text="Cell Detection Settings")
         cell_detect_frame.grid(row=1, column=0, sticky='nsew', padx=5, pady=5)
         cell_detect_frame.columnconfigure(1, weight=1)
 
@@ -676,7 +772,7 @@ class PDFViewer:
             row += 1
 
         # Preprocessing Settings in right column
-        preprocess_frame = ttk.LabelFrame(settings_win, text="Preprocessing Settings")
+        preprocess_frame = ttk.LabelFrame(mask_settings_win, text="Preprocessing Settings")
         preprocess_frame.grid(row=1, column=1, sticky='nsew', padx=5, pady=5)
         preprocess_frame.columnconfigure(1, weight=1)
 
