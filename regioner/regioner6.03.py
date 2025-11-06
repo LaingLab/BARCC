@@ -362,12 +362,41 @@ class PDFViewer:
         # Menu
         self.menu = tk.Menu(self.master)
         self.master.config(menu=self.menu)
+
+        # Create File menu dropdown
         filemenu = tk.Menu(self.menu)
         self.menu.add_cascade(label="File", menu=filemenu)
         filemenu.add_command(label="Import Atlas Section", command=self.open_file)
         filemenu.add_command(label="Save Flattened Image", command=self.save_flattened_image)
         filemenu.add_command(label="Help", command=self.show_help)
         filemenu.add_command(label="Exit", command=self.master.destroy)
+
+        # Create Edit menu dropdown
+        editmenu = tk.Menu(self.menu)
+        self.menu.add_cascade(label="Edit", menu=editmenu)
+            # Put misc/visual things in here (brightness, save pictures, save paint)
+
+        # Create Atlas menu dropdown
+        atlasmenu = tk.Menu(self.menu)
+        self.menu.add_cascade(label="Atlas", menu=atlasmenu)
+            # Put all atlas manipulation functions in here (crop, move, rotate, scale)
+        
+        self.menu.add_separator()
+        # Create Paint menu dropdown
+        paintmenu = tk.Menu(self.menu)
+        self.menu.add_cascade(label="Paint", menu=paintmenu)
+            # All paint functions (start, stop, pen, eraser, brushsize)
+        
+        # Create Mask menu dropdown
+        maskmenu = tk.Menu(self.menu)
+        self.menu.add_cascade(label="Mask", menu=maskmenu)
+            # All mask functions (mask settings, show mask, add cell, remove cell, finish mask edit)
+
+        # Create Cell menu dropdown
+        cellmenu = tk.Menu(self.menu)
+        self.menu.add_cascade(label="Cell", menu=cellmenu)
+            # This might turn into a command that counts the cells
+        
 
         # Frames
         self.top_frame = ttk.Frame(self.master)
