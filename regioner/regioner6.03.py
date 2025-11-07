@@ -579,7 +579,6 @@ class PDFViewer:
             return
         self.current_state = 'paint'
         self.show_brush_settings()
-        self.lines_dict = {}
         self.old_x = None
         self.old_y = None
         #self.line_width = self.choose_size_button.get()
@@ -628,7 +627,8 @@ class PDFViewer:
 #            fill = self.output.itemcget(item, 'fill')
 #            draw.line(adjusted_coords, fill=fill, width=int(float(width)))
 
-        for line, coords in self.lines_dict.items():
+        for line in self.output.find_withtag('paint'):
+            coords = self.output.coords(line)
             # Instead of drawing a thick line, we draw a bunch of ellipses
             width = self.output.itemcget(line, 'width')
             width = int(float(width))
@@ -680,15 +680,11 @@ class PDFViewer:
                                width=self.line_width, fill=paint_color,
                                capstyle=tk.ROUND, smooth=tk.TRUE, splinesteps=36,
                                tags='paint')
-            # This can be removed, just pull the paint info from the canvas when saving
-            # This was added to facilitate the new eraser, but now the eraser doesnt even use it
-            # self.lines_dict[current_line] = self.output.coords(current_line)
-            self.lines_dict[current_line] = coords
         self.old_x = event.x
         self.old_y = event.y
     
     def erase(self, event):
-        if len(self.lines_dict) == 0:
+        if len(self.output.find_withtag('paint')) == 0:
             return
         # Checks if any paint is within brush range
         x = event.x
@@ -703,7 +699,6 @@ class PDFViewer:
         # Removes all paint within eraser_brush range
         for item in self.output.find_enclosed(x-eraser_brush, y-eraser_brush, x+eraser_brush, y+eraser_brush):
             objectToBeDeleted = item
-            del self.lines_dict[objectToBeDeleted]
             self.output.delete(objectToBeDeleted)
 
     def reset(self, event):
