@@ -381,6 +381,8 @@ class PDFViewer:
         self.menu.add_cascade(label="File", menu=filemenu)
         filemenu.add_command(label="Import Tiff", command=self.import_tiff)
         filemenu.add_command(label="Import Atlas Section", command=self.open_file)
+        filemenu.add_command(label="Import Paint", command=self.open_paint)
+        filemenu.add_command(label="Save Paint", command=self.save_paint_to_pdf)
         filemenu.add_command(label="Save Flattened Image", command=self.save_flattened_image)
         filemenu.add_command(label="Next Image", command=self.next_image)
         filemenu.add_command(label="Help", command=self.show_help)
@@ -657,6 +659,38 @@ class PDFViewer:
         self.output.delete('paint')
         
         logger.debug("Paint strokes saved to image successfully")
+
+    def save_paint_to_pdf(self):
+        if self.atlas_filetype != 'img':
+            logger.debug("No painting to save")
+            return
+        
+        save_path = fd.asksaveasfilename(title="Save Paint", defaultextension=".png", filetypes=[("PNG files", "*.png")])
+        if save_path == None:
+            print("save_path is none", file=sys.stderr)
+            return
+        
+        RGBA_img = self.img
+        RGBA_img.save(save_path)
+        messagebox.showinfo("Image Saved", f"Paint saved to: {save_path}")
+
+    def open_paint(self):
+        logger.info("Opening file dialog for paint selection")
+        self.save_state()
+        path = fd.askopenfilename(filetypes=[("PNG files", "*.png")])
+        if path:
+            logger.info(f"Opening paint file: {path}")
+            self.path = path
+            self.img = Image.open(path)
+            self.atlas_filetype = 'png'
+            self.zoom = 1.0
+            self.current_page = 0
+            self.page_images = {}
+            self.mask_images = {}
+            self.zone_counters = {}
+            self.zone_names = {}
+            clear_preprocess_cache()
+            self.show_page()
 
     def use_pen(self):
         # self.activate_button("Pen")
@@ -1012,7 +1046,7 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
             if self.current_page not in self.page_images:
                 if self.atlas_filetype == 'pdf':
                     img = self.pdf_handler.render_page(self.current_page, self.zoom)
-                elif self.atlas_filetype == 'img':
+                else:
                     img = self.img
                 logger.debug(f"Creating new page image: mode={img.mode}, size={img.size}")
                 self.page_images[self.current_page] = img
@@ -1070,16 +1104,7 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
             self.path = path
             self.doc, self.num_pages = self.pdf_handler.open_pdf(self.path)
             self.atlas_filetype = 'pdf'
-            # estimate zoom so page fits a default area
-            page = self.pdf_handler.doc[0]
-            pw = page.rect.width
-            ph = page.rect.height
-            ww = self.output.winfo_width()
-            wh = self.output.winfo_height()
-            try:
-                self.zoom = min(ww / pw, wh / ph)
-            except Exception:
-                self.zoom = 1.0
+            self.zoom = 1.0
             self.current_page = 0
             self.page_images = {}
             self.mask_images = {}
