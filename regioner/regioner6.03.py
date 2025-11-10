@@ -683,12 +683,6 @@ class PDFViewer:
             self.path = path
             self.img = Image.open(path)
             self.atlas_filetype = 'png'
-            self.zoom = 1.0
-            self.current_page = 0
-            self.page_images = {}
-            self.mask_images = {}
-            self.zone_counters = {}
-            self.zone_names = {}
             clear_preprocess_cache()
             self.show_page()
 
