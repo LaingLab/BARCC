@@ -47,7 +47,7 @@ jobs:
           Remove-Item -Recurse -Force build, dist, __pycache__ -ErrorAction SilentlyContinue
 
           # Adjust the entry script path below if your main script is different
-          python -m pyinstaller --noconfirm --clean --onefile --name RegionalCounter regioner/regioner6.03.py
+          pyinstaller --noconfirm --clean --onefile --name RegionalCounter regioner/regioner6.03.py
 
           # Optionally list the dist folder
           Get-ChildItem -Path dist -Recurse
