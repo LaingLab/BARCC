@@ -274,13 +274,14 @@ class PDFViewer:
         logger.info("Initializing PDFViewer")
         self.root = tk.Tk()
         self.master = self.root
-        self.master.bind('<q>', self.quit)
         self.master.title('Regional IF Analyzer')
         self.master.geometry('%dx%d' % (self.master.winfo_screenwidth(), self.master.winfo_screenheight()))
         self.master.resizable(True, True)
         self.master.rowconfigure(0, weight=1)
         self.master.rowconfigure(1, weight=0)
         self.master.columnconfigure(0, weight=1)
+
+        
 
         # Create simple antibody icon
         icon_img = Image.new('RGBA', (32, 32), (0, 0, 0, 0))
@@ -362,11 +363,22 @@ class PDFViewer:
 
         # Build GUI
         self._build_gui()
+        self.init_keybinds()
 
         self.root.mainloop()
 
-    def quit(self, master):
-        self.master.destroy()
+    def init_keybinds(self):
+        # Keyboard shortcuts
+        self.master.bind('<q>', self.quit)
+        self.master.bind('<Control-z>', self._undo_event)
+        self.master.bind('<Control-s>', self.save_flattened_image)
+
+        # Bind click event for highlighting
+        self.output.bind("<Button-1>", self.highlight_region)
+
+
+    def quit(self, _):
+        self.root.destroy()
 
     def disable_event(self):
         pass
@@ -430,6 +442,9 @@ class PDFViewer:
         self.menu.add_cascade(label="Cell", menu=cellmenu)
         cellmenu.add_command(label="Count Cells", command=self.count_cells)
 
+        testmenu = tk.Menu(self.menu)
+        self.menu.add_cascade(label="test", menu=testmenu)
+
         # Add highlight regions button to manually enable this
 
         # This works as a labeling scheme, but how do I have it update?
@@ -454,12 +469,10 @@ class PDFViewer:
         self.scrollx.configure(command=self.output.xview)
 
         
-        # Bind click event for highlighting
-        self.output.bind("<Button-1>", self.highlight_region)
+        
 
-        # Keyboard shortcuts
-        self.master.bind('<Control-z>', self._undo_event)
-        self.master.bind('<Control-s>', self.save_flattened_image)
+        
+        
 
     def neverCallingThisFunction():
         # Frames

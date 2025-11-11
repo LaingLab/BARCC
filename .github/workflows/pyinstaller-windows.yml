@@ -1,0 +1,65 @@
+name: Build EXE with PyInstaller (self-hosted Windows)
+
+# This workflow builds a single EXE using PyInstaller on a self-hosted Windows runner.
+# It expects a working self-hosted Windows runner with development tools installed
+# (Visual C++ Build Tools are commonly required for some packages).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Target self-hosted Windows runner. Adjust labels if your runner uses a different label.
+    runs-on: [self-hosted]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+        shell: powershell
+
+      - name: Install dependencies (from requirements.txt if present)
+        run: |
+          if (Test-Path requirements.txt) {
+            Write-Host "Found requirements.txt - installing dependencies"
+            python -m pip install -r requirements.txt
+          } else {
+            Write-Host "No requirements.txt found - installing common runtime deps + pyinstaller"
+            python -m pip install pyinstaller pillow numpy scipy scikit-image pandas matplotlib
+          }
+        shell: powershell
+
+      - name: Ensure PyInstaller is installed
+        run: python -m pip install --upgrade pyinstaller
+        shell: powershell
+
+      - name: Build single-file EXE with PyInstaller
+        run: |
+          # Clean previous build outputs if they exist
+          Remove-Item -Recurse -Force build, dist, __pycache__ -ErrorAction SilentlyContinue
+
+          # Adjust the entry script path below if your main script is different
+          pyinstaller --noconfirm --clean --onefile --name RegionalCounter regioner/regioner6.03.py
+
+          # Optionally list the dist folder
+          Get-ChildItem -Path dist -Recurse
+        shell: powershell
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RegionalCounter-exe
+          path: dist/RegionalCounter.exe
+
+      - name: Upload full dist folder (zip)
+        uses: actions/upload-artifact@v4
+        with:
+          name: RegionalCounter-dist
+          path: dist
