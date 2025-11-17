@@ -1,6 +1,5 @@
 cell_detection:
   adaptive_block_size: 71
-  base_multiplier: 1
   circularity_threshold: 0.5
   local_radius: 15
   manual_threshold: 0.07
@@ -8,7 +7,6 @@ cell_detection:
   min_cell_size: 20
   min_peak_distance: 5
   peak_min_intensity: 1.5
-  sensitivity_range: 0.2
   threshold_method: manual
   watershed_compactness: 0.0
 preprocessing:

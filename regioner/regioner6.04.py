@@ -49,8 +49,6 @@ class CellDetectionConfig:
     min_peak_distance: int = 5
     peak_min_intensity: float = 0.1
     watershed_compactness: float = 0.0
-    base_multiplier: float = 1.1
-    sensitivity_range: float = 0.2
 
 @dataclass
 class PreprocessingConfig:
@@ -190,9 +188,9 @@ class ImageProcessor:
 
         return img
 
-    def detect_cells(self, image, sensitivity):
+    def detect_cells(self, image):
         """Detect cells using current configuration"""
-        logger.debug(f"Starting cell detection with sensitivity {sensitivity}")
+        logger.debug(f"Starting cell detection")
         
         # Preprocess the image
         img = self.preprocess_image(image)
@@ -218,14 +216,7 @@ class ImageProcessor:
         else:  # MANUAL
             thresh = self.cell_config.manual_threshold
 
-        # Apply sensitivity adjustment
-        sensitivity_multiplier = (
-            self.cell_config.base_multiplier -
-            (sensitivity / 100.0) * self.cell_config.sensitivity_range
-        )
-        logger.debug(f"Sensitivity multiplier: {sensitivity_multiplier}")
-
-        binary = img > (thresh * sensitivity_multiplier) if isinstance(thresh, np.ndarray) else img > (thresh * sensitivity_multiplier)
+        binary = img > thresh
 
         # Size and shape filtering
         labeled = measure.label(binary)
@@ -260,13 +251,10 @@ class ImageProcessor:
 
         return img, labels
 
-def clear_preprocess_cache():
-    _PREPROCESS_CACHE.clear()
-
-def binary_mask_cell_count(background_pil, sensitivity):
+def binary_mask_cell_count(background_pil):
     """Enhanced cell detection using ImageProcessor class"""
     processor = ImageProcessor()
-    img, labels = processor.detect_cells(background_pil, sensitivity)
+    img, labels = processor.detect_cells(background_pil)
     return img, labels > 0
 
 class PDFViewer:
@@ -352,9 +340,6 @@ class PDFViewer:
         # Brightness
         self.brightness = 0.0
 
-        # Sensitivity
-        self.sensitivity_var = tk.IntVar(value=50)
-
         # Mouse state tracking
         self.current_state = None
 
@@ -435,7 +420,6 @@ class PDFViewer:
         maskmenu.add_command(label="Add Cell", command=self.start_add_cells)
         maskmenu.add_command(label="Remove Cell", command=self.start_remove_cells)
         maskmenu.add_command(label="Finish Mask Edit", command=self.stop_mask_edit)
-        maskmenu.add_command(label="Sensitivity", command=self.show_sensitivity_settings)
 
         # Create Cell menu dropdown
         cellmenu = tk.Menu(self.menu)
@@ -569,7 +553,7 @@ class PDFViewer:
         ttk.Button(self.bottom_frame, text="Resize X", command=self.resize_x).pack(side=tk.LEFT, padx=8, pady=8)
         ttk.Button(self.bottom_frame, text="Resize Y", command=self.resize_y).pack(side=tk.LEFT, padx=8, pady=8)
 
-        # Brightness and sensitivity controls
+        # Brightness controls
         self._build_adjustment_controls()
 
     def _build_adjustment_controls(self):
@@ -579,15 +563,6 @@ class PDFViewer:
         self.brightness_slider = ttk.Scale(self.bottom_frame, from_=-100, to=400, orient=tk.HORIZONTAL, command=self.update_brightness)
         self.brightness_slider.pack(side=tk.LEFT, padx=4, pady=8)
         self.brightness_slider.set(0)
-
-        # Sensitivity slider
-        self.sensitivity_label = ttk.Label(self.bottom_frame, text="Sensitivity:")
-        self.sensitivity_label.pack(side=tk.LEFT, padx=8, pady=8)
-        self.sensitivity_var = tk.IntVar(value=50)
-        self.sensitivity_slider = tk.Scale(self.bottom_frame, from_=0, to=100, orient=tk.HORIZONTAL, variable=self.sensitivity_var)
-        self.sensitivity_slider.pack(side=tk.LEFT, padx=4, pady=8)
-        self.sensitivity_value_entry = ttk.Entry(self.bottom_frame, textvariable=self.sensitivity_var, width=4)
-        self.sensitivity_value_entry.pack(side=tk.LEFT, padx=4, pady=8)
 
     def start_paint(self):
         if self.current_state == 'paint':
@@ -794,17 +769,6 @@ class PDFViewer:
         self.brightness_slider = ttk.Scale(brightness_win, from_=-100, to=400, orient=tk.HORIZONTAL, command=self.update_brightness)
         self.brightness_slider.pack(side=tk.LEFT, padx=4, pady=8)
         self.brightness_slider.set(0)
-
-    def show_sensitivity_settings(self):
-        sensitivity_win = Toplevel(self.master)
-        sensitivity_win.title("Sensitivity Settings")
-        sensitivity_win.attributes('-topmost', 'true')
-        self.sensitivity_label = ttk.Label(sensitivity_win, text="Sensitivity:")
-        self.sensitivity_label.pack(side=tk.LEFT, padx=8, pady=8)
-        self.sensitivity_slider = tk.Scale(sensitivity_win, from_=0, to=100, orient=tk.HORIZONTAL, variable=self.sensitivity_var)
-        self.sensitivity_slider.pack(side=tk.LEFT, padx=4, pady=8)
-        self.sensitivity_value_entry = ttk.Entry(sensitivity_win, textvariable=self.sensitivity_var, width=4)
-        self.sensitivity_value_entry.pack(side=tk.LEFT, padx=4, pady=8)
 
     def show_mask_settings(self):
         mask_settings_win = Toplevel(self.master)
@@ -1427,7 +1391,7 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
 
         # === Build Final Cell Mask ===
         background = self.original_background.convert('L')
-        _, auto_labels = binary_mask_cell_count(background, self.sensitivity_var.get())
+        _, auto_labels = binary_mask_cell_count(background)
         auto_mask = auto_labels > 0  # Boolean array
 
         # Convert manual edit masks to boolean arrays
@@ -1466,7 +1430,6 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
             self.img_y,
             self.zone_counters,
             self.zone_names.get(self.current_page, {}),
-            self.sensitivity_var.get()
         )
 
         self.background_image = annotated
@@ -1485,7 +1448,7 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
         background = self.original_background.convert('L')
 
         # Run automatic detection
-        _, auto_labels = binary_mask_cell_count(background, self.sensitivity_var.get())
+        _, auto_labels = binary_mask_cell_count(background)
         auto_mask = auto_labels > 0
 
         base_size = background.size
@@ -1553,7 +1516,7 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
         self.show_page()
         messagebox.showinfo("Next Image", f"Autosaved image to {image_path}\nAutosaved counts to {excel_path}" if self.last_df is not None else f"Autosaved image to {image_path}")
 
-def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_counters, zone_names, sensitivity):
+def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_counters, zone_names):
     """Enhanced cell counting with improved visualization"""
     logger.info("Starting cell counting in zones")
     
@@ -1568,7 +1531,7 @@ def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_
     background_norm = (background_gray - background_gray.min()) / (background_gray.max() - background_gray.min() + 1e-8)
     
     # Detect cells
-    img2d, binary = binary_mask_cell_count(Image.fromarray((background_norm * 255).astype(np.uint8)), sensitivity)
+    img2d, binary = binary_mask_cell_count(Image.fromarray((background_norm * 255).astype(np.uint8)))
 
     # Include manual mask edits if provided
     if page_pil is not None:
