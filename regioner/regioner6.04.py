@@ -301,7 +301,7 @@ class PDFViewer:
         self.undo_stack = self.state_manager.undo_stack
 
         # Paint variables
-        self.brush_size = tk.IntVar(value=3.0)
+        self.brush_size = tk.IntVar(value=4.0)
         self.DEFAULT_COLOR = 'black'
 
         # Crop / edit variables
@@ -589,8 +589,6 @@ class PDFViewer:
 
     def save_paint(self):
         """Save canvas paint strokes to an image without using postscript"""
-        # Hide background temporarily
-        self.output.itemconfig(self.bg_photo_id, state='hidden')
         
         # Get canvas bounds
         bbox = self.output.bbox("paint")  # Get bounds of items tagged with 'paint'
@@ -601,42 +599,50 @@ class PDFViewer:
         # Get coordinates of entire painting area
         x1, y1, x2, y2 = bbox
         # Modify coords so painting stays in the same place after conversion
+        # This forces the bbox to start at the upper left corner of the canvas
+        # This keeps the tiff and painting aligned even when importing the saved painting
         x1 = 0
         y1 = 0
         
         # Create a new transparent image
-        img = Image.new('RGBA', (x2-x1, y2-y1), (0,0,0,0))
-        
+        # Keep original bbox so we can adjust coordinates relative to it
+        bx1, by1, bx2, by2 = x1, y1, x2, y2
+        img = Image.new('RGBA', (int(bx2 - bx1), int(by2 - by1)), (0, 0, 0, 0))
+
         # Draw each paint stroke onto the image
         draw = ImageDraw.Draw(img)
-#        for item in self.output.find_withtag('paint'):
-#            coords = self.output.coords(item)
-#            # Adjust coordinates relative to bbox
-#            adjusted_coords = [c - x1 if i % 2 == 0 else c - y1 for i, c in enumerate(coords)]
-#            width = self.output.itemcget(item, 'width')
-#            fill = self.output.itemcget(item, 'fill')
-#            draw.line(adjusted_coords, fill=fill, width=int(float(width)))
 
         for line in self.output.find_withtag('paint'):
             coords = self.output.coords(line)
-            # Instead of drawing a thick line, we draw a bunch of ellipses
+            if not coords:
+                continue
+
+            if len(coords) != 4:
+                logger.error("Wrong number of coordinates")
+
+            # Convert canvas coords into point tuples for PIL
+            points = []
+            for i in range(0, len(coords), 2):
+                x = coords[i]
+                y = coords[i+1] 
+                points.append((x, y))
+
             width = self.output.itemcget(line, 'width')
-            width = int(float(width))
+            try:
+                width = int(float(width))
+            except Exception:
+                width = 1
+            radius = math.floor(width / 2)
             fill = self.output.itemcget(line, 'fill')
-            # draw.ellipse needs a bounding box, so we incorperate line width to the coords
-            x0, y0, x1, y1 = coords
-            x0 = min(x0, x1)    # ensures corners aren't flipped
-            x1 = max(x0, x1)
-            y0 = min(y0, y1)
-            y1 = max(y0, y1)
-            ex0 = x0 - width/2
-            ey0 = y0 - width/2
-            ey1 = y1 + width/2
-            ex1 = x1 + width/2
-            draw.ellipse((ex0, ey0, ex1, ey1), fill=fill, width=width)
+
+            # Draw lines as points for roundness to fill jagged edges
+            for (px, py) in points:
+                draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=fill)
+                
+            # Draw lines as lines for fast-drawn lines
+            draw.line(points, fill=fill, width=width, joint="curve")
+
             
-        # Show background again
-        self.output.itemconfig(self.bg_photo_id, state='normal')
         
         # Set as current image
         self.img = img
@@ -721,8 +727,19 @@ class PDFViewer:
         self.old_x, self.old_y = None, None
 
     def distance_to_line(self, px, py, x0, y0, x1, y1):
-        # denom has +1e8 to prevent divide by zero errors
-        return abs((y1 - y0) * px - (x1 - x0) * py + x1 * y0 - y1 * x0) / (math.sqrt((y1 - y0)**2 + (x1 - x0)**2) + 1e8)
+        # Robust point-to-segment distance.
+        # If the segment is a point, return Euclidean distance to that point.
+        dx = x1 - x0
+        dy = y1 - y0
+        if dx == 0 and dy == 0:
+            return math.hypot(px - x0, py - y0)
+
+        # Project point onto the line defined by the segment, then clamp to [0,1]
+        t = ((px - x0) * dx + (py - y0) * dy) / (dx * dx + dy * dy)
+        t = max(0.0, min(1.0, t))
+        proj_x = x0 + t * dx
+        proj_y = y0 + t * dy
+        return math.hypot(px - proj_x, py - proj_y)
 
     def show_brush_settings(self): # This is the layout to be applied to all other spawned windows
         window = self.brush_win
@@ -1704,14 +1721,24 @@ def preprocess_for_highlighting(page_id, img, atlas_filetype):
         gray = np.dot(img_array[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.float32)
         # Edge detection
         mag = filters.sobel(gray)
-        # Close dotted lines
-        closed_binary = binary_closing(mag)
+        # Threshold the gradient magnitude to make a binary edge image
+        try:
+            thresh = mag.mean() + 0.5 * mag.std()
+        except Exception:
+            thresh = np.mean(mag)
+        mag_binary = mag > thresh
+
+        # Close small gaps in the binary edges
+        closed_binary = binary_closing(mag_binary)
+
         # Make bounds as thin as possible
         skel_binary = morphology.skeletonize(closed_binary)
+
         barrier = np.ones((img.height, img.width), dtype=np.uint8) * 255
-        barrier[skel_binary] = 0
-        barrier_img = Image.new('L', (img.width, img.height))
-        barrier_img.putdata(barrier.flatten())
+        barrier[skel_binary > 0] = 0
+        barrier_img = Image.fromarray(barrier, mode='L')
+        # Cache the result so repeated calls are fast
+        _PREPROCESS_CACHE[page_id] = barrier_img
         return barrier_img
 
     # Convert to RGBA if not already
