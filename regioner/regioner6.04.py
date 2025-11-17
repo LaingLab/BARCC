@@ -426,8 +426,6 @@ class PDFViewer:
         self.menu.add_cascade(label="Cell", menu=cellmenu)
         cellmenu.add_command(label="Count Cells", command=self.count_cells)
 
-        testmenu = tk.Menu(self.menu)
-        self.menu.add_cascade(label="test", menu=testmenu)
 
         # Add highlight regions button to manually enable this
 
