@@ -5,12 +5,48 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 
-# Load the module from its file location so tests can keep the program in one file
-ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = ROOT / "regioner" / "regioner6.04.py"
-spec = importlib.util.spec_from_file_location("regioner6", str(MODULE_PATH))
-regioner_mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(regioner_mod)
+# Robust module discovery: look for a single .py file in the same directory
+# (or its parent "regioner" directory) that defines ImageProcessor/binary_mask_cell_count
+
+def find_regioner_module():
+    # Start search in this directory (where the test will live)
+    start = Path(__file__).resolve().parent
+
+    candidates = []
+    # Candidate dirs to search (this dir, and a sibling 'regioner' if present)
+    search_dirs = [start]
+    if start.name != 'regioner' and (start / 'regioner').is_dir():
+        search_dirs.append(start / 'regioner')
+
+    for d in search_dirs:
+        for p in d.glob('*.py'):
+            if p.name == Path(__file__).name or p.name == '__init__.py':
+                continue
+            try:
+                text = p.read_text()
+            except Exception:
+                continue
+            # Heuristic: does this file define ImageProcessor or binary_mask_cell_count
+            if 'class ImageProcessor' in text or 'def binary_mask_cell_count' in text:
+                candidates.append(p)
+
+    if not candidates:
+        # Fallback: pick the most recently modified .py in the first search dir
+        d = search_dirs[0]
+        py_files = [p for p in d.glob('*.py') if p.name != Path(__file__).name and p.name != '__init__.py']
+        if not py_files:
+            raise RuntimeError('Could not find the program file to import for tests')
+        candidates = py_files
+
+    # Pick the newest candidate (most recently modified)
+    candidate = max(candidates, key=lambda p: p.stat().st_mtime)
+
+    spec = importlib.util.spec_from_file_location('regioner_mod', str(candidate))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+regioner_mod = find_regioner_module()
 
 # Convenience refs
 ImageProcessor = regioner_mod.ImageProcessor
@@ -102,4 +138,3 @@ def test_count_cells_in_zones_simple():
     assert hasattr(df, "to_excel")
     # counts should be a dict; zone 1 may or may not be present depending on segmentation, but call should not fail
     assert isinstance(counts, dict)
-
