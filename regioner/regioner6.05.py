@@ -331,6 +331,8 @@ class PDFViewer:
         self.editing_mask = False
         self.mask_edit_add = True  # True = add cells, False = remove cells
         self.current_mask = None   # reference to the current mask being edited
+        # self.auto_mask = np.array([[0,0,0], [0,0,0]])
+        self.auto_mask = False 
 
         # Manual edit masks
         self.manual_add_mask = None
@@ -736,6 +738,7 @@ class PDFViewer:
         control_frame.grid(row=0, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
         ttk.Button(control_frame, text="Save", command=save_settings).grid(row=0, column=0, padx=5)
         ttk.Button(control_frame, text="Load", command=load_settings).grid(row=0, column=1, padx=5)
+        ttk.Button(control_frame, text="Show Mask", command=self.show_cell_mask_threshold).grid(row=0, column=2, padx=5)
 
         # Cell Detection Settings in left column
         cell_detect_frame = ttk.LabelFrame(window, text="Cell Detection Settings")
@@ -760,6 +763,7 @@ class PDFViewer:
                         val = float(val)
                     setattr(config_obj, attr_name, val)
                     logger.debug(f"Successfully set {attr_name} to {val}")
+
                 except ValueError as e:
                     logger.error(f"Invalid input for {attr_name}: {e}")
                     messagebox.showerror("Invalid Input", 
@@ -830,15 +834,15 @@ class PDFViewer:
         self.output.unbind("<Button-1>")
         self.output.bind("<Button-1>", self.edit_mask_draw)
         self.output.bind("<B1-Motion>", self.edit_mask_draw)
-        self.output.bind("<ButtonRelease-1>", self.show_cell_mask_threshold)
+        self.output.bind("<ButtonRelease-1>", lambda event : self.show_cell_mask_threshold(event, calculate=False))
         # Right click erases
         self.output.bind("<Button-2>", lambda event : self.edit_mask_draw(event, eraser=True))
         self.output.bind("<B2-Motion>", lambda event : self.edit_mask_draw(event, eraser=True))
-        self.output.bind("<ButtonRelease-2>", self.show_cell_mask_threshold)
+        self.output.bind("<ButtonRelease-2>", lambda event : self.show_cell_mask_threshold(event, calculate=False))
         # Increases compatibility for more OSs
         self.output.bind("<Button-3>", lambda event : self.edit_mask_draw(event, eraser=True))
         self.output.bind("<B3-Motion>", lambda event : self.edit_mask_draw(event, eraser=True))
-        self.output.bind("<ButtonRelease-3>", self.show_cell_mask_threshold)
+        self.output.bind("<ButtonRelease-3>", lambda event : self.show_cell_mask_threshold(event, calculate=False))
 
         # Initialize the correct mask depending on edit mode
         base_size = self.original_background.size
@@ -874,9 +878,9 @@ class PDFViewer:
         # --- Visualization fix ---
         mask_arr = np.array(self.current_mask)
         # Make RGB overlay for display
-        overlay_rgb = np.zeros((*mask_arr.shape, 3), dtype=np.uint8)
-        overlay_rgb[mask_arr > 0] = [255, 0, 0]  # Red overlay where mask is drawn
-        overlay_img = Image.fromarray(overlay_rgb)
+        overlay_rgba = np.zeros((*mask_arr.shape, 4), dtype=np.uint8)
+        overlay_rgba[mask_arr > 0] = [255, 0, 0, 255]  # Red overlay where mask is drawn
+        overlay_img = Image.fromarray(overlay_rgba)
 
         self.show_page(mask=overlay_img)
 
@@ -1001,6 +1005,9 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
             if mask is not None:
                 self.mask_photo = ImageTk.PhotoImage(mask)
                 offset_x = display_bg.width + 10  # 10 pixels spacing
+                self.bg_mask_photo_id = self.output.create_image(offset_x, 0, 
+                                                                image=self.background_photo, 
+                                                                anchor='nw')
                 self.mask_photo_id = self.output.create_image(offset_x, 0, 
                                                              image=self.mask_photo, 
                                                              anchor='nw')
@@ -1399,13 +1406,17 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
         else:
             messagebox.showinfo("Cell Counts", f"Cell counts per zone: {dict(zip(df['Zone'], df['Cell_Count']))}")
 
-    def show_cell_mask_threshold(self, event=None):
+    def show_cell_mask_threshold(self, event=None, calculate=True):
         """Display the combined (auto + manual) mask overlay"""
         background = self.original_background.convert('L')
 
         # Run automatic detection
-        _, auto_labels = binary_mask_cell_count(background)
-        auto_mask = auto_labels > 0
+        if calculate == True:
+            _, auto_labels = binary_mask_cell_count(background)
+            auto_mask = auto_labels > 0
+            self.auto_mask = auto_mask
+        else:
+            auto_mask = self.auto_mask
 
         base_size = background.size
         add_mask = np.zeros(auto_mask.shape, dtype=bool)
@@ -1423,15 +1434,18 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
         combined_mask = (auto_mask | add_mask) & ~remove_mask
 
         # Visualize combined mask on top of the original background
-        original_rgb = self.original_background.convert('RGB')
-        vis_array = np.array(original_rgb)
+        background = self.adjust_image(self.original_background)
+        original_rgb = background.convert('RGB')
+        vis_array = np.array(original_rgb.convert('RGBA'))
         red_overlay = np.zeros_like(vis_array)
-        red_overlay[combined_mask] = [255, 0, 0]
+        red_overlay[combined_mask] = [255, 0, 0, 255]
 
-        alpha = 0.5
+        alpha = 0.7
         vis_array = (vis_array + alpha * red_overlay).astype(np.uint8)
+        alpha_array = (alpha * red_overlay).astype(np.uint8)
 
-        mask_img = Image.fromarray(vis_array)
+        # mask_img = Image.fromarray(vis_array)
+        mask_img = Image.fromarray(alpha_array)
         mask_img = mask_img.resize(self.original_background.size, Image.NEAREST)
 
         self.show_page(mask=mask_img)

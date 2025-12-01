@@ -7,7 +7,7 @@ cell_detection:
   min_cell_size: 20
   min_peak_distance: 5
   peak_min_intensity: 2.5
-  threshold_method: local
+  threshold_method: manual
   watershed_compactness: 0.0
 preprocessing:
   background_method: tophat
