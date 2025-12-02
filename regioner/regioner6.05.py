@@ -1097,7 +1097,8 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
 
         bg_offset_x = -left
         bg_offset_y = -top
-        base.paste(bg_img, (bg_offset_x, bg_offset_y), bg_img)
+        # base.paste(bg_img, (bg_offset_x, bg_offset_y), bg_img)
+        base.paste(bg_img, (bg_offset_x, bg_offset_y))
 
         at_offset_x = self.img_x - left
         at_offset_y = self.img_y - top
@@ -1335,7 +1336,7 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
         overlay = img_array.copy()
         overlay[..., :3][mask] = [255, 255, 0]
         overlay[..., 3][mask] = 18
-        updated_img = Image.fromarray(overlay)
+        updated_img = Image.fromarray(overlay).convert('RGBA')
         self.page_images[self.current_page] = updated_img
         self.show_page()
 
