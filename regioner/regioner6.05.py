@@ -1001,14 +1001,15 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
                                                        image=self.background_photo, 
                                                        anchor='nw')
             
-            # If mask exists, display it on the right
+            # If mask exists, display it on the left
+            # Display untouched image on the right for comparison
             if mask is not None:
                 self.mask_photo = ImageTk.PhotoImage(mask)
                 offset_x = display_bg.width + 10  # 10 pixels spacing
                 self.bg_mask_photo_id = self.output.create_image(offset_x, 0, 
                                                                 image=self.background_photo, 
                                                                 anchor='nw')
-                self.mask_photo_id = self.output.create_image(offset_x, 0, 
+                self.mask_photo_id = self.output.create_image(0, 0, 
                                                              image=self.mask_photo, 
                                                              anchor='nw')
                 
