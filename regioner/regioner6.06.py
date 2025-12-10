@@ -500,8 +500,8 @@ class PDFViewer:
         self.output.unbind('<Button-1>')
         self.output.unbind('<B1-Motion>')
         self.output.unbind('<ButtonRelease-1>') 
-        self.output.bind('<Button-1>', self.highlight_region)
         self.output.unbind('<Button-1>')
+        self.output.bind('<Button-1>', self.highlight_region)
         self.menu.delete(7)
         self.current_state = None
         self.save_paint()
@@ -1609,6 +1609,16 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
             logger.error(f"Error getting pixel value: {e}")
             return
 
+        try: 
+            name = simpledialog.askstring("Region Name", "Enter a name for this region:")
+        except Exception as e:
+            print('no highlighting', file=sys.stderr)
+
+
+
+
+        name = name.strip() if name else f"Zone {zone_id}"
+        self.zone_names[self.current_page][zone_id] = name
         self.zone_counters[self.current_page] += 1
         zone_id = self.zone_counters[self.current_page]
 
@@ -1621,10 +1631,6 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
         mask_array = np.array(mask_img)
         mask_array[mask] = zone_id
         self.mask_images[self.current_page] = Image.fromarray(mask_array)
-
-        name = simpledialog.askstring("Region Name", "Enter a name for this region:")
-        name = name.strip() if name else f"Zone {zone_id}"
-        self.zone_names[self.current_page][zone_id] = name
 
         img_array = np.array(img)
         overlay = img_array.copy()
