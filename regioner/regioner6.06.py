@@ -1719,12 +1719,12 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
             return
 
         image_path = f"{self.tiff_filename}_counted.jpg"
-        excel_path = f"{self.tiff_filename}_data.xlsx"
+        csv_path = f"{self.tiff_filename}_data.csv"
 
         self.autosave_flattened_image(image_path)
 
         if self.last_df is not None:
-            self.last_df.to_excel(excel_path, index=False)
+            self.last_df.to_csv(csv_path, index=False)
 
         # This is SO UGLY, see if there is a cleaner way to re-init tkinter without breaking everything
         # Could I do .destroy() and then call the program again?
@@ -1776,7 +1776,10 @@ This GUI is designed for regional analysis of immunofluorescence (IF) images. It
         self.current_state = None
 
         self.show_page()
-        messagebox.showinfo("Next Image", f"Autosaved image to {image_path}\nAutosaved counts to {excel_path}" if self.last_df is not None else f"Autosaved image to {image_path}")
+        if self.last_df is not None:
+            messagebox.showinfo("Next Image", f"Autosaved image to {image_path}\nAutosaved counts to {csv_path}") 
+        else:
+            messagebox.showinfo("Next Image", f"Autosaved image to {image_path}")
 
 def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_counters, zone_names):
     """Enhanced cell counting with improved visualization"""
