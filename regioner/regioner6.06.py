@@ -23,9 +23,9 @@ import sys
 
 # Configure logging
 logging.basicConfig(
-    # level=logging.INFO,       # For normal operations and major steps
+    level=logging.INFO,       # For normal operations and major steps
     # level=logging.WARNING,    # For recoverable errors
-    level=logging.DEBUG,        # For detailed operational information
+    # level=logging.DEBUG,        # For detailed operational information
     # level=logging.ERROR,      # For critical issues
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
@@ -66,6 +66,25 @@ class PreprocessingConfig:
     enhance_method: str = "unsharp mask"
     unsharp_radius: float = 1.0
     unsharp_amount: float = 2.0
+
+# beginning fleshing these out
+class BrainImage:
+    def __init__(self):
+        self.original_image = None
+        self.scaled_image = None
+        self.background_image = None
+        self.cell_mask = None
+        self.regions = None
+        self.paint = None
+ 
+
+class CellMask:
+    def __init__(self):
+        self.combined_mask = None
+        self.auto_mask = None
+        self.add_mask = None
+        self.remove_mask = None
+
 
 class ImageProcessor:
     def __init__(self):
@@ -436,7 +455,7 @@ class PDFViewer:
         # Add highlight regions button to manually enable this
 
         # This works as a labeling scheme, but how do I have it update?
-        # self.menu.add_command(label="Pen: "+str(self.brush_size.get()))
+        # self.menu.add_command(label="Pen: "+str(self.draw_type.get()))
 
         # Frames
         self.top_frame = ttk.Frame(self.master)
@@ -468,14 +487,22 @@ class PDFViewer:
         self.color = self.DEFAULT_COLOR
         self.active_button = None
         self.use_pen()
-        self.output.unbind("<Button-1>")
+        self.output.unbind('<Button-1>')
+        self.output.bind('<Button-1>', self.paint)
         self.output.bind('<B1-Motion>', self.paint)
         self.output.bind('<ButtonRelease-1>', self.reset)
+        self.draw_type = 'drag'
+        self.master.bind('<s>', self.reset_toggle)
+        self.draw_status = self.menu.add_command(label="Pen: "+str(self.draw_type))
+        self.menu.update()
 
     def stop_paint(self):
+        self.output.unbind('<Button-1>')
         self.output.unbind('<B1-Motion>')
         self.output.unbind('<ButtonRelease-1>') 
         self.output.bind('<Button-1>', self.highlight_region)
+        self.output.unbind('<Button-1>')
+        self.menu.delete(7)
         self.current_state = None
         self.save_paint()
         self.show_page()
@@ -615,6 +642,18 @@ class PDFViewer:
         for item in self.output.find_enclosed(x-eraser_brush, y-eraser_brush, x+eraser_brush, y+eraser_brush):
             objectToBeDeleted = item
             self.output.delete(objectToBeDeleted)
+
+    def reset_toggle(self, event):
+        if self.draw_type == 'drag':
+            self.output.unbind('<ButtonRelease-1>')
+            self.draw_type = 'segment'
+        elif self.draw_type == 'segment':
+            self.output.bind('<ButtonRelease-1>', self.reset)
+            self.draw_type = 'drag'
+            self.reset(event)
+        else:
+            print('error', file=sys.stderr)
+        self.menu.entryconfig(7, label="Pen: "+str(self.draw_type))
 
     def reset(self, event):
         self.old_x, self.old_y = None, None
