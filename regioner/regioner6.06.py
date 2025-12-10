@@ -497,7 +497,6 @@ class PDFViewer:
         self.menu.update()
 
     def stop_paint(self):
-        self.output.unbind('<Button-1>')
         self.output.unbind('<B1-Motion>')
         self.output.unbind('<ButtonRelease-1>') 
         self.output.unbind('<Button-1>')
@@ -639,7 +638,7 @@ class PDFViewer:
         if distance >= eraser_brush:
             return
         # Removes all paint within eraser_brush range
-        for item in self.output.find_enclosed(x-eraser_brush, y-eraser_brush, x+eraser_brush, y+eraser_brush):
+        for item in self.output.find_overlapping(x-eraser_brush, y-eraser_brush, x+eraser_brush, y+eraser_brush):
             objectToBeDeleted = item
             self.output.delete(objectToBeDeleted)
 
