@@ -2,6 +2,13 @@
 
 A GUI tool for analyzing immunofluorescence images with atlas region mapping and automated cell counting.
 
+**v8.01.000 Highlights**
+- New modern Blob Detection engine (Laplacian of Gaussian) — significantly better results on most immunofluorescence images.
+- "Smart Suggest (Offline)" — a fully local, privacy-preserving tool that analyzes your image and recommends better detection parameters.
+- Live switching between Blob and legacy Watershed detection methods.
+- Improved Autotune buttons that adapt to the selected detection strategy.
+- Brush size dialog now opens automatically when using Add/Remove Cell tools.
+
 ## Description
 
 The Regional IF Analyzer is designed to help researchers analyze immunofluorescence images by:
@@ -28,8 +35,8 @@ sudo apt-get install python3-tk
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/LaingLab/BARC.git
-cd BARC
+git clone https://github.com/LaingLab/BARCC.git
+cd BARCC
 ```
 
 2. Install required packages:

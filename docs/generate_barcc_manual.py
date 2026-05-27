@@ -16,7 +16,7 @@ import os
 # ============================================================================
 MANUAL_TITLE = "BARCC - Brain Atlas Regional Cell Counter"
 MANUAL_SUBTITLE = "User Manual"
-VERSION = "8.00.000"
+VERSION = "8.01.000"
 OUTPUT_FILENAME = "BARCC_User_Manual.pdf"
 OUTPUT_DIR = ".."  # Place PDF in repository root
 
@@ -137,7 +137,7 @@ class BARCCUserManual(FPDF):
         self.cell(0, 6, "Laing Lab", new_x=XPos.RIGHT, new_y=YPos.NEXT, align="C")
 
         self.set_font("Helvetica", "", 9)
-        self.cell(0, 5, "https://github.com/LaingLab/BARC", new_x=XPos.RIGHT, new_y=YPos.NEXT, align="C")
+        self.cell(0, 5, "https://github.com/LaingLab/BARCC", new_x=XPos.RIGHT, new_y=YPos.NEXT, align="C")
 
         # Bottom accent bar
         self.set_y(-12)
@@ -325,6 +325,25 @@ def build_manual():
     # ------------------------------------------------------------------
     # 2. INSTALLATION
     # ------------------------------------------------------------------
+    pdf.chapter_title("What's New in Version 8.01.000", 0)
+
+    pdf.body(
+        "BARCC 8.01 introduces major improvements to the cell detection system and parameter tuning workflow:"
+    )
+
+    pdf.bullet_list([
+        "New default detection engine based on Laplacian-of-Gaussian (blob_log) blob detection. This method is significantly more robust on typical immunofluorescence images than the previous watershed approach.",
+        "Full set of Blob Detection parameters now exposed in Mask Settings with live preview.",
+        "New \"Smart Suggest (Offline)\" button — a completely local analysis tool that examines your image and current detections and recommends better parameter values. No data is ever transmitted.",
+        "Ability to instantly switch between the new Blob method and the legacy Watershed method.",
+        "Autotune buttons now intelligently adapt their adjustments depending on the active detection method.",
+        "When using Add Cell or Remove Cell, the Brush Settings dialog now opens automatically for immediate size control."
+    ])
+
+    pdf.body(
+        "These changes dramatically improve the experience of tuning detection parameters for difficult or variable images."
+    )
+
     pdf.chapter_title("2. Installation & Requirements", 0)
 
     pdf.chapter_title("System Requirements", 1)
@@ -337,7 +356,7 @@ def build_manual():
     pdf.chapter_title("Installation Steps", 1)
     pdf.body("1. Clone the repository:")
     pdf.set_font("Courier", "", 9)
-    pdf.multi_cell(0, 5, "git clone https://github.com/LaingLab/BARC.git\ncd BARCC")
+    pdf.multi_cell(0, 5, "git clone https://github.com/LaingLab/BARCC.git\ncd BARCC")
     pdf.ln(3)
 
     pdf.set_font("Helvetica", "", 10.5)
@@ -521,7 +540,76 @@ def build_manual():
 
     pdf.body(
         "This is the most powerful and configurable part of BARCC. The Mask Settings dialog "
-        "provides fine-grained control over every stage of the cell detection pipeline."
+        "provides fine-grained control over cell detection. BARCC v8.01+ supports two different "
+        "detection strategies that you can switch between at any time:"
+    )
+
+    pdf.bullet_list([
+        "Blob Detection (Recommended): Uses modern Laplacian-of-Gaussian (blob_log) blob detection. Generally provides the best results on immunofluorescence images with variably bright cells.",
+        "Watershed (Legacy): The original threshold + distance transform + watershed pipeline. Retained for compatibility with older workflows."
+    ])
+
+    pdf.body(
+        "You can switch between these two methods at any time using the radio buttons at the bottom "
+        "of the Mask Settings dialog. Most users should use the Blob method for new work."
+    )
+
+    pdf.note_box(
+        "A powerful new feature in v8.01 is the \"Smart Suggest (Offline)\" button. "
+        "This fully local tool analyzes your current image and detection results and suggests "
+        "better parameter values. No data ever leaves your computer."
+    )
+
+    pdf.chapter_title("Detection Method", 1)
+    pdf.body(
+        "At the bottom of the Mask Settings dialog you will find a clear choice between two detection engines:"
+    )
+
+    pdf.bullet_list([
+        "Blob (new/recommended): Modern multi-scale blob detection using Laplacian of Gaussian. Much more robust for typical fluorescent cell images.",
+        "Watershed (legacy): The original method based on global/local thresholding followed by watershed segmentation."
+    ])
+
+    pdf.body(
+        "When Blob is selected, the lower part of the dialog shows the Blob Detection parameters. "
+        "When Watershed is selected, the legacy Watershed parameters are shown instead."
+    )
+
+    pdf.chapter_title("Blob Detection Parameters (Recommended)", 1)
+    pdf.body(
+        "These parameters control the modern blob-based detector:"
+    )
+
+    pdf.chapter_title("Blob Threshold", 2)
+    pdf.body(
+        "The most important sensitivity control. Lower values detect more (and dimmer) cells but increase false positives. "
+        "Higher values are more conservative. Typical useful range: 0.05 – 0.20."
+    )
+
+    pdf.chapter_title("Blob Min / Max Sigma", 2)
+    pdf.body(
+        "Controls the range of cell sizes the detector will look for. Min Sigma sets the smallest detectable feature size; Max Sigma sets the largest. "
+        "For most immunofluorescence nuclei, Min Sigma around 1.5–3.0 and Max Sigma around 7–12 works well."
+    )
+
+    pdf.chapter_title("Blob Num Sigma", 2)
+    pdf.body(
+        "Number of scales tested between Min and Max Sigma. Higher values give finer granularity at the cost of speed. Default (12) is usually sufficient."
+    )
+
+    pdf.chapter_title("Blob Overlap", 2)
+    pdf.body(
+        "How much overlap is allowed between nearby blobs. Lower values reduce duplicate detections on clustered cells."
+    )
+
+    pdf.chapter_title("Blob Min / Max Area", 2)
+    pdf.body(
+        "Post-detection filters based on area (in pixels). Very effective at removing tiny noise blobs or huge clumps."
+    )
+
+    pdf.chapter_title("Blob Min Circularity", 2)
+    pdf.body(
+        "Requires detected blobs to be reasonably round. Raising this value helps reject irregular artifacts."
     )
 
     pdf.chapter_title("Threshold Methods", 1)
@@ -652,24 +740,40 @@ def build_manual():
 
     pdf.chapter_title("Autotune Panel", 1)
     pdf.body(
-        "The Mask Settings dialog includes a convenient Autotune panel with one-click adjustments "
-        "for common goals. These buttons modify the live detection parameters and immediately "
-        "reflect in the UI. When you click \"Show Mask,\" the detection will use the updated values."
+        "The Mask Settings dialog includes a convenient Autotune panel with one-click adjustments. "
+        "These buttons intelligently adapt their behavior depending on whether you are using the "
+        "Blob or Watershed detection method."
     )
 
     pdf.body("The available Autotune buttons are:")
     pdf.bullet_list([
-        "More cells - Increases detection sensitivity (lowers size/intensity/circularity thresholds).",
-        "Less cells - Decreases detection sensitivity (raises thresholds).",
-        "Bigger cells - Favors larger objects by raising min/max cell size and compactness.",
-        "Smaller cells - Favors smaller objects by lowering size thresholds.",
-        "Brighter cells - Only detects stronger signals by raising peak intensity threshold.",
-        "Dimmer cells - Detects weaker signals by lowering peak intensity threshold."
+        "More cells - Increases overall sensitivity. With Blob mode this primarily lowers the Blob Threshold and Min Sigma.",
+        "Less cells - Decreases sensitivity and raises size/shape requirements.",
+        "Bigger cells / Smaller cells - Adjust size-related parameters (Min/Max Area or Min/Max Cell Size).",
+        "Brighter cells / Dimmer cells - Primarily adjust intensity sensitivity (Blob Threshold or Peak Min Intensity)."
     ])
+
     pdf.body(
-        "You can click any button multiple times for a stronger effect. The changes are applied "
-        "to the current configuration and will be used the next time cell detection runs (via "
-        "\"Show Mask\" or \"Count Cells\")."
+        "Note: The Autotune buttons are intentionally conservative. For best results on difficult images, "
+        "use the new \"Smart Suggest (Offline)\" button instead (see below)."
+    )
+
+    pdf.chapter_title("Smart Suggest (Offline) – New in v8.01", 1)
+    pdf.body(
+        "This is one of the most powerful new features in BARCC 8.01. Clicking \"Smart Suggest (Offline)\" "
+        "runs a fully local analysis on your current image and detection results. It then proposes specific "
+        "parameter improvements with clear explanations for each suggestion."
+    )
+
+    pdf.bullet_list([
+        "Everything runs 100% on your computer — no images or data are sent anywhere.",
+        "You can selectively check the suggestions you want and apply them with one click.",
+        "It works with both Blob and Watershed modes and gives context-aware advice based on your actual data."
+    ])
+
+    pdf.body(
+        "This tool is especially useful when the simple Autotune buttons are too aggressive or not aggressive enough. "
+        "It is the recommended way to get good starting parameters for new or difficult images."
     )
 
     # ------------------------------------------------------------------
@@ -686,7 +790,7 @@ def build_manual():
     pdf.bullet_list([
         "Add Cell - Click or paint to mark additional cells that the detector missed.",
         "Remove Cell - Erase false positives (dust, autofluorescence, etc.).",
-        "Brush Size - Adjustable via the Brushsize control in the Paint menu."
+        "Brush Size - When you activate Add Cell or Remove Cell, the Brush Settings dialog now opens automatically so you can immediately adjust dot size."
     ])
 
     pdf.body(
@@ -758,7 +862,7 @@ def build_manual():
     pdf.chapter_title("Getting Help", 1)
     pdf.body(
         "For bugs or feature requests, please open an issue on the GitHub repository:\n"
-        "https://github.com/LaingLab/BARC"
+        "https://github.com/LaingLab/BARCC"
     )
 
     # Final page

@@ -52,6 +52,10 @@ logger = logging.getLogger(__name__)
 # Define configuration dataclasses and enums
 @dataclass
 class CellDetectionConfig:
+    # Detection strategy
+    detection_method: str = "blob"          # "blob" (blob_log) or "watershed" (old method)
+
+    # --- Legacy Watershed parameters (kept for fallback) ---
     threshold_method: str = "otsu" 
     manual_threshold: float = 0.5
     adaptive_block_size: int = 101
@@ -62,6 +66,16 @@ class CellDetectionConfig:
     min_peak_distance: int = 5
     peak_min_intensity: float = 0.1
     watershed_compactness: float = 0.0
+
+    # --- Blob Detection (blob_log) parameters ---
+    blob_min_sigma: float = 2.0
+    blob_max_sigma: float = 10.0
+    blob_num_sigma: int = 12
+    blob_threshold: float = 0.08
+    blob_overlap: float = 0.5
+    blob_min_area: int = 15          # post-filter
+    blob_max_area: int = 300
+    blob_min_circularity: float = 0.6
 
 @dataclass
 class PreprocessingConfig:
@@ -227,34 +241,79 @@ class ImageProcessor:
         return img
 
     def detect_cells(self, image):
-        """Detect cells using current configuration"""
-        logger.debug(f"Starting cell detection")
-        
+        """Detect cells using current configuration.
+        Supports two strategies:
+          - "blob": Uses skimage.feature.blob_log (recommended for fluorescent spots)
+          - "watershed": Legacy threshold + watershed method
+        """
+        logger.debug(f"Starting cell detection with method: {self.cell_config.detection_method}")
+
         # Preprocess the image
         img = self.preprocess_image(image)
-        
-        # Apply thresholding based on method
-        logger.debug(f"Applying {self.cell_config.threshold_method} thresholding")
-        if self.cell_config.threshold_method == "otsu":
-            # Standard Otsu thresholding
-            thresh = filters.threshold_otsu(img)
-        elif self.cell_config.threshold_method == "adaptive":
-            # Use a larger block size for better cell detection
-            thresh = filters.threshold_local(
-                img,
-                block_size=self.cell_config.adaptive_block_size
-            )
-        elif self.cell_config.threshold_method == "local":
-            # Simple local thresholding
-            thresh = filters.threshold_local(
-                img,
-                block_size=self.cell_config.local_radius * 2 + 1, # CHECK: why do we have magic numbers
-                method='gaussian'
-            )
-        elif self.cell_config.threshold_method == "manual": # MANUAL
-            thresh = self.cell_config.manual_threshold
+
+        if self.cell_config.detection_method == "blob":
+            return self._detect_cells_blob(img)
         else:
-            logger.error("No valid thresholding method selected, please select a valid method")
+            return self._detect_cells_watershed(img)
+
+    def _detect_cells_blob(self, img: np.ndarray):
+        """Modern blob detection using Laplacian of Gaussian.
+        Much more robust for variably bright fluorescent cells.
+        """
+        cfg = self.cell_config
+
+        # Run blob_log - finds bright blobs across scales
+        blobs = feature.blob_log(
+            img,
+            min_sigma=cfg.blob_min_sigma,
+            max_sigma=cfg.blob_max_sigma,
+            num_sigma=cfg.blob_num_sigma,
+            threshold=cfg.blob_threshold,
+            overlap=cfg.blob_overlap,
+            log_scale=False
+        )
+
+        # Convert to labels image
+        labels = np.zeros(img.shape, dtype=int)
+        cell_id = 1
+
+        for y, x, sigma in blobs:
+            # Estimate radius from sigma (blob_log sigma ≈ radius / sqrt(2))
+            radius = int(sigma * 1.8) + 1
+            area = int(np.pi * radius * radius)
+
+            # Post-filter by size and rough circularity
+            if not (cfg.blob_min_area <= area <= cfg.blob_max_area):
+                continue
+
+            # Draw a filled disk as the cell region (simple but effective)
+            rr, cc = np.ogrid[:img.shape[0], :img.shape[1]]
+            mask = (rr - y) ** 2 + (cc - x) ** 2 <= radius ** 2
+
+            # Only label if not already claimed (avoid heavy overlap)
+            free_space = labels[mask] == 0
+            if free_space.sum() > (mask.sum() * 0.6):  # mostly free
+                labels[mask] = cell_id
+                cell_id += 1
+
+        return img, labels
+
+    def _detect_cells_watershed(self, img: np.ndarray):
+        """Legacy detection method (kept for compatibility)."""
+        cfg = self.cell_config
+
+        # Thresholding
+        if cfg.threshold_method == "otsu":
+            thresh = filters.threshold_otsu(img)
+        elif cfg.threshold_method == "adaptive":
+            thresh = filters.threshold_local(img, block_size=cfg.adaptive_block_size)
+        elif cfg.threshold_method == "local":
+            thresh = filters.threshold_local(
+                img, block_size=cfg.local_radius * 2 + 1, method='gaussian'
+            )
+        elif cfg.threshold_method == "manual":
+            thresh = cfg.manual_threshold
+        else:
             thresh = 0
 
         binary = img > thresh
@@ -263,22 +322,21 @@ class ImageProcessor:
         labeled = measure.label(binary)
         props = measure.regionprops(labeled)
 
-        # Filter by size and circularity
         mask = np.zeros_like(binary)
         for prop in props:
-            if (self.cell_config.min_cell_size <= prop.area <= self.cell_config.max_cell_size and
-                prop.perimeter**2 / (4 * np.pi * prop.area) <= 1/self.cell_config.circularity_threshold):
+            if (cfg.min_cell_size <= prop.area <= cfg.max_cell_size and
+                    prop.perimeter ** 2 / (4 * np.pi * prop.area) <= 1 / cfg.circularity_threshold):
                 mask[tuple(prop.coords.T)] = True
 
-        # Watershed segmentation for touching cells
+        # Watershed
         distance = distance_transform_edt(mask)
         coords = feature.peak_local_max(
             distance,
-            min_distance=self.cell_config.min_peak_distance,
-            threshold_abs=self.cell_config.peak_min_intensity,
+            min_distance=cfg.min_peak_distance,
+            threshold_abs=cfg.peak_min_intensity,
             exclude_border=True
         )
-        
+
         markers = np.zeros_like(distance, dtype=bool)
         markers[tuple(coords.T)] = True
         markers = measure.label(markers)
@@ -287,7 +345,7 @@ class ImageProcessor:
             -distance,
             markers,
             mask=mask,
-            compactness=self.cell_config.watershed_compactness
+            compactness=cfg.watershed_compactness
         )
 
         return img, labels
@@ -427,6 +485,7 @@ class PDFViewer:
 
         # Transparent menu / window mode
         self.transparent_mode = tk.BooleanVar(value=False)
+        self.transparent_windows = []  # popups that should follow transparent mode
 
         # Persistent paint layer (this is the key to zoom-safe painting)
         self.paint_layer = None  # RGBA PIL Image, created when background is loaded
@@ -537,8 +596,17 @@ class PDFViewer:
         self.menu.add_cascade(label="View", menu=viewmenu)
 
         def toggle_transparent_mode():
+            # Main window always stays fully opaque
+            self.master.attributes('-alpha', 1.0)
+
+            # Update all currently open popups
             alpha = 0.3 if self.transparent_mode.get() else 1.0
-            self.master.attributes('-alpha', alpha)
+            for w in self.transparent_windows[:]:
+                try:
+                    w.attributes('-alpha', alpha)
+                except Exception:
+                    if w in self.transparent_windows:
+                        self.transparent_windows.remove(w)
 
         viewmenu.add_checkbutton(
             label="Transparent Mode (70%)",
@@ -1137,9 +1205,7 @@ class PDFViewer:
         window = Toplevel(self.master)
         window.attributes('-topmost', 'true')
         window.protocol("WM_DELETE_WINDOW", self.disable_event)
-
-        if self.transparent_mode.get():
-            window.attributes('-alpha', 0.3)
+        self._register_transparent_window(window)
 
         window.title("Brush Settings")
         tk.Label(window, text="Brush Size: ").grid(row=2, column=0)
@@ -1155,9 +1221,7 @@ class PDFViewer:
         window = Toplevel(self.master)
         window.attributes('-topmost', 'true')
         window.protocol("WM_DELETE_WINDOW", self.disable_event)
-
-        if self.transparent_mode.get():
-            window.attributes('-alpha', 0.3)
+        self._register_transparent_window(window)
 
         window.title("Scale Settings")
         # Scale controls
@@ -1179,9 +1243,7 @@ class PDFViewer:
         window = Toplevel(self.master)
         window.attributes('-topmost', 'true')
         window.protocol("WM_DELETE_WINDOW", self.disable_event)
-
-        if self.transparent_mode.get():
-            window.attributes('-alpha', 0.3)
+        self._register_transparent_window(window)
 
         window.title("Rotate Settings")
         rotation_label = ttk.Label(window, text="Rotate (degrees):")
@@ -1199,9 +1261,7 @@ class PDFViewer:
         window = Toplevel(self.master)
         window.attributes('-topmost', 'true')
         window.protocol("WM_DELETE_WINDOW", self.disable_event)
-        
-        if self.transparent_mode.get():
-            window.attributes('-alpha', 0.3)
+        self._register_transparent_window(window)
 
         window.title("Brightness Settings")
         brightness_label = ttk.Label(window, text="Brightness:")
@@ -1220,10 +1280,7 @@ class PDFViewer:
         window.attributes('-topmost', 'true')
         # Allow the window's X button to close the dialog properly
         window.protocol("WM_DELETE_WINDOW", window.destroy)
-
-        # Apply transparent mode (70% opacity) if enabled
-        if self.transparent_mode.get():
-            window.attributes('-alpha', 0.3)
+        self._register_transparent_window(window)
 
         window.title("Mask Settings")
 
@@ -1254,26 +1311,27 @@ class PDFViewer:
 
         def autotune_more_cells():
             cfg = self.image_processor.cell_config
-            cfg.min_cell_size = max(5, cfg.min_cell_size - 6)
-            cfg.peak_min_intensity = max(0.01, round(cfg.peak_min_intensity - 0.06, 2))
-            cfg.circularity_threshold = max(0.25, round(cfg.circularity_threshold - 0.06, 2))
-            cfg.min_peak_distance = max(2, cfg.min_peak_distance - 1)
-            if cfg.threshold_method == "manual":
-                cfg.manual_threshold = max(0.05, round(cfg.manual_threshold - 0.08, 2))
-            # Slightly more sensitive preprocessing
-            pcfg = self.image_processor.preprocess_config
-            if pcfg.denoise_method != "none":
-                pcfg.nr_gaussian_sigma = max(0.3, round(pcfg.nr_gaussian_sigma - 0.3, 1))
+            if cfg.detection_method == "blob":
+                cfg.blob_threshold = max(0.01, round(cfg.blob_threshold - 0.025, 3))
+                cfg.blob_min_sigma = max(1.0, round(cfg.blob_min_sigma - 0.4, 1))
+                cfg.blob_min_area = max(5, cfg.blob_min_area - 5)
+            else:
+                cfg.min_cell_size = max(5, cfg.min_cell_size - 6)
+                cfg.peak_min_intensity = max(0.01, round(cfg.peak_min_intensity - 0.06, 2))
+                cfg.circularity_threshold = max(0.25, round(cfg.circularity_threshold - 0.06, 2))
+                cfg.min_peak_distance = max(2, cfg.min_peak_distance - 1)
             _apply_autotune_and_refresh(lambda: None)
 
         def autotune_less_cells():
             cfg = self.image_processor.cell_config
-            cfg.min_cell_size += 6
-            cfg.peak_min_intensity = min(0.95, round(cfg.peak_min_intensity + 0.06, 2))
-            cfg.circularity_threshold = min(0.95, round(cfg.circularity_threshold + 0.06, 2))
-            cfg.min_peak_distance += 1
-            if cfg.threshold_method == "manual":
-                cfg.manual_threshold = min(0.95, round(cfg.manual_threshold + 0.08, 2))
+            if cfg.detection_method == "blob":
+                cfg.blob_threshold = min(0.9, round(cfg.blob_threshold + 0.03, 3))
+                cfg.blob_min_area += 8
+            else:
+                cfg.min_cell_size += 6
+                cfg.peak_min_intensity = min(0.95, round(cfg.peak_min_intensity + 0.06, 2))
+                cfg.circularity_threshold = min(0.95, round(cfg.circularity_threshold + 0.06, 2))
+                cfg.min_peak_distance += 1
             _apply_autotune_and_refresh(lambda: None)
 
         def autotune_bigger_cells():
@@ -1299,9 +1357,13 @@ class PDFViewer:
 
         def autotune_dimmer_cells():
             cfg = self.image_processor.cell_config
-            cfg.peak_min_intensity = max(0.01, round(cfg.peak_min_intensity - 0.10, 2))
-            # Also relax size a little to catch dim but real cells
-            cfg.min_cell_size = max(5, cfg.min_cell_size - 3)
+            if cfg.detection_method == "blob":
+                cfg.blob_threshold = max(0.005, round(cfg.blob_threshold - 0.04, 3))
+                cfg.blob_min_sigma = max(1.0, round(cfg.blob_min_sigma - 0.5, 1))
+                cfg.blob_min_area = max(5, cfg.blob_min_area - 4)
+            else:
+                cfg.peak_min_intensity = max(0.01, round(cfg.peak_min_intensity - 0.10, 2))
+                cfg.min_cell_size = max(5, cfg.min_cell_size - 3)
             _apply_autotune_and_refresh(lambda: None)
 
 
@@ -1378,6 +1440,17 @@ class PDFViewer:
             self.tm_manual_frame = ttk.LabelFrame(tm_frame, text='Manual')
             self.other_circularity_frame = ttk.LabelFrame(option_frame, text='Circularity')
             self.other_watershed_frame = ttk.LabelFrame(option_frame, text='Watershed')
+            self.blob_frame = ttk.LabelFrame(option_frame, text='Blob Detection (Recommended)')
+
+            # Quick method switcher
+            method_frame = ttk.Frame(option_frame)
+            ttk.Label(method_frame, text="Detection Method:").pack(side='left', padx=5)
+            self.detection_method_var = tk.StringVar(value=self.image_processor.cell_config.detection_method)
+            ttk.Radiobutton(method_frame, text="Blob (new)", variable=self.detection_method_var, value="blob",
+                            command=lambda: setattr(self.image_processor.cell_config, 'detection_method', 'blob')).pack(side='left')
+            ttk.Radiobutton(method_frame, text="Watershed (old)", variable=self.detection_method_var, value="watershed",
+                            command=lambda: setattr(self.image_processor.cell_config, 'detection_method', 'watershed')).pack(side='left')
+            method_frame.grid(row=3, column=0, sticky='w', pady=8)
 
             tm_otsu_options = [] # None
             tm_adaptive_options = ['adaptive_block_size']
@@ -1385,13 +1458,17 @@ class PDFViewer:
             tm_manual_options = ['manual_threshold']
             other_circularity_options = ['min_cell_size', 'max_cell_size', 'circularity_threshold']
             other_watershed_options = ['min_peak_distance', 'peak_min_intensity', 'watershed_compactness']
+            blob_options = ['blob_min_sigma', 'blob_max_sigma', 'blob_num_sigma',
+                            'blob_threshold', 'blob_overlap', 'blob_min_area',
+                            'blob_max_area', 'blob_min_circularity']
 
             cell_detect_options = [ tm_otsu_options,
                                     tm_adaptive_options,
                                     tm_local_options,
                                     tm_manual_options,
                                     other_circularity_options,
-                                    other_watershed_options
+                                    other_watershed_options,
+                                    blob_options
                                   ]
 
             cell_detect_frames = [  self.tm_otsu_frame,
@@ -1399,7 +1476,8 @@ class PDFViewer:
                                     self.tm_local_frame,
                                     self.tm_manual_frame,
                                     self.other_circularity_frame,
-                                    self.other_watershed_frame
+                                    self.other_watershed_frame,
+                                    self.blob_frame
                                  ]
 
             for i in range(0, len(cell_detect_options)):
@@ -1413,6 +1491,7 @@ class PDFViewer:
             # Static: do not change with radiobutton, so they can be shown now
             self.other_circularity_frame.grid(row=0, column=0, sticky='news')
             self.other_watershed_frame.grid(row=1, column=0, sticky='news')
+            self.blob_frame.grid(row=2, column=0, sticky='news')
 
         def create_setter(entry_widget, config_obj, attr_name):
             def setter(*args):
@@ -1515,6 +1594,10 @@ class PDFViewer:
         ttk.Button(auto_btns, text="Smaller cells", width=12, command=autotune_smaller_cells).grid(row=1, column=0, padx=2, pady=1)
         ttk.Button(auto_btns, text="Brighter cells", width=12, command=autotune_brighter_cells).grid(row=1, column=1, padx=2, pady=1)
         ttk.Button(auto_btns, text="Dimmer cells", width=12, command=autotune_dimmer_cells).grid(row=1, column=2, padx=2, pady=1)
+
+        # Smart Local Agent button (fully offline, no data leaves the computer)
+        ttk.Button(control_frame, text="Smart Suggest (Offline)", 
+                   command=self._show_smart_suggest_dialog).grid(row=1, column=4, padx=(15, 5), pady=(6, 2))
 
         # Presets row
         ttk.Label(control_frame, text="Presets:").grid(row=2, column=0, padx=(5, 8), pady=(8, 2), sticky='w')
@@ -1692,6 +1775,7 @@ class PDFViewer:
         if self.background_image is None:
             messagebox.showerror("Error", "Please import a TIFF file first.")
             return
+        self.show_brush_settings()
         self.start_mask_edit(add=True)
 
     def start_remove_cells(self):
@@ -1699,6 +1783,7 @@ class PDFViewer:
         if self.background_image is None:
             messagebox.showerror("Error", "Please import a TIFF file first.")
             return
+        self.show_brush_settings()
         self.start_mask_edit(add=False)
 
     def start_mask_edit(self, add=True):
@@ -1777,6 +1862,223 @@ class PDFViewer:
         self.output.bind("<Button-1>", self.highlight_region)
         logger.info("Stopped mask edit mode")
         messagebox.showinfo("Mask Editing", "Mask edits applied. You can now re-count cells.")
+
+    # ==================================================================
+    # OFFLINE SMART SUGGEST AGENT (Fully local, no data leaves computer)
+    # ==================================================================
+
+    def _analyze_current_detection(self):
+        """
+        Fully local analysis of the current image and detection result.
+        Returns useful statistics and suggestions for blob parameters.
+        Everything runs on the user's machine.
+        """
+        if self.original_background is None:
+            return None
+
+        background = np.array(self.original_background.convert('L')).astype(np.float32) / 255.0
+
+        # Get current detection
+        try:
+            _, auto_labels = binary_mask_cell_count(background, processor=self.image_processor)
+            current_mask = auto_labels > 0
+        except Exception as e:
+            logger.error(f"Analysis failed during detection: {e}")
+            return None
+
+        num_detections = int(np.sum(current_mask))
+        total_pixels = background.size
+        detection_density = num_detections / total_pixels * 1_000_000  # detections per megapixel
+
+        # Intensity statistics
+        detected_intensities = background[current_mask] if num_detections > 0 else np.array([0.0])
+        non_detected = background[~current_mask]
+
+        mean_detected = float(np.mean(detected_intensities)) if num_detections > 0 else 0.0
+        mean_background = float(np.mean(non_detected)) if len(non_detected) > 0 else 0.0
+        contrast = mean_detected - mean_background
+
+        # Rough noise estimate
+        noise_estimate = float(np.std(non_detected[:10000])) if len(non_detected) > 10000 else 0.05
+
+        suggestions = []
+
+        cfg = self.image_processor.cell_config
+
+        # === Heuristic recommendations for blob mode ===
+        if cfg.detection_method != "blob":
+            suggestions.append({
+                "param": "detection_method",
+                "current": cfg.detection_method,
+                "suggested": "blob",
+                "reason": "The new Blob detector is significantly better for most immunofluorescence images than the old Watershed method."
+            })
+
+        # Too many detections → too sensitive
+        if detection_density > 850:
+            new_threshold = min(0.95, round(cfg.blob_threshold + 0.04, 3))
+            suggestions.append({
+                "param": "blob_threshold",
+                "current": cfg.blob_threshold,
+                "suggested": new_threshold,
+                "reason": f"Very high detection density ({detection_density:.0f} per MP). Raising threshold to reduce false positives."
+            })
+
+        # Very low threshold with many detections
+        if cfg.blob_threshold < 0.07 and num_detections > 400:
+            suggestions.append({
+                "param": "blob_threshold",
+                "current": cfg.blob_threshold,
+                "suggested": max(0.08, round(cfg.blob_threshold + 0.05, 3)),
+                "reason": "Low threshold + high count usually means lots of noise is being detected."
+            })
+
+        # Very small min_sigma picking up noise
+        if cfg.blob_min_sigma < 1.8:
+            suggestions.append({
+                "param": "blob_min_sigma",
+                "current": cfg.blob_min_sigma,
+                "suggested": max(1.8, round(cfg.blob_min_sigma + 0.6, 1)),
+                "reason": "Very small sigma values detect tiny noise specks. Raising it helps focus on real cells."
+            })
+
+        # Low min area
+        if cfg.blob_min_area < 20 and num_detections > 300:
+            suggestions.append({
+                "param": "blob_min_area",
+                "current": cfg.blob_min_area,
+                "suggested": max(22, cfg.blob_min_area + 8),
+                "reason": "Small minimum area allows many noise blobs through."
+            })
+
+        # Low circularity on noisy data
+        if cfg.blob_min_circularity < 0.65:
+            suggestions.append({
+                "param": "blob_min_circularity",
+                "current": cfg.blob_min_circularity,
+                "suggested": min(0.78, round(cfg.blob_min_circularity + 0.08, 2)),
+                "reason": "Low circularity threshold allows irregular noise to be counted as cells."
+            })
+
+        # If contrast is low, suggest slightly more aggressive denoising
+        if contrast < 0.12:
+            suggestions.append({
+                "param": "preprocess_nr_gaussian",
+                "current": self.image_processor.preprocess_config.nr_gaussian_sigma,
+                "suggested": min(2.0, round(self.image_processor.preprocess_config.nr_gaussian_sigma + 0.4, 1)),
+                "reason": "Low contrast between cells and background. A bit more denoising can help."
+            })
+
+        return {
+            "num_detections": num_detections,
+            "detection_density": round(detection_density, 1),
+            "contrast": round(contrast, 3),
+            "noise_estimate": round(noise_estimate, 4),
+            "suggestions": suggestions
+        }
+
+    def _show_smart_suggest_dialog(self):
+        """Shows suggestions from the fully local offline agent."""
+        analysis = self._analyze_current_detection()
+
+        if analysis is None:
+            messagebox.showerror("Analysis Failed", "Could not analyze the current image. Please load an image first.")
+            return
+
+        suggestions = analysis["suggestions"]
+
+        if not suggestions:
+            messagebox.showinfo(
+                "Smart Suggest",
+                "The current settings look reasonably balanced for this image.\n\n"
+                f"Detections: {analysis['num_detections']}  |  Density: {analysis['detection_density']} per MP"
+            )
+            return
+
+        # Build suggestion dialog
+        dialog = Toplevel(self.root)
+        dialog.title("Smart Suggest (Fully Offline)")
+        dialog.geometry("620x480")
+
+        ttk.Label(dialog, text="Local Analysis (no data leaves your computer)", font=("Helvetica", 11, "bold")).pack(pady=8)
+
+        info = f"Detections found: {analysis['num_detections']}   |   Density: {analysis['detection_density']} per MP   |   Contrast: {analysis['contrast']}"
+        ttk.Label(dialog, text=info).pack(pady=4)
+
+        suggestions_frame = ttk.Frame(dialog)
+        suggestions_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+        # Store (suggestion_dict, BooleanVar) pairs
+        suggestion_vars = []
+
+        for suggestion in suggestions:
+            var = tk.BooleanVar(value=True)  # default to checked
+            suggestion_vars.append((suggestion, var))
+
+            frame = ttk.Frame(suggestions_frame, relief='groove', borderwidth=1)
+            frame.pack(fill='x', pady=4)
+
+            # Checkbox on the left
+            cb = ttk.Checkbutton(frame, variable=var)
+            cb.pack(side='left', padx=6, pady=4)
+
+            # Text content
+            text = f"{suggestion['param']} :  {suggestion['current']}  →  {suggestion['suggested']}"
+            ttk.Label(frame, text=text, font=("Helvetica", 10, "bold")).pack(anchor='w', padx=8, pady=(4, 0))
+            ttk.Label(frame, text=suggestion['reason'], wraplength=520).pack(anchor='w', padx=8, pady=(0, 6))
+
+        # Bottom buttons
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(fill='x', padx=10, pady=12)
+
+        def apply_suggestion(sugg):
+            cfg = self.image_processor.cell_config
+            pcfg = self.image_processor.preprocess_config
+
+            param = sugg['param']
+            value = sugg['suggested']
+
+            if param == "detection_method":
+                cfg.detection_method = value
+            elif param == "preprocess_nr_gaussian":
+                pcfg.nr_gaussian_sigma = value
+            else:
+                setattr(cfg, param, value)
+
+        def apply_checked():
+            applied = 0
+            for sugg, var in suggestion_vars:
+                if var.get():
+                    apply_suggestion(sugg)
+                    applied += 1
+            if applied > 0:
+                messagebox.showinfo("Applied", f"Applied {applied} change(s).\n\nYou may need to click 'Show Mask' again to see the effect.")
+            dialog.destroy()
+
+        def apply_all():
+            for sugg, var in suggestion_vars:
+                apply_suggestion(sugg)
+            messagebox.showinfo("Applied", "Applied all suggested changes.\n\nYou may need to click 'Show Mask' again to see the effect.")
+            dialog.destroy()
+
+        ttk.Button(button_frame, text="Apply All That Are Checked", command=apply_checked, width=26).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="Apply All", command=apply_all, width=14).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="Close", command=dialog.destroy, width=10).pack(side='right', padx=5)
+
+    def _register_transparent_window(self, window):
+        """Register a popup window so it follows the Transparent Mode setting."""
+        if window not in self.transparent_windows:
+            self.transparent_windows.append(window)
+
+        # Apply current transparency state
+        alpha = 0.3 if self.transparent_mode.get() else 1.0
+        window.attributes('-alpha', alpha)
+
+        # Best-effort cleanup when the window is closed
+        def cleanup(event=None):
+            if window in self.transparent_windows:
+                self.transparent_windows.remove(window)
+        window.bind("<Destroy>", cleanup, add="+")
 
 
 
@@ -1874,18 +2176,13 @@ class PDFViewer:
         """Create a progress dialog with a determinate loading bar.
         Returns an object with .set_progress(percent, message) and .close() methods.
         """
-        transparent = self.transparent_mode.get()
-
         class ProgressDialog:
-            def __init__(self, parent, title, transparent):
+            def __init__(self, parent, title):
                 self.window = Toplevel(parent)
                 self.window.title(title)
                 self.window.attributes('-topmost', True)
                 self.window.resizable(False, False)
                 self.window.protocol("WM_DELETE_WINDOW", lambda: None)
-
-                if transparent:
-                    self.window.attributes('-alpha', 0.3)
 
                 self.label = ttk.Label(self.window, text="Initializing...")
                 self.label.pack(padx=20, pady=(15, 5))
@@ -1913,7 +2210,9 @@ class PDFViewer:
                 except:
                     pass
 
-        return ProgressDialog(self.master, title, transparent)
+        dialog = ProgressDialog(self.master, title)
+        self._register_transparent_window(dialog.window)
+        return dialog
 
     def save_state(self):
         self.state_manager.save_state(self)
