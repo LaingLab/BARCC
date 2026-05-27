@@ -378,6 +378,65 @@ def build_manual():
         "At least 8 GB RAM recommended for large images"
     ])
 
+    pdf.chapter_title("Image Format and Compatibility Requirements", 1)
+    pdf.body(
+        "BARCC is designed primarily for quantitative analysis of immunofluorescence images. "
+        "The following specifications describe the supported and recommended image characteristics:"
+    )
+
+    pdf.chapter_title("Supported File Formats", 2)
+    pdf.body(
+        "BARCC supports the following image file formats with varying levels of compatibility:"
+    )
+    pdf.bullet_list([
+        "TIFF (.tif, .tiff) — Fully supported and strongly recommended. Supports both single-page and multi-page (stacked) TIFF files. Handles 8-bit, 16-bit, and 32-bit floating point data. This is the only format recommended for serious quantitative work.",
+        "PNG — Limited support. May be imported in certain workflows but is not recommended for primary analysis due to potential compression artifacts.",
+        "JPEG / JPG — Not supported. Lossy compression makes these formats unsuitable for cell detection and quantitative analysis."
+    ])
+
+    pdf.chapter_title("Bit Depth and Data Types", 2)
+    pdf.bullet_list([
+        "8-bit (uint8) — Supported",
+        "16-bit (uint16) — Fully supported and recommended for most immunofluorescence work",
+        "32-bit floating point — Supported (both 0–1 normalized and arbitrary ranges)",
+        "Multi-channel images (RGB, RGBA, etc.) — Accepted but typically converted or reduced internally. Single-channel grayscale images are strongly preferred for best results."
+    ])
+
+    pdf.chapter_title("Image Dimensions and Size", 2)
+    pdf.body(
+        "BARCC has no hard upper limits on image dimensions, but practical performance considerations apply:"
+    )
+    pdf.bullet_list([
+        "Recommended maximum: approximately 8,000–10,000 pixels on the longest side for comfortable interactive use.",
+        "Very large images (e.g., > 12,000–15,000 pixels per side) may cause high memory usage, slow performance during detection, or instability during manual editing.",
+        "File sizes above ~500 MB can lead to noticeable slowdowns in the Mask Settings dialog and when generating visualizations."
+    ])
+
+    pdf.chapter_title("Resolution and Physical Scaling", 2)
+    pdf.body(
+        "BARCC is strictly pixel-based and does not read or use image resolution metadata (DPI or µm/pixel). "
+        "All detection parameters (cell size, sigma values, peak intensity, etc.) are expressed in pixels. "
+        "Users must convert biological size requirements into pixel values based on their specific imaging resolution."
+    )
+
+    pdf.chapter_title("Recommended Image Characteristics", 2)
+    pdf.body(
+        "For optimal performance with the current detection system (especially the Blob Detection method):"
+    )
+    pdf.bullet_list([
+        "File format: Uncompressed or lossless TIFF",
+        "Bit depth: 16-bit or 32-bit floating point",
+        "Background: Relatively dark and uniform",
+        "Cell appearance: Locally brighter than background, roughly circular or elliptical",
+        "Noise level: Moderate to low (use preprocessing denoising when necessary)",
+        "Image size: 1,000–8,000 pixels on the longest side for best interactive experience"
+    ])
+
+    pdf.note_box(
+        "While BARCC can technically load images outside these recommendations, results may be suboptimal. "
+        "For best accuracy and performance, prepare images as single-channel TIFFs with good contrast between cells and background."
+    )
+
     pdf.chapter_title("Installation Steps", 1)
     pdf.body("1. Clone the repository:")
     pdf.set_font("Courier", "", 9)
