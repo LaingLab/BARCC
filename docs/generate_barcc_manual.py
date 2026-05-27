@@ -38,6 +38,29 @@ class BARCCUserManual(FPDF):
         self.current_chapter = ""
         self.chapter_pages = {}  # For future TOC enhancements
 
+    def _safe_text(self, text):
+        """Replace Unicode characters that Helvetica doesn't support."""
+        replacements = {
+            '\u2014': '-',      # em dash —
+            '\u2013': '-',      # en dash –
+            '\u201c': '"',      # left double quote “
+            '\u201d': '"',      # right double quote ”
+            '\u2018': "'",      # left single quote ‘
+            '\u2019': "'",      # right single quote ’
+            '\u2026': '...',    # ellipsis …
+            '\u00a0': ' ',      # non-breaking space
+            '\u2713': '[x]',    # check mark ✓
+            '\u2714': '[x]',    # heavy check mark ✔
+            '\u2022': '-',      # bullet •
+            '\u2010': '-',      # hyphen
+            '\u2011': '-',      # non-breaking hyphen
+            '\u2012': '-',      # figure dash
+            '\u2043': '-',      # hyphen bullet
+        }
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        return text
+
     # ------------------------------------------------------------------
     # HEADER & FOOTER
     # ------------------------------------------------------------------
@@ -53,7 +76,7 @@ class BARCCUserManual(FPDF):
         if self.current_chapter:
             self.set_font("Helvetica", "", 9)
             self.set_text_color(*GRAY_TEXT)
-            self.cell(0, 10, self.current_chapter[:50], new_x=XPos.RIGHT, new_y=YPos.TOP, align="R")
+            self.cell(0, 10, self._safe_text(self.current_chapter[:50]), new_x=XPos.RIGHT, new_y=YPos.TOP, align="R")
 
         # Accent line under header
         self.set_draw_color(*ACCENT_COLOR)
@@ -73,7 +96,7 @@ class BARCCUserManual(FPDF):
         self.cell(0, 10, page_text, new_x=XPos.RIGHT, new_y=YPos.TOP, align="L")
 
         # Right side - copyright
-        self.cell(0, 10, "(c) 2026 Laing Lab - BARCC", new_x=XPos.RIGHT, new_y=YPos.TOP, align="R")
+        self.cell(0, 10, self._safe_text("(c) 2026 Laing Lab - BARCC"), new_x=XPos.RIGHT, new_y=YPos.TOP, align="R")
 
     # ------------------------------------------------------------------
     # STYLED CONTENT HELPERS
@@ -146,13 +169,14 @@ class BARCCUserManual(FPDF):
 
     def chapter_title(self, title: str, level: int = 0):
         """Add a styled chapter or section title."""
-        self.current_chapter = title
+        safe_title = self._safe_text(title)
+        self.current_chapter = safe_title
 
         if level == 0:
             self.add_page()
             self.set_font("Helvetica", "B", 18)
             self.set_text_color(*ACCENT_COLOR)
-            self.cell(0, 12, title, new_x=XPos.RIGHT, new_y=YPos.NEXT)
+            self.cell(0, 12, safe_title, new_x=XPos.RIGHT, new_y=YPos.NEXT)
             # Underline
             self.set_draw_color(*ACCENT_COLOR)
             self.set_line_width(0.5)
@@ -162,13 +186,13 @@ class BARCCUserManual(FPDF):
             self.set_font("Helvetica", "B", 13)
             self.set_text_color(*DARK_TEXT)
             self.ln(4)
-            self.cell(0, 8, title, new_x=XPos.RIGHT, new_y=YPos.NEXT)
+            self.cell(0, 8, safe_title, new_x=XPos.RIGHT, new_y=YPos.NEXT)
             self.ln(1)
         else:
             self.set_font("Helvetica", "B", 11)
             self.set_text_color(*DARK_TEXT)
             self.ln(3)
-            self.cell(0, 7, title, new_x=XPos.RIGHT, new_y=YPos.NEXT)
+            self.cell(0, 7, safe_title, new_x=XPos.RIGHT, new_y=YPos.NEXT)
             self.ln(1)
 
         self.set_text_color(*DARK_TEXT)
@@ -178,7 +202,8 @@ class BARCCUserManual(FPDF):
         """Standard body paragraph."""
         self.set_font("Helvetica", "", 10.5)
         self.set_text_color(*DARK_TEXT)
-        self.multi_cell(0, 5.8, text)
+        self.set_x(25)  # Ensure safe left margin
+        self.multi_cell(0, 5.8, self._safe_text(text))
         self.ln(3)
 
     def bullet_list(self, items: list[str]):
@@ -187,7 +212,7 @@ class BARCCUserManual(FPDF):
         self.set_text_color(*DARK_TEXT)
         for item in items:
             self.set_x(30)
-            self.multi_cell(0, 5.8, f"-  {item}")
+            self.multi_cell(0, 5.8, f"-  {self._safe_text(item)}")
             self.ln(0.5)
         self.ln(3)
 
@@ -233,7 +258,7 @@ class BARCCUserManual(FPDF):
         self.set_font("Helvetica", "", 9.5)
         self.set_text_color(*DARK_TEXT)
         self.set_x(25)
-        self.multi_cell(166, 5.5, text)
+        self.multi_cell(166, 5.5, self._safe_text(text))
         y_end = self.get_y()
         self.rect(25, y_start, 166, y_end - y_start, "D")
         self.ln(4)
@@ -363,6 +388,15 @@ def build_manual():
     pdf.body("2. Install dependencies:")
     pdf.set_font("Courier", "", 9)
     pdf.multi_cell(0, 5, "pip install -r requirements.txt")
+    pdf.ln(2)
+
+    pdf.set_font("Helvetica", "", 10)
+    pdf.body(
+        "For full .xlsx export support (including the Detection Parameters metadata sheet) and the _masked.tif "
+        "feature, also install the Excel engines:"
+    )
+    pdf.set_font("Courier", "", 9)
+    pdf.multi_cell(0, 5, "pip install openpyxl xlsxwriter")
     pdf.ln(3)
 
     pdf.set_font("Helvetica", "", 10.5)
@@ -463,19 +497,29 @@ def build_manual():
 
     pdf.chapter_title("File Browser (Left Pane)", 1)
     pdf.body(
-        "A dedicated file manager pane is available on the left side of the main window. "
-        "Click \"Select Folder\" to choose a directory containing your experimental TIFF images. "
-        "All .tif and .tiff files in that folder are listed. Double-click any file to load it as the active image."
+        "BARCC v8.01 introduced a dedicated file manager pane on the left side of the main window. "
+        "This makes it much easier to work with folders containing many TIFF images."
     )
 
     pdf.body(
-        "A second column shows a checkmark (✓) for any image that already has a corresponding results file "
-        "(.csv or .xlsx) in the same folder from a previous Count Cells operation. This makes it easy to see "
-        "which images in a large dataset have already been processed."
+        "Click the \"Select Folder\" button at the top of the left pane to choose a directory. "
+        "BARCC will scan the folder and display all .tif and .tiff files in a list. "
+        "Double-click any file in the list to load it as the active working image."
     )
 
     pdf.body(
-        "Use the Refresh button if you add or remove files from the folder while the program is running."
+        "A second column in the list displays a checkmark (✓) next to any image that has already been processed. "
+        "This checkmark appears automatically if a matching .csv or .xlsx results file (generated by Count Cells) "
+        "exists in the same folder. This is very useful for tracking which images in a large dataset have already been counted."
+    )
+
+    pdf.body(
+        "The Refresh button rescans the current folder. This is useful if you add or remove files while BARCC is running."
+    )
+
+    pdf.note_box(
+        "The File Browser works independently of the traditional \"File > Import TIFF\" menu. "
+        "You can still use the menu for one-off files, but the left pane is much faster when working with a whole folder of images."
     )
 
     pdf.chapter_title("Save Flattened Image", 1)
@@ -798,6 +842,24 @@ def build_manual():
         "use the new \"Smart Suggest (Offline)\" button instead (see below)."
     )
 
+    pdf.chapter_title("Export / Import Settings", 1)
+    pdf.body(
+        "You can now export your current detection and preprocessing settings as a portable .json file. "
+        "This is useful for backing up configurations, sharing them with colleagues, or moving them between computers."
+    )
+
+    pdf.body(
+        "In the Mask Settings dialog, use the buttons at the bottom:"
+    )
+    pdf.bullet_list([
+        "\"Export Settings...\" — Saves your current Blob (or Watershed) configuration and preprocessing settings to a .json file of your choice.",
+        "\"Import Settings...\" — Loads a previously exported .json file and applies all parameters immediately."
+    ])
+
+    pdf.body(
+        "This is separate from the internal Presets system (which stores quick named presets locally in ~/.barc/presets.json)."
+    )
+
     pdf.chapter_title("Smart Suggest (Offline) – New in v8.01", 1)
     pdf.body(
         "This is one of the most powerful new features in BARCC 8.01. Clicking \"Smart Suggest (Offline)\" "
@@ -807,7 +869,8 @@ def build_manual():
 
     pdf.bullet_list([
         "Everything runs 100% on your computer — no images or data are sent anywhere.",
-        "You can selectively check the suggestions you want and apply them with one click.",
+        "Each suggestion has a checkbox. You can selectively choose which changes to apply.",
+        "Buttons at the bottom allow you to \"Apply All\", \"Apply All That Are Checked\", or simply \"Close\".",
         "It works with both Blob and Watershed modes and gives context-aware advice based on your actual data."
     ])
 
