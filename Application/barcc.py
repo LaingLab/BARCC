@@ -714,7 +714,7 @@ class PDFViewer:
         self.output.unbind('<Button-1>')
         self.output.unbind('<Button-3>')
         self.output.bind('<Button-1>', self.highlight_region)
-        self.menu.delete(7)
+        self.menu.delete(8)
         self.current_state = None
 
         # Auto-assign default names to any painted strokes/groups that the user didn't explicitly name
@@ -920,7 +920,7 @@ class PDFViewer:
             self.reset(event)
         else:
             print('error', file=sys.stderr)
-        self.menu.entryconfig(7, label="Pen: "+str(self.draw_type))
+        self.menu.entryconfig(8, label="Pen: "+str(self.draw_type))
 
     def reset(self, event):
         self.old_x, self.old_y = None, None
