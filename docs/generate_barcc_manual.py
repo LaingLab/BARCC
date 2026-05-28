@@ -16,7 +16,7 @@ import os
 # ============================================================================
 MANUAL_TITLE = "BARCC - Brain Atlas Regional Cell Counter"
 MANUAL_SUBTITLE = "User Manual"
-VERSION = "8.01.000"
+VERSION = "8.02.000"
 OUTPUT_FILENAME = "BARCC_User_Manual.pdf"
 OUTPUT_DIR = ".."  # Place PDF in repository root
 
@@ -350,6 +350,30 @@ def build_manual():
     # ------------------------------------------------------------------
     # 2. INSTALLATION
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # What's New — 8.02.000 (current)
+    # ------------------------------------------------------------------
+    pdf.chapter_title("What's New in Version 8.02.000", 0)
+
+    pdf.body(
+        "BARCC 8.02.000 delivers major stability, accuracy, and reliability improvements focused on the Paint tool workflow for creating custom analysis regions:"
+    )
+
+    pdf.bullet_list([
+        "Painted zones that are named immediately after drawing (via right-click) now correctly and reliably register for cell counting. Clicking Count Cells automatically stops paint mode and converts all strokes — both user-named regions and auto-defaulted \"Painted Region N\" entries.",
+        "Complete prevention of cross-image contamination: every new TIFF loaded (via File Browser or Import) performs a full wipe of all mask_images, zone_names, zone_counters, named_paint_groups, and durable paint geometry data.",
+        "Durable storage of paint stroke geometry using stable model/image coordinates (not view-dependent canvas coords). Hand-drawn regions now survive zooming, panning, and internal canvas refreshes.",
+        "Accurate interior filling of painted structures using scipy.ndimage.binary_fill_holes after boundary stroking. Cells that are visibly inside your drawn outlines are now counted correctly instead of only thin boundary pixels.",
+        "Neighborhood search (5x5) around each detected cell centroid when looking up zone membership. This provides tolerance for drawing precision and any remaining micro-imperfections in region fills.",
+        "Critical stability fix: Closing the \"Counting Cells\" or \"Detecting Cells\" progress dialog with the X button (or Alt+F4) before the operation finishes no longer crashes the application. All progress UI methods are now fully defensive no-op after early dismissal.",
+        "Elimination of duplicate zone entries (e.g., 6 zones appearing when only 3 were drawn) through proper retirement of processed paint groups after conversion.",
+        "Overall hardening of the entire paint -> named group -> zone mask -> counting pipeline."
+    ])
+
+    pdf.body(
+        "These changes make the Paint tool (for custom regions outside of atlas PDFs) fully trustworthy and production-ready for quantitative cell counting work."
+    )
+
     pdf.chapter_title("What's New in Version 8.01.000", 0)
 
     pdf.body(

@@ -2,7 +2,18 @@
 
 A GUI tool for analyzing immunofluorescence images with atlas region mapping and automated cell counting.
 
-**v8.01.000 Highlights**
+**v8.02.000 Highlights**
+- Major reliability overhaul of the Paint tool for custom regions:
+  - Zones named immediately after drawing now correctly register for counting.
+  - Count Cells auto-stops paint mode and converts all strokes (named + auto-default).
+  - Full state wipe on every new image load (prevents cross-image leakage).
+  - Durable model-coordinate storage so drawings survive zoom/pan.
+  - Proper interior filling (`binary_fill_holes`) + neighborhood zone lookup → accurate counts inside hand-drawn structures.
+  - No more duplicate zones in the spreadsheet.
+- Critical stability fix: Closing the "Counting Cells" or "Detecting Cells" progress dialog early (X button) can no longer crash the application. All progress UI calls are now defensive.
+- Continuing from v8.01: Modern Blob Detection (default), Smart Suggest (Offline), left File Browser with counted status, automatic dual export (`.xlsx` + `_masked.tif`), and portable settings.
+
+**v8.01.000 Highlights** (previous major release)
 - New modern Blob Detection engine (Laplacian of Gaussian) — significantly better results on most immunofluorescence images.
 - "Smart Suggest (Offline)" — a fully local, privacy-preserving tool that analyzes your image and recommends better detection parameters (with checkbox selection).
 - Live switching between Blob and legacy Watershed detection methods directly in Mask Settings.
@@ -11,7 +22,6 @@ A GUI tool for analyzing immunofluorescence images with atlas region mapping and
 - Export/Import full detection settings as portable .json files from Mask Settings.
 - Improved Autotune buttons that adapt intelligently based on the active detection method.
 - Brush Settings dialog now opens automatically when using Add/Remove Cell.
-- Many bug fixes around painted regions, transparency mode, and Progress dialogs.
 
 ## Description
 
@@ -49,7 +59,7 @@ pip install -r requirements.txt
 ```
 
 **Note on Excel exports** (recommended):
-Starting with v8.01, clicking **Count Cells** automatically saves:
+Starting with v8.01 (refined in 8.02), clicking **Count Cells** automatically saves:
 - `YourImage.xlsx` — Contains two sheets:
   - "Cell Counts" (per region)
   - "Detection Parameters" (complete record of every setting used — excellent for methods/reproducibility)

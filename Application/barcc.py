@@ -456,6 +456,7 @@ class PDFViewer:
         self._paint_group_counter = 0
         self.current_paint_group = None
         self.named_paint_groups = {}   # group_tag (e.g. 'paintgroup_5') -> name
+        self.paint_group_data = {}     # durable: group_tag -> list of {'coords': [x1,y1,...], 'width': w}  (survives show_page/delete("all"))
 
         # Crop / edit variables
         self.crop_mode = False
@@ -726,6 +727,12 @@ class PDFViewer:
                 if tag.startswith('paintgroup_'):
                     all_current_groups.add(tag)
 
+        # Also include groups recorded in durable storage (in case show_page() wiped the transient 'paint' canvas items).
+        # Retirement (pop + dtag inside convert/force) ensures already-committed groups are no longer present here.
+        for gtag in list(self.paint_group_data.keys()):
+            if gtag.startswith('paintgroup_'):
+                all_current_groups.add(gtag)
+
         for group_tag in all_current_groups:
             if group_tag not in self.named_paint_groups:
                 self.named_paint_groups[group_tag] = None  # will get default name in convert
@@ -741,6 +748,7 @@ class PDFViewer:
         self.output.delete('paint')   # Remove all temporary paint strokes from canvas
         self.save_paint()
         self.named_paint_groups.clear()
+        self.paint_group_data.clear()
         self.current_paint_group = None
         self.show_page()
 
@@ -891,6 +899,16 @@ class PDFViewer:
             tags=tags
         )
 
+        # Record durable geometry for this segment so zones survive show_page() / canvas wipes.
+        # Store *model/image* coordinates (stable) rather than view-dependent canvas coords.
+        if self.current_paint_group:
+            if self.current_paint_group not in self.paint_group_data:
+                self.paint_group_data[self.current_paint_group] = []
+            self.paint_group_data[self.current_paint_group].append({
+                'model_points': [prev_ix, prev_iy, ix, iy],
+                'width': self.line_width
+            })
+
         # Store the new point in image space for the next segment
         self.old_x = ix
         self.old_y = iy
@@ -997,6 +1015,19 @@ class PDFViewer:
 
         self.named_paint_groups[group_tag] = name
 
+        # Immediately commit this named group to the zone mask / zone_names.
+        # This guarantees that "naming the zones immediately after drawing" makes them
+        # defined for Count Cells even if the user never clicks Stop Paint and even if
+        # later show_page() calls delete the transient canvas vectors.
+        self._convert_named_paints_to_zones()
+
+        # Extra defensive untag (convert already retires the group_tag to stop double-processing)
+        for item in all_segments:
+            try:
+                self.output.dtag(item, group_tag)
+            except Exception:
+                pass
+
         # Keep the whole group yellow to show it's a named structural boundary
         for item in all_segments:
             self.output.itemconfig(item, fill='#ffcc00')
@@ -1055,29 +1086,59 @@ class PDFViewer:
         if not self.named_paint_groups:
             return
 
+        # Ensure we have a valid current_page for pure Paint workflows
+        if self.current_page is None:
+            self.current_page = 0
+
         if self.current_page not in self.zone_counters:
             self.zone_counters[self.current_page] = 0
         if self.current_page not in self.zone_names:
             self.zone_names[self.current_page] = {}
 
-        # Determine target size for the zone mask
+        # Determine target size for the zone mask (very defensive)
+        target_size = None
         if self.original_background is not None:
             target_size = self.original_background.size
         elif self.background_image is not None:
             target_size = self.background_image.size
         else:
-            return
+            # Last resort: use current canvas size or a reasonable default
+            try:
+                target_size = (self.output.winfo_width(), self.output.winfo_height())
+            except Exception:
+                target_size = (1024, 1024)
 
         # Get or create the zone mask for this page
-        if self.current_page not in self.mask_images:
+        if self.current_page not in self.mask_images or self.mask_images[self.current_page] is None:
             self.mask_images[self.current_page] = Image.new('L', target_size, 0)
 
         mask_img = self.mask_images[self.current_page].copy()
         draw = ImageDraw.Draw(mask_img)
 
         for group_tag, name in list(self.named_paint_groups.items()):
-            segments = self.output.find_withtag(group_tag)
-            if not segments:
+            # Collect strokes from durable data first (stable model coords preferred), else live canvas
+            strokes = []
+            if group_tag in self.paint_group_data and self.paint_group_data[group_tag]:
+                for rec in self.paint_group_data[group_tag]:
+                    mp = rec.get('model_points')
+                    if mp and len(mp) >= 4:
+                        strokes.append((mp, rec.get('width', 3), True))  # True = already model space
+                    else:
+                        strokes.append((rec.get('coords', []), rec.get('width', 3), False))
+            if not strokes:
+                for item_id in self.output.find_withtag(group_tag):
+                    try:
+                        coords = self.output.coords(item_id)
+                        if coords and len(coords) >= 4:
+                            w = self.output.itemcget(item_id, 'width')
+                            try:
+                                w = int(float(w))
+                            except Exception:
+                                w = 3
+                            strokes.append((coords, w, False))
+                    except Exception:
+                        pass
+            if not strokes:
                 continue
 
             # One zone id for the entire connected group
@@ -1090,31 +1151,25 @@ class PDFViewer:
                 clean_name = str(name).strip() or f"Painted Region {zone_id}"
 
             self.zone_names[self.current_page][zone_id] = clean_name
-            # Update the groups dict too for consistency
-            self.named_paint_groups[group_tag] = clean_name
 
-            # Draw every segment belonging to this group using the same zone_id
-            for item_id in segments:
+            # Accumulate model-space points while drawing for floodfill seed later
+            group_model_points = []
+            for coords, width, is_model in strokes:
                 try:
-                    coords = self.output.coords(item_id)
                     if not coords or len(coords) < 4:
                         continue
-
-                    width = self.output.itemcget(item_id, 'width')
-                    try:
-                        width = int(float(width))
-                    except Exception:
-                        width = 3
-
-                    # Convert canvas coords → image coords, properly accounting for current zoom scale
-                    # This ensures painted named regions get correct zone pixels in the mask even after zooming.
                     points = []
                     for i in range(0, len(coords), 2):
-                        cx = coords[i]
-                        cy = coords[i + 1]
-                        ix = int( (cx / self.view_scale) - self.img_x )
-                        iy = int( (cy / self.view_scale) - self.img_y )
+                        if is_model:
+                            ix = int(coords[i])
+                            iy = int(coords[i + 1])
+                        else:
+                            cx = coords[i]
+                            cy = coords[i + 1]
+                            ix = int( (cx / self.view_scale) - self.img_x )
+                            iy = int( (cy / self.view_scale) - self.img_y )
                         points.append((ix, iy))
+                        group_model_points.append((ix, iy))
 
                     if len(points) < 2:
                         continue
@@ -1127,9 +1182,54 @@ class PDFViewer:
                 except Exception as e:
                     logger.error(f"Failed to rasterize segment in group {group_tag}: {e}")
 
+            # Robust interior fill for hand-drawn regions.
+            # 1. Try a quick flood from the bbox center (helps with clean drawings).
+            # 2. Then use binary_fill_holes on the pixels we have labeled for this zone_id.
+            #    This is the key fix: it properly fills enclosed areas even with gaps in the freehand strokes
+            #    and works far better than a single-seed flood from the boundary centroid.
+            if group_model_points:
+                try:
+                    minx = min(p[0] for p in group_model_points)
+                    maxx = max(p[0] for p in group_model_points)
+                    miny = min(p[1] for p in group_model_points)
+                    maxy = max(p[1] for p in group_model_points)
+                    cx_seed = (minx + maxx) // 2
+                    cy_seed = (miny + maxy) // 2
+                    for dx, dy in [(0,0), (2,0), (-2,0), (0,2), (0,-2), (5,0), (-5,0), (0,5), (0,-5)]:
+                        sx = cx_seed + dx
+                        sy = cy_seed + dy
+                        if 0 <= sx < mask_img.width and 0 <= sy < mask_img.height:
+                            if mask_img.getpixel((sx, sy)) == 0:
+                                draw.floodfill((sx, sy), fill=zone_id, thresh=0)
+                                break
+                except Exception:
+                    pass
+
+            # Strong fill using binary hole filling (the real solution for painted structures)
+            try:
+                m = np.array(mask_img)
+                zone_pixels = (m == zone_id)
+                if zone_pixels.any():
+                    filled = ndi.binary_fill_holes(zone_pixels)
+                    # Only write into background (0); never overwrite other zones or existing labels
+                    m[(filled) & (m == 0)] = zone_id
+                    mask_img = Image.fromarray(m.astype(np.uint8))
+                    draw = ImageDraw.Draw(mask_img)
+            except Exception as e:
+                logger.debug(f"binary_fill_holes for zone {zone_id} skipped: {e}")
+
             logger.info(f"Converted named paint group '{clean_name}' ({group_tag}) → zone {zone_id}")
 
-        # Update the mask
+            # Retire the group immediately after successful conversion so it cannot be re-discovered
+            # (prevents the 3-drawn → 6-in-spreadsheet duplication when naming + later Count Cells / Stop Paint both process it)
+            self.named_paint_groups.pop(group_tag, None)
+            self.paint_group_data.pop(group_tag, None)
+            for item_id in self.output.find_withtag(group_tag):
+                try:
+                    self.output.dtag(item_id, group_tag)
+                except Exception:
+                    pass
+
         self.mask_images[self.current_page] = mask_img
 
     def _force_paint_strokes_to_zones(self, paint_items):
@@ -1161,6 +1261,7 @@ class PDFViewer:
         draw = ImageDraw.Draw(mask_img)
 
         # Group remaining paint items by their group tag if present, otherwise treat all as one group
+        # Also pull any durable (post-wipe) groups so force works even without live canvas items
         groups = {}
         for item in paint_items:
             group_tag = None
@@ -1173,6 +1274,10 @@ class PDFViewer:
             if group_tag not in groups:
                 groups[group_tag] = []
             groups[group_tag].append(item)
+
+        for gtag in list(self.paint_group_data.keys()):
+            if gtag not in groups:
+                groups[gtag] = []  # will use durable coords inside the draw loop below
 
         for group_tag, items in groups.items():
             self.zone_counters[self.current_page] += 1
@@ -1213,7 +1318,79 @@ class PDFViewer:
                 except Exception as e:
                     logger.error(f"Failed to force-convert paint item to zone: {e}")
 
+            # If this group had no live canvas items (wiped), draw from durable recorded data (prefer model points)
+            durable_points_for_flood = []
+            if group_tag in self.paint_group_data:
+                for rec in self.paint_group_data.get(group_tag, []):
+                    try:
+                        mp = rec.get('model_points')
+                        width = rec.get('width', 3)
+                        coords = mp if (mp and len(mp) >= 4) else rec.get('coords', [])
+                        is_model = bool(mp and len(mp) >= 4)
+                        if not coords or len(coords) < 4:
+                            continue
+                        points = []
+                        for i in range(0, len(coords), 2):
+                            if is_model:
+                                ix = int(coords[i])
+                                iy = int(coords[i + 1])
+                            else:
+                                cx = coords[i]
+                                cy = coords[i + 1]
+                                ix = int( (cx / self.view_scale) - self.img_x )
+                                iy = int( (cy / self.view_scale) - self.img_y )
+                            points.append((ix, iy))
+                            durable_points_for_flood.append((ix, iy))
+                        if len(points) < 2:
+                            continue
+                        radius = max(1, width // 2)
+                        for px, py in points:
+                            draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=zone_id)
+                        draw.line(points, fill=zone_id, width=width, joint="curve")
+                    except Exception as e:
+                        logger.error(f"Failed to force-convert durable paint data for {group_tag}: {e}")
+
+            # Fill interior for durable-only (unnamed) groups as well
+            if durable_points_for_flood:
+                try:
+                    minx = min(p[0] for p in durable_points_for_flood)
+                    maxx = max(p[0] for p in durable_points_for_flood)
+                    miny = min(p[1] for p in durable_points_for_flood)
+                    maxy = max(p[1] for p in durable_points_for_flood)
+                    cx_seed = (minx + maxx) // 2
+                    cy_seed = (miny + maxy) // 2
+                    for dx, dy in [(0,0), (2,0), (-2,0), (0,2), (0,-2)]:
+                        sx = cx_seed + dx
+                        sy = cy_seed + dy
+                        if 0 <= sx < mask_img.width and 0 <= sy < mask_img.height:
+                            if mask_img.getpixel((sx, sy)) == 0:
+                                draw.floodfill((sx, sy), fill=zone_id, thresh=0)
+                                break
+                except Exception:
+                    pass
+
+            # Strong binary_fill_holes for force path (unnamed strokes auto-named at Count Cells time)
+            try:
+                m = np.array(mask_img)
+                zone_pixels = (m == zone_id)
+                if zone_pixels.any():
+                    filled = ndi.binary_fill_holes(zone_pixels)
+                    m[(filled) & (m == 0)] = zone_id
+                    mask_img = Image.fromarray(m.astype(np.uint8))
+                    draw = ImageDraw.Draw(mask_img)
+            except Exception as e:
+                logger.debug(f"binary_fill_holes (force) for zone {zone_id} skipped: {e}")
+
             logger.info(f"Force-converted paint group '{group_tag}' → zone {zone_id} ('{default_name}')")
+
+            # Retire after processing (prevents re-counting the same strokes as extra zones)
+            self.named_paint_groups.pop(group_tag, None)
+            self.paint_group_data.pop(group_tag, None)
+            for item_id in self.output.find_withtag(group_tag):
+                try:
+                    self.output.dtag(item_id, group_tag)
+                except Exception:
+                    pass
 
         self.mask_images[self.current_page] = mask_img
 
@@ -2156,7 +2333,7 @@ class PDFViewer:
                 return
 
             config_data = {
-                "version": "8.01.000",
+                "version": "8.02.000",
                 "detection_method": self.image_processor.cell_config.detection_method,
                 "cell_detection": self.image_processor.cell_config.__dict__.copy(),
                 "preprocessing": self.image_processor.preprocess_config.__dict__.copy(),
@@ -2272,6 +2449,8 @@ class PDFViewer:
     def _show_busy_dialog(self, title="Working"):
         """Create a progress dialog with a determinate loading bar.
         Returns an object with .set_progress(percent, message) and .close() methods.
+        The dialog is hardened so that the user closing it (X button) will never
+        cause the rest of the operation (or the whole app) to crash.
         """
         class ProgressDialog:
             def __init__(self, parent, title):
@@ -2279,7 +2458,10 @@ class PDFViewer:
                 self.window.title(title)
                 self.window.attributes('-topmost', True)
                 self.window.resizable(False, False)
-                self.window.protocol("WM_DELETE_WINDOW", lambda: None)
+                self.closed = False
+
+                # Strongly disable the close button / Alt+F4 etc.
+                self.window.protocol("WM_DELETE_WINDOW", self._on_close_attempt)
 
                 self.label = ttk.Label(self.window, text="Initializing...")
                 self.label.pack(padx=20, pady=(15, 5))
@@ -2295,17 +2477,37 @@ class PDFViewer:
 
                 self.window.update_idletasks()
 
+            def _on_close_attempt(self):
+                """User tried to close the dialog early. Mark as closed so all future
+                calls to set_progress/close are no-ops and cannot raise."""
+                self.closed = True
+                self._safe_destroy()
+
+            def _safe_destroy(self):
+                try:
+                    if self.window and self.window.winfo_exists():
+                        self.window.destroy()
+                except Exception:
+                    pass
+
             def set_progress(self, percent, message=None):
-                self.progress['value'] = max(0, min(100, percent))
-                if message:
-                    self.label.config(text=message)
-                self.window.update_idletasks()
+                if getattr(self, 'closed', False):
+                    return
+                try:
+                    self.progress['value'] = max(0, min(100, percent))
+                    if message:
+                        self.label.config(text=message)
+                    if self.window and self.window.winfo_exists():
+                        self.window.update_idletasks()
+                except Exception:
+                    # Window was closed externally or became invalid — treat as closed forever
+                    self.closed = True
 
             def close(self):
-                try:
-                    self.window.destroy()
-                except:
-                    pass
+                if getattr(self, 'closed', False):
+                    return
+                self.closed = True
+                self._safe_destroy()
 
         dialog = ProgressDialog(self.master, title)
         self._register_transparent_window(dialog.window)
@@ -2576,23 +2778,27 @@ class PDFViewer:
             self.mask_images = {}
             self.zone_counters = {}
             self.zone_names = {}
+            self.named_paint_groups.clear()
+            self.paint_group_data.clear()
             clear_preprocess_cache()
             self.show_page()
 
     def import_tiff(self):
         logger.info("Opening file dialog for TIFF selection")
         self.named_paint_groups.clear()
+        self.paint_group_data.clear()
         self.current_paint_group = None
         self.view_scale = 1.0
         self.img_x = 0
         self.img_y = 0
 
-        # Reset zone/mask state for pure TIFF workflows so painted regions work cleanly
+        # Full reset of zone/mask system on every new image load.
+        # This ensures painted regions from previous images do not leak into new ones.
+        self.mask_images = {}
+        self.zone_names = {}
+        self.zone_counters = {}
         if self.current_page is None:
             self.current_page = 0
-        self.mask_images.pop(self.current_page, None)
-        self.zone_names.pop(self.current_page, None)
-        self.zone_counters.pop(self.current_page, None)
 
         tiff_path = fd.askopenfilename(filetypes=[("TIFF files", "*.tiff *.tif")])
         if tiff_path:
@@ -2762,15 +2968,17 @@ class PDFViewer:
 
         logger.info(f"Loading TIFF from file browser: {tiff_path}")
 
-        # Reset zone/mask state for clean paint-based workflows
+        # Full reset of zone/mask system on every new image load.
+        # This ensures painted regions from previous images do not leak into new ones.
+        self.mask_images = {}
+        self.zone_names = {}
+        self.zone_counters = {}
         if self.current_page is None:
             self.current_page = 0
-        self.mask_images.pop(self.current_page, None)
-        self.zone_names.pop(self.current_page, None)
-        self.zone_counters.pop(self.current_page, None)
 
         # Reset state similar to import_tiff
         self.named_paint_groups.clear()
+        self.paint_group_data.clear()
         self.current_paint_group = None
         self.view_scale = 1.0
         self.img_x = 0
@@ -3092,37 +3300,37 @@ class PDFViewer:
         if getattr(self, 'current_state', None) == 'paint':
             self.stop_paint()
 
-        # Robust fallback for painted regions:
-        # Always convert any remaining paint strokes into zones when Count Cells is pressed.
-        # This ensures that zones drawn with the Paint tool are respected even if the user
-        # previously loaded an atlas or has mask_images entries for the current page.
+        # Ensure zone structures exist for the current page (important for pure Paint workflows)
+        if self.current_page not in self.zone_names:
+            self.zone_names[self.current_page] = {}
+        if self.current_page not in self.mask_images:
+            if self.original_background is not None:
+                target_size = self.original_background.size
+            elif self.background_image is not None:
+                target_size = self.background_image.size
+            else:
+                target_size = (1024, 1024)  # fallback
+            self.mask_images[self.current_page] = Image.new('L', target_size, 0)
+        if self.current_page not in self.zone_counters:
+            self.zone_counters[self.current_page] = 0
+
+        # Always attempt to convert any remaining *named* paint groups into zones.
+        # This is the main path for users who named their regions (via right-click or autonaming).
+        self._convert_named_paints_to_zones()
+
+        # Fallback for any completely unnamed paint strokes that are still on the canvas
         remaining_paint = self.output.find_withtag('paint')
         if remaining_paint:
             self._force_paint_strokes_to_zones(remaining_paint)
-            # Clean up the visual paint strokes now that they've been turned into zones
             self.output.delete('paint')
 
-        if self.current_page not in self.mask_images:
-            # One last attempt: if there are still paint items, force convert them
-            remaining = self.output.find_withtag('paint')
-            if remaining:
-                self._force_paint_strokes_to_zones(remaining)
-                self.output.delete('paint')
-
-            if self.current_page not in self.mask_images:
-                logger.warning("Cell counting failed: No regions defined")
-                messagebox.showerror(
-                    "No Regions Defined",
-                    "No regions (zones) have been defined for this page.\n\n"
-                    "Please either:\n"
-                    "• Load an atlas and click on regions to define them, or\n"
-                    "• Use the Paint tools to draw regions (right-click strokes to name them, or let Count Cells auto-name them)."
-                )
-                return
-
-        # Guard: if there are still no zones defined for this page after auto-stopping paint,
-        # give a clear message instead of generating an empty spreadsheet.
+        # Final safety net: if we still have no zones but the user was painting,
+        # try one last conversion of any named groups.
         page_zones = self.zone_names.get(self.current_page, {})
+        if not page_zones:
+            self._convert_named_paints_to_zones()
+            page_zones = self.zone_names.get(self.current_page, {})
+
         if not page_zones:
             messagebox.showerror(
                 "No Regions Defined",
@@ -3188,7 +3396,7 @@ class PDFViewer:
         progress.set_progress(85, "Generating annotated image...")
         self.show_page()
 
-        # === Automatic saving of results (new in 8.01) ===
+        # === Automatic saving of results (new in 8.01, improved in 8.02) ===
         base_name = self.tiff_filename
         tiff_dir = self.tiff_dir
 
@@ -3255,7 +3463,7 @@ class PDFViewer:
         except Exception as e:
             logger.error(f"Failed to save _masked.tif: {e}")
 
-        if progress:
+        if progress and not getattr(progress, 'closed', False):
             progress.set_progress(100, "Done")
             progress.close()
 
@@ -3295,12 +3503,12 @@ class PDFViewer:
             remove_mask = remove_mask_arr > 0
 
         # Combine automatic and manual edits
-        if progress:
+        if progress and not getattr(progress, 'closed', False):
             progress.set_progress(70, "Combining manual edits...")
         combined_mask = (auto_mask | add_mask) & ~remove_mask
 
         # Visualize combined mask on top of the original background
-        if progress:
+        if progress and not getattr(progress, 'closed', False):
             progress.set_progress(85, "Generating visualization...")
         background = self.adjust_image(self.original_background)
         original_rgb = background.convert('RGB')
@@ -3316,11 +3524,11 @@ class PDFViewer:
         mask_img = Image.fromarray(alpha_array)
         mask_img = mask_img.resize(self.original_background.size, Image.NEAREST)
 
-        if progress:
+        if progress and not getattr(progress, 'closed', False):
             progress.set_progress(95, "Displaying mask...")
         self.show_page(mask=mask_img)
 
-        if progress:
+        if progress and not getattr(progress, 'closed', False):
             progress.set_progress(100, "Done")
             progress.close()
 
@@ -3441,18 +3649,35 @@ def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_
         counts[i] = 0
     filtered_props = []
 
-    # Filter props based on mask and count per zone
+    # Filter props based on mask and count per zone.
+    # Use a small neighborhood search around each centroid. This tolerates:
+    # - cells whose centroid lands exactly on a boundary stroke pixel
+    # - tiny gaps or imperfections left by even the improved flood/hole-fill
     mask_arr = np.array(mask_pil)
+    h, w = mask_arr.shape
     for prop in props:
         row, col = prop.centroid
         ax = int(col - img_x)
         ay = int(row - img_y)
-        if 0 <= ax < mask_pil.width and 0 <= ay < mask_pil.height:
-            zone_id = mask_arr[ay, ax]
-            if zone_id > 0:
-                counts.setdefault(zone_id, 0)
-                counts[zone_id] += 1
-                filtered_props.append(prop)
+
+        found_zone = 0
+        # Check exact point first, then a 5x5 neighborhood (good balance of tolerance vs. accuracy)
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                qx = ax + dx
+                qy = ay + dy
+                if 0 <= qx < w and 0 <= qy < h:
+                    val = mask_arr[qy, qx]
+                    if val > 0:
+                        found_zone = val
+                        break
+            if found_zone:
+                break
+
+        if found_zone > 0:
+            counts.setdefault(found_zone, 0)
+            counts[found_zone] += 1
+            filtered_props.append(prop)
 
     # Enhanced visualization
     bg_min = img2d.min()
