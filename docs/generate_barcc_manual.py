@@ -367,7 +367,10 @@ def build_manual():
         "Neighborhood search (5x5) around each detected cell centroid when looking up zone membership. This provides tolerance for drawing precision and any remaining micro-imperfections in region fills.",
         "Critical stability fix: Closing the \"Counting Cells\" or \"Detecting Cells\" progress dialog with the X button (or Alt+F4) before the operation finishes no longer crashes the application. All progress UI methods are now fully defensive no-op after early dismissal.",
         "Elimination of duplicate zone entries (e.g., 6 zones appearing when only 3 were drawn) through proper retirement of processed paint groups after conversion.",
-        "Overall hardening of the entire paint -> named group -> zone mask -> counting pipeline."
+        "Overall hardening of the entire paint -> named group -> zone mask -> counting pipeline.",
+        "Paint menu reorganization: \"Save Paint\" moved from File menu to Paint menu and renamed \"Save Paint Layer\". New \"Load Paint\" command added.",
+        "Save Paint Layer now auto-saves directly into the folder currently open in the left File Browser (with automatic unique naming to avoid overwrites), matching the auto-export style of Count Cells. No save dialog appears when a working directory is selected.",
+        "Load Paint and Import Paint now default their file dialogs to the current directory shown in the left File Browser for faster workflow."
     ])
 
     pdf.body(
@@ -672,10 +675,18 @@ def build_manual():
         "via the Brushsize dialog."
     )
 
-    pdf.chapter_title("Import / Save Paint", 1)
+    pdf.chapter_title("Load / Save Paint Layer", 1)
     pdf.body(
         "Painted regions can be saved and reloaded in future sessions, enabling consistent "
         "analysis across multiple images or experiments."
+    )
+    pdf.body(
+        "The Paint menu now contains dedicated **Load Paint** and **Save Paint Layer** commands. "
+        "When a folder is open in the left File Browser, Save Paint Layer automatically saves the "
+        "current paint layer directly into that folder as `{image}_paint.png` (or with numbered "
+        "suffixes to avoid overwriting). The left file list is refreshed automatically after saving. "
+        "Both Load Paint and Import Paint default their file selection dialogs to the current "
+        "working directory shown in the left File Browser."
     )
 
     pdf.chapter_title("Labeling Painted Regions", 1)

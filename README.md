@@ -10,6 +10,11 @@ A GUI tool for analyzing immunofluorescence images with atlas region mapping and
   - Durable model-coordinate storage so drawings survive zoom/pan.
   - Proper interior filling (`binary_fill_holes`) + neighborhood zone lookup → accurate counts inside hand-drawn structures.
   - No more duplicate zones in the spreadsheet.
+- Paint menu improvements:
+  - "Save Paint" moved from File menu to Paint menu and renamed **Save Paint Layer**.
+  - New **Load Paint** command added to the Paint menu.
+  - Save Paint Layer now **auto-saves** directly into the folder currently open in the left File Browser (smart unique naming, no dialog). The file list refreshes automatically.
+  - Load Paint and Import Paint default to the current left File Browser directory.
 - Critical stability fix: Closing the "Counting Cells" or "Detecting Cells" progress dialog early (X button) can no longer crash the application. All progress UI calls are now defensive.
 - Continuing from v8.01: Modern Blob Detection (default), Smart Suggest (Offline), left File Browser with counted status, automatic dual export (`.xlsx` + `_masked.tif`), and portable settings.
 
@@ -97,6 +102,7 @@ python Application/barcc.py
       - Click "Paint > Start Paint"
       - Draw a circle around the ROI
       - Once done, click "Paint > Stop Paint"
+      - Use "Paint > Save Paint Layer" to auto-save the paint into your current left File Browser folder (or "Load Paint" to reload one).
    
    b. *Import Atlas Section*:
       - Click "File > Import Atlas Section"
