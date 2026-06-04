@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 BARCC User Manual Generator
 Generates a highly polished, professional PDF manual for the BARCC application.
 
