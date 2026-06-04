@@ -4,6 +4,12 @@ BARCC User Manual Generator
 Generates a highly polished, professional PDF manual for the BARCC application.
 
 Run this script from the docs/ directory (or with proper paths) to regenerate the manual.
+
+On Windows with the project's Anaconda 'barcc' environment:
+  cd C:\Users\blain\BARCC\docs
+  & "C:\Users\blain\anaconda3\envs\barcc\python.exe" generate_barcc_manual.py
+
+(Or: conda activate barcc; python generate_barcc_manual.py)
 """
 
 from fpdf import FPDF
@@ -56,6 +62,11 @@ class BARCCUserManual(FPDF):
             '\u2011': '-',      # non-breaking hyphen
             '\u2012': '-',      # figure dash
             '\u2043': '-',      # hyphen bullet
+            '\u2192': '->',     # right arrow →
+            '\u2190': '<-',     # left arrow ←
+            '\u2194': '<->',    # left right arrow ↔
+            '\u00b7': '.',      # middle dot ·
+            '\u2023': '>',      # triangular bullet ‣
         }
         for old, new in replacements.items():
             text = text.replace(old, new)
