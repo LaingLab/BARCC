@@ -2,7 +2,19 @@
 
 A GUI tool for analyzing immunofluorescence images with atlas region mapping and automated cell counting.
 
-**v8.02.001 Highlights** (current patch)
+**v8.02.002 Highlights** (current patch)
+- Fixed mismatch between zone counts shown on the mask/image (yellow labels and visible red cell markers) and the numbers in the exported spreadsheet ("Cell Counts" sheet).
+  - Root cause: Unconditional application of `img_x`/`img_y` atlas overlay offset when mapping detected cell centroids (from the main experimental image / final cell mask) into the zone mask for counting, and when positioning zone labels in `show_page`.
+  - This affected painted regions (which live in the background TIFF's 0,0-aligned coordinate space) whenever the atlas overlay had been panned, zoomed, or shifted (non-zero `img_x`/`img_y`), causing cells to be assigned to wrong zones (or none) in the DataFrame used for both the spreadsheet and `last_df`.
+  - Visual cell markers were drawn at correct positions, leading to "I see 30 cells in the painted region but spreadsheet says 12" (or vice versa).
+- Implemented size-based heuristic in `count_cells_in_zones` and the zone label drawing code:
+  - If the zone mask size closely matches the main `background_image` / cell mask size (paint regions on TIFF, or standalone), use direct coordinates (offset 0) for accurate assignment and label placement over the background layer.
+  - If sizes differ (atlas/PDF overlay), fall back to previous `img_x`/`img_y` offset logic for layer alignment.
+- This ensures the counts reported in the spreadsheet exactly match what the user sees visually in each region on the annotated image and on-screen labels (after re-running Count Cells).
+- No impact on pure atlas workflows or when no overlay offset is present.
+- Version in exported settings JSON updated to "8.02.002".
+
+**v8.02.001 Highlights** (previous)
 - Final Paint tool reliability fixes so the primary workflow ("draw region, right-click name immediately, click Count Cells") succeeds on the *very first attempt* after loading any image:
   - Fixed a case where the first named painted region would be lost ("No Regions Defined" error) while a second region drawn afterward would appear in the spreadsheet.
   - Root cause was an unconditional reset of `zone_names` / `mask_images` / `zone_counters` inside `load_page_image` the first time `atlas_filetype='img'` (baked paint) was activated during `stop_paint`'s `show_page`. Guarded so only PDF atlas pages perform per-page zone resets; paint zones now survive the internal bake-to-img path.

@@ -2602,7 +2602,7 @@ class PDFViewer:
                 return
 
             config_data = {
-                "version": "8.02.001",
+                "version": "8.02.002",
                 "detection_method": self.image_processor.cell_config.detection_method,
                 "cell_detection": self.image_processor.cell_config.__dict__.copy(),
                 "preprocessing": self.image_processor.preprocess_config.__dict__.copy(),
@@ -3068,7 +3068,20 @@ class PDFViewer:
         if self.show_zone_labels and self.last_df is not None and self.current_page in self.mask_images:
             try:
                 mask = np.array(self.mask_images[self.current_page])
+                mask_h, mask_w = mask.shape
                 zone_data = self.last_df.set_index('Zone')['Cell_Count'].to_dict() if 'Zone' in self.last_df.columns else {}
+
+                # Choose label placement offset:
+                # - If zone mask size matches the main background image, the zones are in the background's
+                #   coordinate system (e.g. hand-painted regions on a TIFF) -> place labels at (0,0) base.
+                # - Otherwise (atlas overlay of different size), place relative to the atlas position (img_x/y).
+                label_offset_x = display_img_x
+                label_offset_y = display_img_y
+                if self.background_image is not None:
+                    bg_w, bg_h = self.background_image.size
+                    if abs(mask_w - bg_w) < 5 and abs(mask_h - bg_h) < 5:
+                        label_offset_x = 0
+                        label_offset_y = 0
 
                 for zone_name, count in zone_data.items():
                     # Find pixels belonging to this zone in the mask
@@ -3092,8 +3105,8 @@ class PDFViewer:
                     cx = int(np.mean(coords[1]))
 
                     # Scale to current view
-                    screen_x = cx * scale + display_img_x
-                    screen_y = cy * scale + display_img_y
+                    screen_x = cx * scale + label_offset_x
+                    screen_y = cy * scale + label_offset_y
 
                     label_text = f"{zone_name}\n({count})"
                     self.output.create_text(screen_x, screen_y, text=label_text, fill="yellow",
@@ -4041,11 +4054,21 @@ def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_
     # - cells whose centroid lands exactly on a boundary stroke pixel
     # - tiny gaps or imperfections left by even the improved flood/hole-fill
     mask_arr = np.array(mask_pil)
-    h, w = mask_arr.shape
+    mask_h, mask_w = mask_arr.shape
+    # Determine whether the zone mask is in the same coordinate system as the cell detection / background.
+    # - Paint regions (and standalone TIFF) live in the main background image space (offset 0).
+    # - Atlas zones may come from a differently-sized/positioned overlay layer (use img_x/y for translation).
+    bg_w, bg_h = background_pil.size  # PIL (width, height)
+    use_offset = not (abs(mask_w - bg_w) < 5 and abs(mask_h - bg_h) < 5)
+
     for prop in props:
         row, col = prop.centroid
-        ax = int(col - img_x)
-        ay = int(row - img_y)
+        if use_offset:
+            ax = int(col - img_x)
+            ay = int(row - img_y)
+        else:
+            ax = int(col)
+            ay = int(row)
 
         found_zone = 0
         # Check exact point first, then a 5x5 neighborhood (good balance of tolerance vs. accuracy)
@@ -4053,7 +4076,7 @@ def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_
             for dx in range(-2, 3):
                 qx = ax + dx
                 qy = ay + dy
-                if 0 <= qx < w and 0 <= qy < h:
+                if 0 <= qx < mask_w and 0 <= qy < mask_h:
                     val = mask_arr[qy, qx]
                     if val > 0:
                         found_zone = val

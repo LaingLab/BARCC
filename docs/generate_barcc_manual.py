@@ -22,7 +22,7 @@ import os
 # ============================================================================
 MANUAL_TITLE = "BARCC - Brain Atlas Regional Cell Counter"
 MANUAL_SUBTITLE = "User Manual"
-VERSION = "8.02.001"
+VERSION = "8.02.002"
 OUTPUT_FILENAME = "BARCC_User_Manual.pdf"
 OUTPUT_DIR = ".."  # Place PDF in repository root
 
@@ -362,7 +362,34 @@ def build_manual():
     # 2. INSTALLATION
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
-    # What's New — 8.02.001 (current patch)
+    # What's New — 8.02.002 (current patch)
+    # ------------------------------------------------------------------
+    pdf.chapter_title("What's New in Version 8.02.002", 0)
+
+    pdf.body(
+        "BARCC 8.02.002 is a patch release that fixes a long-standing source of confusion between the counts the user sees visually on the annotated image/mask and the numbers reported in the spreadsheet."
+    )
+
+    pdf.bullet_list([
+        "Fixed mismatch between per-zone cell counts shown on the mask/image (yellow zone labels like \"RegionName\\n(NN)\" when \"Show Zone Labels & Counts\" is enabled, plus visible red cell markers in the annotated image) and the numbers in the exported spreadsheet (Cell Counts sheet) or CSV fallback.",
+        "Root cause: The cell-to-zone assignment inside `count_cells_in_zones` (used for the DataFrame that feeds both the spreadsheet and `last_df`) and the on-screen label positioning in `show_page` unconditionally applied the atlas overlay offset (`-img_x` / `+ display_img_x` etc.).",
+        "Painted regions (and the main experimental TIFF background) live in a 0,0-aligned coordinate system matching the cell detection mask. Atlas/PDF zones may come from a differently sized/positioned overlay layer. Any non-zero `img_x`/`img_y` (from panning the atlas, zooming, dragging, alignment, etc.) would shift the lookup, causing cells to be assigned to the wrong zone (or no zone) for counting purposes.",
+        "Visual markers were drawn at the correct positions (using raw centroids), so users would see e.g. 30 red dots inside a painted region but the spreadsheet and labels would report a different number.",
+        "Implemented a robust size-based heuristic:",
+        "  - Compare zone mask size to the main `background_image` / cell mask size.",
+        "  - If they match (within tolerance): zones are paint-on-background or standalone TIFF → use direct cell coordinates (no offset) for accurate assignment and place labels over the background layer at canvas (0,0).",
+        "  - If sizes differ (atlas overlay): fall back to the previous `img_x`/`img_y` offset logic to align with the placed atlas layer.",
+        "The same logic was applied to zone label text placement so the yellow (count) overlays appear over the correct regions even when an atlas overlay has a non-zero offset.",
+        "After re-running Count Cells, the per-zone totals in the spreadsheet now exactly match the number of cells the user sees marked inside each region on the image and in the on-screen labels.",
+        "No change to pure atlas workflows, detection logic, manual edits, or cases where no overlay offset is present. Version in exported settings JSON is \"8.02.002\"."
+    ])
+
+    pdf.body(
+        "This resolves the final major \"numbers don't match what I see\" issue for users relying on painted custom regions for quantitative analysis."
+    )
+
+    # ------------------------------------------------------------------
+    # What's New — 8.02.001 (previous patch)
     # ------------------------------------------------------------------
     pdf.chapter_title("What's New in Version 8.02.001", 0)
 
