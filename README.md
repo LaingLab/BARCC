@@ -2,7 +2,16 @@
 
 A GUI tool for analyzing immunofluorescence images with atlas region mapping and automated cell counting.
 
-**v8.02.000 Highlights**
+**v8.02.001 Highlights** (current patch)
+- Final Paint tool reliability fixes so the primary workflow ("draw region, right-click name immediately, click Count Cells") succeeds on the *very first attempt* after loading any image:
+  - Fixed a case where the first named painted region would be lost ("No Regions Defined" error) while a second region drawn afterward would appear in the spreadsheet.
+  - Root cause was an unconditional reset of `zone_names` / `mask_images` / `zone_counters` inside `load_page_image` the first time `atlas_filetype='img'` (baked paint) was activated during `stop_paint`'s `show_page`. Guarded so only PDF atlas pages perform per-page zone resets; paint zones now survive the internal bake-to-img path.
+  - Additional hardening in the named conversion, stop, and count paths (broader durable data collection, conditional dtag, pre-clear re-tries, ultimate force before the error guard) to guarantee `paint_group_data` model points always produce registered zones.
+- Brightness Settings dialog (the live slider) X button (titlebar close) now works and closes the window. Same fix applied for consistency to Brush Size, Scale, and Rotate settings dialogs. (Progress dialogs remain intentionally hardened against early close.)
+- All v8.02.000 Paint guarantees (immediate naming, auto-stop on Count, durable geometry, interior `binary_fill_holes` fill, no dups, full cross-image wipe, auto Save Paint Layer to File Browser dir, etc.) now apply even to the first painted region.
+- Version recorded in exported settings JSON is now "8.02.001".
+
+**v8.02.000 Highlights** (previous)
 - Major reliability overhaul of the Paint tool for custom regions:
   - Zones named immediately after drawing now correctly register for counting.
   - Count Cells auto-stops paint mode and converts all strokes (named + auto-default).

@@ -16,7 +16,7 @@ import os
 # ============================================================================
 MANUAL_TITLE = "BARCC - Brain Atlas Regional Cell Counter"
 MANUAL_SUBTITLE = "User Manual"
-VERSION = "8.02.000"
+VERSION = "8.02.001"
 OUTPUT_FILENAME = "BARCC_User_Manual.pdf"
 OUTPUT_DIR = ".."  # Place PDF in repository root
 
@@ -351,7 +351,28 @@ def build_manual():
     # 2. INSTALLATION
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
-    # What's New — 8.02.000 (current)
+    # What's New — 8.02.001 (current patch)
+    # ------------------------------------------------------------------
+    pdf.chapter_title("What's New in Version 8.02.001", 0)
+
+    pdf.body(
+        "BARCC 8.02.001 is a targeted patch release that resolves the last reported edge cases in the Paint tool for custom regions and improves dialog usability:"
+    )
+
+    pdf.bullet_list([
+        "First-paint reliability: Drawing a region, naming it immediately via right-click, and clicking Count Cells now succeeds on the *very first attempt* after loading any image (no more \"No Regions Defined\" for the initial named zone, with only later zones appearing in the spreadsheet).",
+        "Fixed root cause in the 'img' bake path: The first `stop_paint()` (auto-called by Count Cells) + its `show_page()` would activate `atlas_filetype='img'` (via `save_paint`). `load_page_image()` then unconditionally reset `zone_names[page]`, `mask_images[page]`, and `zone_counters[page]` the first time `page_images` was populated for non-PDF content. This destroyed zones just registered by `name_painted_region` → `_convert_named_paints_to_zones`. A guard now restricts the destructive per-page init to `atlas_filetype == 'pdf'` only; 'img' (baked paint) and 'png' (loaded paint) cases preserve existing zone/mask state.",
+        "Additional conversion hardening (building on 8.02.000 durability work): broadened stroke collection in `_convert_named_paints_to_zones` (always tries `paint_group_data` model points + canvas + last-resort any paint items for still-named groups), conditional `dtag` only after successful retirement in `name_painted_region`, pre-clear re-try collection inside `stop_paint`, and an ultimate force-add of lingering data groups before the error guard in `count_cells`.",
+        "Brightness slider dialog X button fix: The titlebar X (and Alt+F4) on the Brightness Settings window (containing the live brightness scale/slider) now properly closes the dialog. Previously wired to a no-op `disable_event`. Applied the same `window.protocol(\"WM_DELETE_WINDOW\", window.destroy)` pattern (already used by Mask Settings) to Brush Settings, Scale Settings, and Rotate Settings for consistency. Transparent window registration and <Destroy> cleanup continue to work. Progress dialogs remain hardened (defensive no-op flag) so early close cannot crash counting/detection.",
+        "All prior v8.02.000 guarantees (immediate naming registers zones, Count auto-stops paint, durable model coordinates, `binary_fill_holes` + neighborhood lookup for accurate interiors, retirement to prevent dups, full wipe on every new image load, auto Save Paint Layer into the left File Browser directory, etc.) now apply reliably even to the first painted+named region on a fresh load."
+    ])
+
+    pdf.body(
+        "These changes complete the Paint tool reliability story. The workflow \"draw, right-click name immediately after the stroke, click Count Cells (without pressing Stop Paint)\" is now fully production-ready on the first try."
+    )
+
+    # ------------------------------------------------------------------
+    # What's New — 8.02.000
     # ------------------------------------------------------------------
     pdf.chapter_title("What's New in Version 8.02.000", 0)
 
