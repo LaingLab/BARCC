@@ -2,17 +2,33 @@
 
 A GUI tool for analyzing immunofluorescence images with atlas region mapping and automated cell counting.
 
-**v8.02.002 Highlights** (current patch)
-- Fixed mismatch between zone counts shown on the mask/image (yellow labels and visible red cell markers) and the numbers in the exported spreadsheet ("Cell Counts" sheet).
-  - Root cause: Unconditional application of `img_x`/`img_y` atlas overlay offset when mapping detected cell centroids (from the main experimental image / final cell mask) into the zone mask for counting, and when positioning zone labels in `show_page`.
-  - This affected painted regions (which live in the background TIFF's 0,0-aligned coordinate space) whenever the atlas overlay had been panned, zoomed, or shifted (non-zero `img_x`/`img_y`), causing cells to be assigned to wrong zones (or none) in the DataFrame used for both the spreadsheet and `last_df`.
-  - Visual cell markers were drawn at correct positions, leading to "I see 30 cells in the painted region but spreadsheet says 12" (or vice versa).
-- Implemented size-based heuristic in `count_cells_in_zones` and the zone label drawing code:
-  - If the zone mask size closely matches the main `background_image` / cell mask size (paint regions on TIFF, or standalone), use direct coordinates (offset 0) for accurate assignment and label placement over the background layer.
-  - If sizes differ (atlas/PDF overlay), fall back to previous `img_x`/`img_y` offset logic for layer alignment.
-- This ensures the counts reported in the spreadsheet exactly match what the user sees visually in each region on the annotated image and on-screen labels (after re-running Count Cells).
-- No impact on pure atlas workflows or when no overlay offset is present.
-- Version in exported settings JSON updated to "8.02.002".
+**v8.03.000 Highlights** (current major release)
+- **Atlas Manager Ribbon** (new central, discoverable UI for atlas region work; toggleable via View > "Show Atlas Manager Ribbon"):
+  - Expandable header + content; always shows selected region.
+  - Global Crop and Move now **checkboxes** (visible active state; enables whole-atlas click-drag modes).
+  - "Move Selected Region" checkbox + interior drag: translates *only* the orange selected zone's mask (artwork/other regions fixed).
+  - "Border drag resize enabled" checkbox: enables edge grab.
+  - **Global Quick Adjust** (new): Rot +/-5°, Scale +/-5% for entire atlas page (base + masks) + Dialogs access.
+  - Selectable list of labeled regions (click to select for editing).
+  - Selected Region Quick Adjust (Rot +/-5°, Scale +/-5%, Dialogs) — only affects chosen zone.
+- **Per-region atlas editing**:
+  - Select via canvas click (now autoselects named regions, no re-name prompt), list, or Atlas > Select Region.
+  - Edge grab: click near border → red local segment (persistent). Re-click to reposition; drag to locally deform boundary (falloff, live preview). Commit on release.
+  - Move-selected + quick per-region transforms.
+- **Mutual exclusion & clarity**: Enabling edge/border auto-deselects global Move (and Crop); vice versa. Checkboxes + orange tint + list make context obvious.
+- **Menu update**: Import Atlas (plus all global/per-region tools) moved to dedicated top-level **Atlas** menu.
+- **Robustness fixes**:
+  - Atlas crop: proper model coords via _canvas_to_atlas, rebase img_x/img_y, prune orphans, full state clear (no more "disappearing" atlas).
+  - Load order: image after atlas no longer breaks global Move/edge (stale selection/edge state now fully cleared in import_tiff + _load_tiff_file paths).
+  - Edge hit-testing forgiving (boundary pixels still trigger grab when near selected).
+  - Drag delegation: per-region features work even under global edit bindings.
+  - Hygiene: clears on page switch, deselect, imports, crop, etc.
+- Updated manual (regenerated with new What's New 8.03.000 + expanded Atlas chapter documenting ribbon, quick adjust, edge features, checkboxes, etc.).
+- Version in code/settings JSON: "8.03.000".
+
+See release-notes-v8.03.000.md for full details. Previous v8.02.x Paint reliability and count fixes remain intact.
+
+**v8.02.002 Highlights** (previous patch)
 
 **v8.02.001 Highlights** (previous)
 - Final Paint tool reliability fixes so the primary workflow ("draw region, right-click name immediately, click Count Cells") succeeds on the *very first attempt* after loading any image:
@@ -125,13 +141,14 @@ python Application/barcc.py
       - Once done, click "Paint > Stop Paint"
       - Use "Paint > Save Paint Layer" to auto-save the paint into your current left File Browser folder (or "Load Paint" to reload one).
    
-   b. *Import Atlas Section*:
-      - Click "File > Import Atlas Section"
+   b. *Import Atlas*:
+      - Click "Atlas > Import Atlas"
       - Select your PDF atlas file
 
 3. **Align Atlas**:
    - Use "Move Atlas" button to position the atlas over your image
    - Use rotation and scaling controls if needed
+   - For fine per-region adjustments (after naming zones): Atlas > Select Region (then click a yellow region), then use Rotate Selected Region / Scale Selected Region to tweak individual shapes larger/smaller or rotate them. The underlying atlas lines stay fixed as reference while the counting zones (yellow) adjust.
 
 4. **Define Regions**:
    - Click on regions to highlight them

@@ -22,7 +22,7 @@ import os
 # ============================================================================
 MANUAL_TITLE = "BARCC - Brain Atlas Regional Cell Counter"
 MANUAL_SUBTITLE = "User Manual"
-VERSION = "8.02.002"
+VERSION = "8.03.000"
 OUTPUT_FILENAME = "BARCC_User_Manual.pdf"
 OUTPUT_DIR = ".."  # Place PDF in repository root
 
@@ -67,6 +67,8 @@ class BARCCUserManual(FPDF):
             '\u2194': '<->',    # left right arrow ↔
             '\u00b7': '.',      # middle dot ·
             '\u2023': '>',      # triangular bullet ‣
+            '\u25b6': '>',      # black right-pointing triangle ▶ (ribbon arrow)
+            '\u25bc': 'v',      # black down-pointing triangle ▼ (ribbon arrow)
         }
         for old, new in replacements.items():
             text = text.replace(old, new)
@@ -292,13 +294,13 @@ class BARCCUserManual(FPDF):
             ("4. User Interface Overview", 6),
             ("5. File Menu", 7),
             ("6. Working with Atlas Sections", 8),
-            ("7. Paint Tools for Regions of Interest", 10),
-            ("8. Mask Settings & Cell Detection", 11),
-            ("9. Manual Cell Editing", 14),
-            ("10. Counting Cells & Exporting Results", 15),
-            ("11. Saving & Export Options", 16),
-            ("12. Keyboard Shortcuts", 17),
-            ("13. Troubleshooting", 18),
+            ("7. Paint Tools for Regions of Interest", 11),
+            ("8. Mask Settings & Cell Detection", 12),
+            ("9. Manual Cell Editing", 15),
+            ("10. Counting Cells & Exporting Results", 16),
+            ("11. Saving & Export Options", 17),
+            ("12. Keyboard Shortcuts", 18),
+            ("13. Troubleshooting", 19),
         ]
 
         self.set_font("Helvetica", "", 11)
@@ -361,6 +363,42 @@ def build_manual():
     # ------------------------------------------------------------------
     # 2. INSTALLATION
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # What's New — 8.03.000
+    # ------------------------------------------------------------------
+    pdf.chapter_title("What's New in Version 8.03.000", 0)
+
+    pdf.body(
+        "BARCC 8.03.000 delivers a major new workflow for atlas-based region editing via the Atlas Manager ribbon, plus global quick adjustments, improved mode visibility, and numerous robustness fixes for mixed image+atlas workflows."
+    )
+
+    pdf.bullet_list([
+        "Atlas menu reorganization: \"Import Atlas\" (and global Crop/Move/Rotate/Scale plus per-region tools) now lives under a dedicated Atlas top-level menu (moved from File menu for better discoverability).",
+        "New Atlas Manager ribbon (collapsible/expandable via header arrow; fully toggleable on/off from View > \"Show Atlas Manager Ribbon\" check item). The ribbon is the central hub for atlas region work:",
+        "  - Header always shows the currently selected region name/ID (or \"No region selected\").",
+        "  - Global tools now implemented as checkboxes (Crop, Move) so the active mode is immediately visible. Checking enables the corresponding click-drag behavior on the canvas (whole-atlas operations); unchecking returns to normal selection/naming.",
+        "  - \"Move Selected Region\" checkbox: when a region is selected (orange tint), click+drag inside it to translate *only* that zone's pixels in the mask. The underlying atlas artwork, other regions, and background image remain fixed. This is ideal for fine local alignment corrections without disturbing global registration.",
+        "  - \"Border drag resize enabled\" checkbox: when checked (and region selected), clicking near the perimeter of the orange/yellow region illuminates a local red edge segment. Re-click the red line to reposition the editable window; drag the red to locally push/pull only that portion of the boundary (linear falloff weights preserve connectivity and overall region integrity). Live shape update of the tinted region during drag via efficient rasterization + partial refresh. Release commits the edit.",
+        "  - Persistent red edge highlight survives panning, zooming, page changes, and show_page() calls (unless explicitly toggled off by a short click on an already-illuminated edge).",
+        "  - Quick Global Adjust section (new): Rot +5° / -5°, Scale +5% / -5% buttons that apply to the entire current atlas page (base artwork + all zone masks). Plus \"Dialogs...\" shortcut to the full global Rotate/Scale settings dialogs.",
+        "  - Selectable list of all labeled regions on the current atlas page. Clicking any entry selects it for editing (orange tint, ribbon header update, ready for quick adjust, edge drag, or move-selected). List auto-syncs after naming, transforms, page changes, etc.",
+        "  - Per-region quick adjust (unchanged from prior work but now clearly labeled \"Selected Region Quick Adjust\"): Rot +/-5°, Scale +/-5%, and \"Dialogs...\" for the currently selected region only (centroid-preserving transforms via the existing _apply_transform_to_region machinery).",
+        "Automatic mutual exclusion between global modes and edge features: enabling the border-drag checkbox deselects global Move (and Crop); enabling global Move or Crop automatically unchecks the border drag. Region \"Move Selected\" also cooperates with edit mode bindings. This prevents confusing overlapping behaviors and makes the active toolset obvious from the checkbox states.",
+        "Major improvements to per-region atlas editing: individual regions on an imported atlas can now be selected (canvas click on named yellow area, list, or Atlas menu Select Region tool), then independently rotated, scaled, translated (via the move-selected drag), or locally deformed via the red-edge drag. The rest of the atlas and background stay in place. Transforms update both the visual tint and the underlying label mask used for counting.",
+        "Robustness fixes across the board:",
+        "  - Atlas crop now correctly converts canvas rect to model (native) coordinates using _canvas_to_atlas, clamps to image bounds, rebases img_x/img_y so the cropped content stays visually in place, prunes orphaned zone names, and fully clears stale selection/edge state.",
+        "  - Load-order fixes: loading a TIFF/image *after* an atlas no longer leaves stale selected_zone_id or selected_edge_full_contour that would hijack global Move drags (via the priority checks in drag_start/drag_move) or cause is_near tests to behave unexpectedly. All image-load paths (import_tiff and file-browser _load_tiff_file) now perform complete selection/edge/region-mode clears in addition to the zone/mask wipes.",
+        "  - Edge grab hit-testing made forgiving: clicks that land on boundary pixels (zid==0 at exact integer sample) but are near the current selected region's border (or an already-illuminated red) are treated as edge-grab intent instead of falling through to a name prompt.",
+        "  - Global Move (edit_mode) and per-region features now correctly delegate in the drag handlers so that \"Move Selected Region\" or edge grab work even if the global Move binding is active (priority checks on mousedown; motion delegation).",
+        "  - Many additional state hygiene improvements (clears on page change, deselect, import atlas, crop end, etc.) so that ribbon list, orange tint, red edge, and move/edge flags stay consistent.",
+        "Ribbon checkboxes (global Crop/Move + per-region Move Selected + Border drag) plus the selected region header and list now give immediate, at-a-glance feedback about the current editing context and which tools are armed.",
+        "All new per-region and global quick adjust operations participate in undo (save_state) and correctly update the ribbon list/header after transforms."
+    ])
+
+    pdf.body(
+        "These changes make fine-grained, region-by-region correction of atlas registration practical while preserving the ability to do global alignment. The visual distinction between \"I'm moving the whole atlas\" vs. \"I'm only moving/deforming this one region\" is now explicit via checkboxes and selection highlighting."
+    )
+
     # ------------------------------------------------------------------
     # What's New — 8.02.002 (current patch)
     # ------------------------------------------------------------------
@@ -578,7 +616,7 @@ def build_manual():
 
     pdf.bullet_list([
         "Import a TIFF image (File > Import TIFF)",
-        "Import an atlas section PDF (File > Import Atlas Section)",
+        "Import an atlas section PDF (Atlas > Import Atlas)",
         "Align the atlas over your image using Move, Rotate, and Resize tools",
         "Define regions using either Paint tools or by clicking atlas regions",
         "Configure and preview cell detection parameters (Mask > Show Mask Settings)",
@@ -628,10 +666,15 @@ def build_manual():
         "After import, the image is automatically scaled to fit the window while preserving aspect ratio."
     )
 
-    pdf.chapter_title("Import Atlas Section", 1)
+    pdf.chapter_title("Import Atlas", 1)
     pdf.body(
         "Opens a PDF file containing brain atlas plates. BARCC uses PyMuPDF to render individual pages "
         "at high quality. You can navigate between pages of multi-plate PDFs."
+    )
+    pdf.body(
+        "Note: Import Atlas (and related global/per-region atlas tools) now lives under the top-level "
+        "Atlas menu rather than the File menu, for better grouping with Crop, Move, Rotate, Scale, "
+        "and the new region selection/editing commands."
     )
 
     pdf.chapter_title("Split Tiff", 1)
@@ -683,25 +726,124 @@ def build_manual():
 
     pdf.body(
         "Accurate alignment of the atlas to your experimental image is critical for meaningful "
-        "regional analysis. BARCC provides several interactive tools for this purpose."
+        "regional analysis. BARCC provides several interactive tools for this purpose, now centered "
+        "around the Atlas Manager ribbon for both global and per-region fine control."
     )
 
-    pdf.chapter_title("Move Atlas", 1)
+    pdf.chapter_title("The Atlas Manager Ribbon", 1)
     pdf.body(
-        "Click and drag the atlas overlay to reposition it over the underlying image. "
-        "This is the primary tool for coarse alignment."
+        "The ribbon (View > \"Show Atlas Manager Ribbon\" to toggle visibility) is the primary interface "
+        "for working with atlas regions. It is collapsible via the ▶/▼ arrow in the header."
+    )
+    pdf.bullet_list([
+        "Header always displays the currently selected region (name and ID) or \"No region selected\".",
+        "Global tools appear as checkboxes (Crop, Move) — their checked state shows at a glance whether whole-atlas click-drag modes are active.",
+        "\"Move Selected Region\" checkbox: enables interior drag of the orange-tinted selected region to shift *only* its mask pixels (everything else stays fixed).",
+        "\"Border drag resize enabled\" checkbox: arms edge-grab mode for the selected region.",
+        "Global Quick Adjust: one-click Rot +/-5° and Scale +/-5% for the entire current atlas page (base + all masks), plus quick access to the full Rotate/Scale dialogs.",
+        "Selectable list of every labeled region on the current page. Click any entry to select it for editing (orange highlight appears, ribbon header updates).",
+        "Selected Region Quick Adjust: the same +/- rotate and scale buttons, but applied only to the currently selected region (centroid-preserving).",
+        "All operations are undoable and immediately reflected in the ribbon list and on-screen tints."
+    ])
+    pdf.note_box(
+        "The ribbon automatically stays in sync after naming, transforms, page changes, crops, etc. "
+        "Checkboxes enforce mutual exclusion (e.g., turning on border drag automatically unchecks global Move and vice versa) so you always know which tool family is armed."
     )
 
-    pdf.chapter_title("Rotate", 1)
+    pdf.chapter_title("Selecting Regions for Editing", 1)
     pdf.body(
-        "Enter a rotation angle in degrees and apply it. Positive values rotate clockwise. "
-        "Useful for correcting slight angular differences between your sectioning plane and the atlas."
+        "Click a yellow (named) or orange (selected) area directly on the atlas canvas, or use the list in the ribbon, "
+        "or Atlas menu > \"Select Region\" (temporarily rebinds clicks to pick a zone). The selected region "
+        "receives an orange tint overlay and becomes the target for quick adjust, edge drag, and move-selected."
+    )
+    pdf.body(
+        "Canvas clicks on already-named regions now intelligently autoselect them into the ribbon (instead of "
+        "re-prompting for a name). Clicks near the perimeter (even on boundary pixels) are treated as edge-grab "
+        "intent when the border checkbox is on."
     )
 
-    pdf.chapter_title("Resize / Scale", 1)
+    pdf.chapter_title("Global Quick Adjust (new in 8.03)", 1)
     pdf.body(
-        "Apply uniform or axis-specific scaling. The Scale dialog also provides fine X and Y "
-        "adjustment sliders for precise matching of anatomical landmarks."
+        "The ribbon now offers the same style of quick +/- buttons for the *entire* atlas page that were previously "
+        "available only for individual selected regions:"
+    )
+    pdf.bullet_list([
+        "Rot +5° / Rot -5° — rotates the full rendered atlas artwork and all zone masks for the current page (expand=True semantics, size may grow).",
+        "Scale +5% / Scale -5% — uniform scaling of the entire page content.",
+        "\"Dialogs...\" shortcut to the full global Rotate and Scale settings dialogs (with numeric entry and axis-specific scaling)."
+    ])
+    pdf.body(
+        "These are the global equivalents of the per-region quick adjust. They affect every region on the page "
+        "plus the underlying artwork; use them for coarse global corrections before fine per-region work."
+    )
+
+    pdf.chapter_title("Per-Region Editing & Quick Adjust", 1)
+    pdf.body(
+        "Once a region is selected (orange), you can:"
+    )
+    pdf.bullet_list([
+        "Use the Selected Region Quick Adjust buttons (Rot +/-5°, Scale +/-5%) — these transform only the chosen zone's mask while keeping its centroid roughly in place. The rest of the atlas and background are untouched.",
+        "Open full per-region Rotate/Scale dialogs via the \"Dialogs...\" button (or Atlas menu).",
+        "Enable \"Move Selected Region\" and drag inside the orange area to translate only that zone (see below).",
+        "Enable \"Border drag resize\" for local boundary editing (see below)."
+    ])
+
+    pdf.chapter_title("Move Selected Region (translate only one zone)", 1)
+    pdf.body(
+        "With a region selected and the \"Move Selected Region\" checkbox checked, click and drag inside the "
+        "orange area. Only the pixels belonging to that zone in the label mask are shifted; the atlas artwork "
+        "itself, other zones, and the background image remain exactly where they are. This is perfect for "
+        "nudging a single misaligned anatomical region without disturbing your global registration."
+    )
+    pdf.body(
+        "The checkbox and the global Move checkbox are coordinated so you can easily switch between moving "
+        "the whole atlas layer versus moving just the current region."
+    )
+
+    pdf.chapter_title("Edge Grab & Local Deformation (expand/shrink from the border)", 1)
+    pdf.body(
+        "With \"Border drag resize enabled\" checked and a region selected:"
+    )
+    pdf.bullet_list([
+        "Click near the perimeter of the orange/yellow region. A local segment of the boundary is highlighted in bright red.",
+        "The red segment is a movable \"handle\" centered on your click point (using a sliding window along the contour with falloff weighting).",
+        "Click again on an already-red edge to re-center the editable window at that exact location.",
+        "Drag the red line outward or inward. Only the vertices inside the local window move, with linear falloff so the deformation blends smoothly into the rest of the boundary. The rest of the region (and the rest of the atlas) stays fixed.",
+        "You get live visual feedback: the tinted region shape updates in real time as you drag.",
+        "Release the mouse to commit the new shape to the mask (used for counting) and the display.",
+        "A short click (no drag) on a red edge toggles the highlight off."
+    ])
+    pdf.body(
+        "The red highlight is persistent across pans, zooms, and show_page refreshes until you explicitly dismiss it. "
+        "This gives you precise, one-sided control over region boundaries without having to repaint or globally scale/rotate."
+    )
+
+    pdf.chapter_title("Global Crop & Move (checkbox style)", 1)
+    pdf.body(
+        "The Global Crop and Move tools are now checkboxes in the ribbon (and check items in the Atlas menu). "
+        "When checked, they rebind canvas clicks for whole-atlas operations (crop rectangle or drag-to-move the "
+        "entire overlay layer via img_x/img_y). Their checked state gives clear feedback that you are in a global "
+        "mode rather than a per-region editing mode. Unchecking (or enabling an edge feature) restores normal "
+        "click behavior (naming / region selection / edge grab)."
+    )
+    pdf.note_box(
+        "Best practice for atlas work: Use global Crop/Move/Quick Rotate/Scale first for rough alignment of the "
+        "whole plate, then switch to per-region tools (list or canvas selection + quick adjust + edge drag + move-selected) "
+        "for fine anatomical corrections. The checkboxes and orange selection tint make the current context obvious."
+    )
+
+    pdf.chapter_title("Move Atlas (legacy / still available)", 1)
+    pdf.body(
+        "The classic click-and-drag of the atlas overlay (when the global Move checkbox is checked) repositions "
+        "the entire atlas layer relative to the background. This remains the primary tool for coarse global alignment."
+    )
+
+    pdf.chapter_title("Rotate / Scale (global)", 1)
+    pdf.body(
+        "Use either the ribbon Global Quick Adjust buttons for small increments or the full dialogs (Atlas menu "
+        "or ribbon \"Dialogs...\" under Global Quick Adjust). These affect the rendered atlas artwork and all "
+        "zone masks on the current page. After a global rotate that expands the canvas, the layer offset is "
+        "automatically handled on the next redraw."
     )
 
     pdf.chapter_title("Brightness & Contrast Adjustments", 1)
@@ -712,7 +854,9 @@ def build_manual():
 
     pdf.note_box(
         "Best practice: Identify 3-4 reliable anatomical landmarks (e.g., ventricles, major fiber tracts, "
-        "cortical boundaries) and align to those rather than trying to match the entire section at once."
+        "cortical boundaries) and align to those rather than trying to match the entire section at once. "
+        "After global alignment, use the new per-region tools in the ribbon to tweak individual structures "
+        "without disturbing the rest of the plate."
     )
 
     # ------------------------------------------------------------------

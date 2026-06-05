@@ -23,7 +23,7 @@ from PIL import Image, ImageTk, ImageDraw, ImageFont, ImageEnhance
 import numpy as np
 import copy
 from skimage import filters, morphology, measure, util, feature, segmentation, color, restoration, exposure
-from skimage.morphology import binary_closing, disk
+from skimage.morphology import closing, disk
 from scipy.ndimage import distance_transform_edt
 from scipy import ndimage as ndi
 from dataclasses import dataclass
@@ -445,8 +445,13 @@ class PDFViewer:
         self.zoom = 1.0
         self.page_images = {}
         self.mask_images = {}
+        self.base_page_images = {}
         self.zone_counters = {}
         self.zone_names = {}
+
+        # Per-region atlas editing (new feature for adjusting individual atlas region shapes)
+        self.selected_zone_id = None
+        self.selected_page = None
 
         # Undo/state
         self.undo_stack = self.state_manager.undo_stack
@@ -463,11 +468,13 @@ class PDFViewer:
 
         # Crop / edit variables
         self.crop_mode = False
+        self.crop_mode_var = tk.BooleanVar(value=False)
         self.crop_rect = None
         self.start_x = None
         self.start_y = None
 
         self.edit_mode = False
+        self.edit_mode_var = tk.BooleanVar(value=False)
         self.img_x = 0
         self.img_y = 0
         self.drag_start_x = None
@@ -491,6 +498,20 @@ class PDFViewer:
         # Transparent menu / window mode
         self.transparent_mode = tk.BooleanVar(value=False)
         self.transparent_windows = []  # popups that should follow transparent mode
+
+        # Atlas ribbon visibility and state (must be created before _build_gui so View menu can reference it)
+        self.show_atlas_ribbon = tk.BooleanVar(value=True)
+        self.atlas_ribbon_expanded = False
+        self.border_mode_var = tk.BooleanVar(value=True)
+        self.region_move_mode = tk.BooleanVar(value=False)
+        self.region_translate_active = False
+        self.count_button_packed = False
+        self.count_button = None
+        self.region_translate_zid = None
+        self.region_translate_start_mx = 0.0
+        self.region_translate_start_my = 0.0
+        self.region_translate_original_mask = None
+        self.region_list_id_map = {}
 
         # Persistent paint layer (this is the key to zoom-safe painting)
         self.paint_layer = None  # RGBA PIL Image, created when background is loaded
@@ -557,7 +578,6 @@ class PDFViewer:
         self.menu.add_cascade(label="File", menu=filemenu)
         filemenu.add_command(label="Split Tiff", command=self.split_tiff)
         filemenu.add_command(label="Import Tiff", command=self.import_tiff)
-        filemenu.add_command(label="Import Atlas Section", command=self.open_file)
         filemenu.add_command(label="Import Paint", command=self.open_paint)
         filemenu.add_command(label="Save Flattened Image", command=self.save_flattened_image)
         filemenu.add_command(label="Next Image", command=self.next_image)
@@ -575,10 +595,19 @@ class PDFViewer:
         # Create Atlas menu dropdown
         atlasmenu = tk.Menu(self.menu)
         self.menu.add_cascade(label="Atlas", menu=atlasmenu)
-        atlasmenu.add_command(label="Crop", command=self.toggle_crop_mode)
-        atlasmenu.add_command(label="Move", command=self.toggle_edit_mode)
+        atlasmenu.add_command(label="Import Atlas", command=self.import_atlas)
+        atlasmenu.add_separator()
+        atlasmenu.add_checkbutton(label="Crop", variable=self.crop_mode_var, command=self.toggle_crop_mode)
+        atlasmenu.add_checkbutton(label="Move", variable=self.edit_mode_var, command=self.toggle_edit_mode)
         atlasmenu.add_command(label="Rotate", command=self.show_rotate_settings)
         atlasmenu.add_command(label="Scale", command=self.show_scale_settings)
+
+        # Per-region transforms for individually selected atlas zones (new in this update)
+        atlasmenu.add_separator()
+        atlasmenu.add_command(label="Select Region", command=self.select_region)
+        atlasmenu.add_command(label="Deselect Region", command=self.deselect_region)
+        atlasmenu.add_command(label="Rotate Selected Region", command=self.show_rotate_selected_dialog)
+        atlasmenu.add_command(label="Scale Selected Region", command=self.show_scale_selected_dialog)
         
         # Create Paint menu dropdown
         paintmenu = tk.Menu(self.menu)
@@ -627,6 +656,13 @@ class PDFViewer:
             command=toggle_transparent_mode
         )
 
+        viewmenu.add_separator()
+        viewmenu.add_checkbutton(
+            label="Show Atlas Manager Ribbon",
+            variable=self.show_atlas_ribbon,
+            command=self._toggle_atlas_ribbon_visibility
+        )
+
         # Create Cell menu dropdown
         cellmenu = tk.Menu(self.menu)
         self.menu.add_cascade(label="Cell", menu=cellmenu)
@@ -661,18 +697,29 @@ class PDFViewer:
         self.top_frame = ttk.Frame(self.main_paned)
         self.main_paned.add(self.top_frame, weight=1)
 
-        self.top_frame.rowconfigure(0, weight=1)
+        self.top_frame.rowconfigure(0, weight=0)  # ribbon row (collapsible Atlas Manager)
+        self.top_frame.rowconfigure(1, weight=1)  # canvas viewer
+        self.top_frame.rowconfigure(2, weight=0)  # horizontal scrollbar
         self.top_frame.columnconfigure(0, weight=1)
 
-        # Scrollbars and canvas (moved inside top_frame)
+        # Atlas Manager ribbon (dropdown/expandable panel for selected region + manip options + border drag)
+        self._build_atlas_ribbon(self.top_frame)
+        self.atlas_ribbon.grid(row=0, column=0, columnspan=2, sticky='ew', padx=2, pady=1)
+        self._update_ribbon_selection()
+
+        # Respect initial visibility from View menu var (default shown)
+        if not self.show_atlas_ribbon.get():
+            self.atlas_ribbon.grid_remove()
+
+        # Scrollbars and canvas (viewer area shifted down to make room for ribbon)
         self.scrolly = ttk.Scrollbar(self.top_frame, orient=tk.VERTICAL)
-        self.scrolly.grid(row=0, column=1, sticky='ns')
+        self.scrolly.grid(row=1, column=1, sticky='ns')
         self.scrollx = ttk.Scrollbar(self.top_frame, orient=tk.HORIZONTAL)
-        self.scrollx.grid(row=1, column=0, sticky='ew')
+        self.scrollx.grid(row=2, column=0, sticky='ew')
 
         self.output = tk.Canvas(self.top_frame, bg='#ECE8F3')
         self.output.configure(yscrollcommand=self.scrolly.set, xscrollcommand=self.scrollx.set)
-        self.output.grid(row=0, column=0, sticky='nsew')
+        self.output.grid(row=1, column=0, sticky='nsew')
         self.scrolly.configure(command=self.output.yview)
         self.scrollx.configure(command=self.output.xview)
 
@@ -686,6 +733,37 @@ class PDFViewer:
         self.output.bind("<Alt-B1-Motion>", self._do_pan)
         self.output.bind("<Alt-ButtonRelease-1>", self._end_pan)
 
+        # Interactive border drag support for selected atlas regions (pull only the dragged side)
+        # These are additive so they coexist with other mode-specific bindings
+        self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
+        self.output.bind("<ButtonRelease-1>", self._end_border_drag, add=True)
+        self.output.bind("<Motion>", self._update_cursor_for_atlas_border, add=True)
+        self.border_drag_active = False
+        self.border_drag_original_mask = None
+        self.border_drag_centroid = (0.0, 0.0)
+        self.border_drag_unit = (0.0, 1.0)
+        self.border_drag_start_mouse = (0.0, 0.0)
+        self.border_drag_zone = None
+
+        # Edge editing state for precise local boundary pulling (new)
+        self.edge_grab_active = False
+        self.active_edge = None
+        self.edge_closest_idx = 0
+        self.edge_window = 30
+        self.edge_start_idx = 0
+        self.edge_end_idx = 0
+        self.original_full_contour_for_edit = None
+        self.current_edited_contour = None
+        self.edge_highlight_item = None
+
+        # Persistent selected edge for toggle (click to select/illuminate red, click again to deselect)
+        self.selected_edge_full_contour = None
+        self.selected_edge_start_idx = 0
+        self.selected_edge_end_idx = 0
+        self.selected_edge_closest = 0
+        self._edge_pending_deselect = False
+        self.edge_drag_start_pos = (0.0, 0.0)
+
     # End of UI, beginning of functions
 
     def split_tiff(self):
@@ -697,6 +775,11 @@ class PDFViewer:
         if self.current_state == 'paint':
             return
         self.current_state = 'paint'
+        self.region_move_mode.set(False)
+        self.region_move_mode.set(False)
+        self.region_translate_active = False
+        self.region_translate_original_mask = None
+        self.region_translate_zid = None
         self.show_brush_settings()
         self.old_x = None
         self.old_y = None
@@ -721,8 +804,13 @@ class PDFViewer:
         self.output.unbind('<Button-1>')
         self.output.unbind('<Button-3>')
         self.output.bind('<Button-1>', self.highlight_region)
+        self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
         self.menu.delete(8)
         self.current_state = None
+        self.region_move_mode.set(False)
+        self.region_translate_active = False
+        self.region_translate_original_mask = None
+        self.region_translate_zid = None
 
         # Auto-assign default names to any painted strokes/groups that the user didn't explicitly name
         # This ensures the spreadsheet always gets populated with Painted Regions when using the paint tool.
@@ -2239,6 +2327,10 @@ class PDFViewer:
         """Enable mask editing mode"""
         self.editing_mask = True
         self.mask_edit_add = add
+        self.region_move_mode.set(False)
+        self.region_translate_active = False
+        self.region_translate_original_mask = None
+        self.region_translate_zid = None
         self.output.unbind("<Button-1>")
         self.output.bind("<Button-1>", self.edit_mask_draw)
         self.output.bind("<B1-Motion>", self.edit_mask_draw)
@@ -2309,6 +2401,11 @@ class PDFViewer:
         self.output.unbind("<B3-Motion>")
         self.output.unbind("<ButtonRelease-3>")
         self.output.bind("<Button-1>", self.highlight_region)
+        self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
+        self.region_move_mode.set(False)
+        self.region_translate_active = False
+        self.region_translate_original_mask = None
+        self.region_translate_zid = None
         logger.info("Stopped mask edit mode")
         messagebox.showinfo("Mask Editing", "Mask edits applied. You can now re-count cells.")
 
@@ -2962,7 +3059,9 @@ class PDFViewer:
                 if self.atlas_filetype == 'pdf':
                     img = self.pdf_handler.render_page(self.current_page, self.zoom)
                     logger.debug(f"Creating new page image: mode={img.mode}, size={img.size}")
-                    self.page_images[self.current_page] = img
+                    # Store clean base (no yellow tints) for per-region editing + rebuilds
+                    self.base_page_images[self.current_page] = img.copy()
+                    self.page_images[self.current_page] = img  # will be rebuilt with overlays when zones exist
                     # Only for true multi-page atlas (PDF): initialize per-page zone/mask state.
                     # Do NOT reset for 'img' (baked paint from Stop/Count) or 'png' (loaded paint layer):
                     # those would clobber zones/masks that _convert_named_paints_to_zones just
@@ -2979,6 +3078,8 @@ class PDFViewer:
                     # paths are responsible for them.
                     img = self.img
                     logger.debug(f"Creating new page image: mode={img.mode}, size={img.size}")
+                    if self.current_page not in self.base_page_images:
+                        self.base_page_images[self.current_page] = img.copy()
                     self.page_images[self.current_page] = img
                     # Intentionally no reset of mask_images / zone_names / zone_counters here.
             
@@ -2989,6 +3090,34 @@ class PDFViewer:
     def show_page(self, mask=None):
         if mask is None:
             self.showing_auto_mask = False
+
+        # Deselect region transform target if we've switched pages
+        if self.selected_page is not None and self.selected_page != self.current_page:
+            self.selected_zone_id = None
+            self.selected_page = None
+            self._clear_edge_highlight()
+            self.edge_grab_active = False
+            self.border_drag_active = False
+            self.active_edge = None
+            self.current_edited_contour = None
+            self.selected_edge_full_contour = None
+            self.original_full_contour_for_edit = None
+            self._edge_pending_deselect = False
+            self.region_translate_active = False
+            self.region_translate_original_mask = None
+            self.region_translate_zid = None
+            self.region_move_mode.set(False)
+            self.crop_mode = False
+            self.crop_mode_var.set(False)
+            self.edit_mode = False
+            self.edit_mode_var.set(False)
+
+        self._update_ribbon_selection()
+
+        # Keep any active red edge highlight in the correct screen position after pan/zoom/page change
+        if getattr(self, 'active_edge', None) is not None:
+            self._update_edge_highlight()
+
         img = self.load_page_image() or Image.new('RGBA', (1, 1), (0, 0, 0, 0))
 
         self.output.delete("all")
@@ -3124,6 +3253,14 @@ class PDFViewer:
         if self.paint_group_data:
             self._rebuild_paint_vectors()
 
+        # Re-draw any persistent selected edge highlight (red) after delete("all").
+        # Keeps the illumination visible after pan/zoom/show_page while an edge is selected.
+        if getattr(self, 'selected_edge_full_contour', None) is not None and not getattr(self, 'edge_grab_active', False):
+            if getattr(self, 'active_edge', None) is not None:
+                self._draw_edge_highlight(self.active_edge)
+            else:
+                self._draw_edge_highlight()
+
 
     def img_white_to_transparent(self, img):
         img_array = np.array(img)
@@ -3132,7 +3269,48 @@ class PDFViewer:
         img = Image.fromarray(img_array)
         return img
 
-    def open_file(self):
+    def _canvas_to_atlas(self, canvas_x, canvas_y):
+        """Convert canvas/screen coordinates to atlas model/native coordinates.
+        Correctly accounts for self.img_x/y (layer offset) and self.view_scale (zoom).
+        Returns floats for precision in distance/scale calculations.
+        """
+        if self.view_scale <= 0:
+            return 0.0, 0.0
+        model_x = (canvas_x - self.img_x) / self.view_scale
+        model_y = (canvas_y - self.img_y) / self.view_scale
+        return model_x, model_y
+
+    def _rebuild_page_overlays(self, page=None):
+        """Rebuild page_images[page] by taking the clean base and applying yellow (or orange for selected)
+        tint overlays based on the current mask labels. This enables clean per-region edits without
+        losing the underlying atlas artwork.
+        """
+        if page is None:
+            page = self.current_page
+        if page not in self.base_page_images:
+            # Fallback: promote current page image as base (for legacy 'img' atlas cases)
+            if page in self.page_images:
+                self.base_page_images[page] = self.page_images[page].copy()
+            else:
+                return
+        base = self.base_page_images[page].convert('RGBA').copy()
+        arr = np.array(base)
+        if page in self.mask_images:
+            m = np.array(self.mask_images[page])
+            for zid in np.unique(m):
+                if zid == 0:
+                    continue
+                reg = (m == zid)
+                if self.selected_zone_id is not None and self.selected_page == page and zid == self.selected_zone_id:
+                    # Special tint for the actively selected region (visual feedback)
+                    arr[reg, :3] = [255, 140, 0]  # orange
+                    arr[reg, 3] = 50
+                else:
+                    arr[reg, :3] = [255, 255, 0]  # yellow
+                    arr[reg, 3] = 18
+        self.page_images[page] = Image.fromarray(arr.astype(np.uint8), 'RGBA')
+
+    def import_atlas(self):
         logger.info("Opening file dialog for atlas selection")
         self.save_state()
         path = fd.askopenfilename(filetypes=[("PDF files", "*.pdf"), ("PDF files", "*.ai")])
@@ -3148,8 +3326,27 @@ class PDFViewer:
             self.current_page = 0
             self.page_images = {}
             self.mask_images = {}
+            self.base_page_images = {}
             self.zone_counters = {}
             self.zone_names = {}
+            self.selected_zone_id = None
+            self.selected_page = None
+            self._clear_edge_highlight()
+            self.edge_grab_active = False
+            self.border_drag_active = False
+            self.active_edge = None
+            self.current_edited_contour = None
+            self.original_full_contour_for_edit = None
+            self.selected_edge_full_contour = None
+            self._edge_pending_deselect = False
+            self.region_translate_active = False
+            self.region_translate_original_mask = None
+            self.region_translate_zid = None
+            self.region_move_mode.set(False)
+            self.crop_mode = False
+            self.crop_mode_var.set(False)
+            self.edit_mode = False
+            self.edit_mode_var.set(False)
             self.named_paint_groups.clear()
             self.paint_group_data.clear()
             clear_preprocess_cache()
@@ -3171,6 +3368,29 @@ class PDFViewer:
         self.zone_counters = {}
         if self.current_page is None:
             self.current_page = 0
+
+        # Also clear any stale region selection / edge edit state from previous atlas or image.
+        # Prevents stale selected_zone_id or selected_edge_full_contour from hijacking
+        # global atlas Move (drag_start/drag_move priority checks) or causing other issues
+        # when loading a new image (especially after atlas was loaded first).
+        self.selected_zone_id = None
+        self.selected_page = None
+        self._clear_edge_highlight()
+        self.edge_grab_active = False
+        self.border_drag_active = False
+        self.active_edge = None
+        self.current_edited_contour = None
+        self.original_full_contour_for_edit = None
+        self.selected_edge_full_contour = None
+        self._edge_pending_deselect = False
+        self.region_translate_active = False
+        self.region_translate_original_mask = None
+        self.region_translate_zid = None
+        self.region_move_mode.set(False)
+        self.crop_mode = False
+        self.crop_mode_var.set(False)
+        self.edit_mode = False
+        self.edit_mode_var.set(False)
 
         tiff_path = fd.askopenfilename(filetypes=[("TIFF files", "*.tiff *.tif")])
         if tiff_path:
@@ -3356,6 +3576,26 @@ class PDFViewer:
         self.img_x = 0
         self.img_y = 0
 
+        # Also clear any stale region selection / edge edit state (same as import_tiff).
+        self.selected_zone_id = None
+        self.selected_page = None
+        self._clear_edge_highlight()
+        self.edge_grab_active = False
+        self.border_drag_active = False
+        self.active_edge = None
+        self.current_edited_contour = None
+        self.original_full_contour_for_edit = None
+        self.selected_edge_full_contour = None
+        self._edge_pending_deselect = False
+        self.region_translate_active = False
+        self.region_translate_original_mask = None
+        self.region_translate_zid = None
+        self.region_move_mode.set(False)
+        self.crop_mode = False
+        self.crop_mode_var.set(False)
+        self.edit_mode = False
+        self.edit_mode_var.set(False)
+
         self.tiff_dir = os.path.dirname(tiff_path)
         self.tiff_filename = os.path.splitext(os.path.basename(tiff_path))[0]
 
@@ -3468,7 +3708,17 @@ class PDFViewer:
     def toggle_crop_mode(self):
         self.save_state()
         self.crop_mode = not self.crop_mode
+        self.crop_mode_var.set(self.crop_mode)
         if self.crop_mode:
+            self.region_move_mode.set(False)
+            self.border_mode_var.set(False)
+            if getattr(self, 'edit_mode', False):
+                self.edit_mode = False
+                self.edit_mode_var.set(False)
+                self.output.bind("<Button-1>", self.highlight_region)
+                self.output.unbind("<B1-Motion>")
+                self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
+            self.region_translate_active = False
             self.output.bind("<Button-1>", self.crop_start)
             self.output.bind("<B1-Motion>", self.crop_drag)
             self.output.bind("<ButtonRelease-1>", self.crop_end)
@@ -3476,6 +3726,7 @@ class PDFViewer:
             self.output.bind("<Button-1>", self.highlight_region)
             self.output.unbind("<B1-Motion>")
             self.output.unbind("<ButtonRelease-1>")
+            self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
             if self.crop_rect:
                 self.output.delete(self.crop_rect)
                 self.crop_rect = None
@@ -3495,39 +3746,176 @@ class PDFViewer:
     def crop_end(self, event):
         end_x = self.output.canvasx(event.x)
         end_y = self.output.canvasy(event.y)
-        left = min(self.start_x, end_x)
-        top = min(self.start_y, end_y)
-        right = max(self.start_x, end_x)
-        bottom = max(self.start_y, end_y)
+        page = self.current_page
+
+        # Convert the canvas-space crop rectangle to *model* (atlas native) coordinates.
+        # base_page_images, page_images[] and mask_images[] are stored at the native
+        # resolution of the rendered PDF page (or original atlas size). Canvas coords
+        # include view_scale + img_x/img_y layer offset, so direct use of canvas numbers
+        # for PIL.crop produces wrong (often tiny/empty/out-of-bounds) results after any
+        # pan or zoom -- causing the atlas to "disappear" after crop.
+        mx1, my1 = self._canvas_to_atlas(self.start_x, self.start_y)
+        mx2, my2 = self._canvas_to_atlas(end_x, end_y)
+        mleft = min(mx1, mx2)
+        mtop = min(my1, my2)
+        mright = max(mx1, mx2)
+        mbottom = max(my1, my2)
+
+        # Remember the canvas position of the crop top-left. After cropping the rasters
+        # we rebase img_x/img_y so the new smaller atlas's (0,0) is drawn exactly where
+        # the TL of the crop rect was. This prevents the remaining content from jumping
+        # and keeps the "cropped to selection" feel.
+        cleft = min(self.start_x, end_x)
+        ctop = min(self.start_y, end_y)
+
+        # --- Crop base (clean reference for rebuilds) using model coords + clamp ---
+        if page in self.base_page_images:
+            base = self.base_page_images[page]
+            bw, bh = base.size
+            left = max(0, min(int(mleft), bw))
+            top = max(0, min(int(mtop), bh))
+            right = max(left, min(int(mright), bw))
+            bottom = max(top, min(int(mbottom), bh))
+            if right > left and bottom > top:
+                cropped_base = base.crop((left, top, right, bottom))
+                cropped_base = self.img_white_to_transparent(cropped_base)
+                self.base_page_images[page] = cropped_base
+            else:
+                # Degenerate rect (e.g. click with no drag, or completely outside) -- abort cleanly
+                self.show_page()
+                self.toggle_crop_mode()
+                return
+
+        # --- Crop the loaded page image (we also assign so size is consistent until rebuild) ---
         img = self.load_page_image()
-        cropped_img = img.crop((left, top, right, bottom))
-        cropped_img = self.img_white_to_transparent(cropped_img)
-        self.page_images[self.current_page] = cropped_img
-        mask_img = self.mask_images[self.current_page]
-        cropped_mask = mask_img.crop((left, top, right, bottom))
-        self.mask_images[self.current_page] = cropped_mask
+        iw, ih = img.size
+        left = max(0, min(int(mleft), iw))
+        top = max(0, min(int(mtop), ih))
+        right = max(left, min(int(mright), iw))
+        bottom = max(top, min(int(mbottom), ih))
+        if right > left and bottom > top:
+            cropped_img = img.crop((left, top, right, bottom))
+            cropped_img = self.img_white_to_transparent(cropped_img)
+            self.page_images[page] = cropped_img
+        else:
+            self.show_page()
+            self.toggle_crop_mode()
+            return
+
+        # --- Crop mask (the labels must stay aligned with the new base) ---
+        if page in self.mask_images:
+            mask_img = self.mask_images[page]
+            mw, mh = mask_img.size
+            left = max(0, min(int(mleft), mw))
+            top = max(0, min(int(mtop), mh))
+            right = max(left, min(int(mright), mw))
+            bottom = max(top, min(int(mbottom), mh))
+            if right > left and bottom > top:
+                cropped_mask = mask_img.crop((left, top, right, bottom))
+                self.mask_images[page] = cropped_mask
+            # (if degenerate we already returned above from the page_images crop)
+
+        # Prune zone_names for any zids that no longer have any pixels after the crop.
+        # Keeps the "Labeled Regions" list in the Atlas Manager accurate (no ghosts for
+        # regions that were cropped away). Counters are left alone (never reuse ids).
+        if page in self.mask_images and page in self.zone_names:
+            try:
+                m = np.array(self.mask_images[page])
+                present = {int(z) for z in np.unique(m) if z > 0}
+                for zid in list(self.zone_names[page].keys()):
+                    if zid not in present:
+                        del self.zone_names[page][zid]
+            except Exception:
+                pass
+
+        # Rebase the atlas layer offset. The new native (0,0) now corresponds to what used
+        # to be (mleft, mtop) in the old image; place it at the same screen location.
+        self.img_x = cleft
+        self.img_y = ctop
+
         clear_preprocess_cache()
+        self._rebuild_page_overlays(page)
+        self._clear_edge_highlight()
+        self.edge_grab_active = False
+        self.active_edge = None
+        self.current_edited_contour = None
+        self.selected_edge_full_contour = None
+        self._edge_pending_deselect = False
+        self.region_translate_active = False
+        self.region_translate_original_mask = None
+        self.region_translate_zid = None
+        self.selected_zone_id = None
+        self.selected_page = None
+        self.region_move_mode.set(False)
+
         self.show_page()
         self.toggle_crop_mode()
-        if not self.count_button_packed:
-            self.count_button.pack(side=tk.LEFT, padx=10, pady=10)
-            self.count_button_packed = True
+        if getattr(self, 'count_button', None) is not None and not getattr(self, 'count_button_packed', False):
+            try:
+                self.count_button.pack(side=tk.LEFT, padx=10, pady=10)
+                self.count_button_packed = True
+            except Exception:
+                pass
 
     def toggle_edit_mode(self):
         self.save_state()
         self.edit_mode = not self.edit_mode
+        self.edit_mode_var.set(self.edit_mode)
         if self.edit_mode:
+            self.region_move_mode.set(False)
+            self.border_mode_var.set(False)
+            if getattr(self, 'crop_mode', False):
+                self.crop_mode = False
+                self.crop_mode_var.set(False)
+                self.output.bind("<Button-1>", self.highlight_region)
+                self.output.unbind("<B1-Motion>")
+                self.output.unbind("<ButtonRelease-1>")
+                self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
+                if self.crop_rect:
+                    self.output.delete(self.crop_rect)
+                    self.crop_rect = None
+            self.region_translate_active = False
             self.output.bind("<Button-1>", self.drag_start)
             self.output.bind("<B1-Motion>", self.drag_move)
         else:
             self.output.bind("<Button-1>", self.highlight_region)
             self.output.unbind("<B1-Motion>")
+            self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
 
     def drag_start(self, event):
+        # Give priority to per-region features (Move Selected Region checkbox or border/edge grab)
+        # even if the global "Move" (edit_mode) binding is active. This prevents "move selected"
+        # or edge grab from moving the whole atlas layer like the global drag does.
+        cx = self.output.canvasx(event.x)
+        cy = self.output.canvasy(event.y)
+        mx, my = self._canvas_to_atlas(cx, cy)
+        if self.region_move_mode.get() and self.selected_zone_id is not None and getattr(self, 'selected_page', None) == self.current_page:
+            if not self._is_near_selected_border(mx, my, screen_tol=8):
+                self._start_region_translate(mx, my)
+                return
+        if (getattr(self, 'border_mode_var', None) and self.border_mode_var.get() and
+                self.selected_zone_id is not None and getattr(self, 'selected_page', None) == self.current_page):
+            if self._is_near_selected_border(mx, my, screen_tol=8) or \
+               (getattr(self, 'selected_edge_full_contour', None) is not None and self._is_click_on_selected_edge(mx, my, screen_tol=10)):
+                self._try_start_border_drag(event)
+                return
         self.drag_start_x = event.x
         self.drag_start_y = event.y
 
     def drag_move(self, event):
+        # Delegate to per-region translate or edge grab logic if active (see drag_start priority).
+        if getattr(self, 'region_translate_active', False):
+            mx, my = self._canvas_to_atlas(self.output.canvasx(event.x), self.output.canvasy(event.y))
+            dx = mx - self.region_translate_start_mx
+            dy = my - self.region_translate_start_my
+            if self.region_translate_original_mask is not None:
+                self.mask_images[self.current_page] = self.region_translate_original_mask.copy()
+                self._apply_region_translation(dx, dy)
+                self._refresh_atlas_layer()
+            return
+        if getattr(self, 'edge_grab_active', False) or getattr(self, '_edge_pending_deselect', False):
+            self._handle_border_drag_motion(event)
+            return
         dx = event.x - self.drag_start_x
         dy = event.y - self.drag_start_y
         self.img_x += dx
@@ -3540,13 +3928,23 @@ class PDFViewer:
         self.save_state()
         try:
             degrees = float(self.rotation_entry.get())
-            img = self.page_images[self.current_page]
-            rotated = img.rotate(degrees, expand=True)
-            self.page_images[self.current_page] = rotated
-            mask_img = self.mask_images[self.current_page]
-            rotated_mask = mask_img.rotate(degrees, expand=True, resample=Image.NEAREST)
-            self.mask_images[self.current_page] = rotated_mask
+            page = self.current_page
+            # Transform the clean base (the atlas artwork) and the zone mask
+            if page in self.base_page_images:
+                base = self.base_page_images[page]
+                rotated_base = base.rotate(degrees, expand=True)
+                self.base_page_images[page] = rotated_base
+            if page in self.mask_images:
+                mask_img = self.mask_images[page]
+                rotated_mask = mask_img.rotate(degrees, expand=True, resample=Image.NEAREST)
+                self.mask_images[page] = rotated_mask
             clear_preprocess_cache()
+            self._rebuild_page_overlays(page)
+            self._clear_edge_highlight()
+            self.edge_grab_active = False
+            self.border_drag_active = False
+            self.active_edge = None
+            self.current_edited_contour = None
             self.show_page()
         except ValueError:
             messagebox.showerror("Error", "Please enter a valid number for rotation degrees.")
@@ -3557,14 +3955,24 @@ class PDFViewer:
             scale = float(self.scale_entry.get())
             if scale <= 0:
                 raise ValueError("Scale must be positive")
-            img = self.page_images[self.current_page]
-            new_size = (int(img.width * scale), int(img.height * scale))
-            resized = img.resize(new_size, Image.BILINEAR)
-            self.page_images[self.current_page] = resized
-            mask_img = self.mask_images[self.current_page]
-            resized_mask = mask_img.resize(new_size, Image.NEAREST)
-            self.mask_images[self.current_page] = resized_mask
+            page = self.current_page
+            if page in self.base_page_images:
+                base = self.base_page_images[page]
+                new_size = (int(base.width * scale), int(base.height * scale))
+                resized_base = base.resize(new_size, Image.BILINEAR)
+                self.base_page_images[page] = resized_base
+            if page in self.mask_images:
+                mask_img = self.mask_images[page]
+                new_size = (int(mask_img.width * scale), int(mask_img.height * scale))
+                resized_mask = mask_img.resize(new_size, Image.NEAREST)
+                self.mask_images[page] = resized_mask
             clear_preprocess_cache()
+            self._rebuild_page_overlays(page)
+            self._clear_edge_highlight()
+            self.edge_grab_active = False
+            self.border_drag_active = False
+            self.active_edge = None
+            self.current_edited_contour = None
             self.show_page()
         except ValueError:
             messagebox.showerror("Error", "Please enter a valid positive number for scale factor.")
@@ -3575,13 +3983,18 @@ class PDFViewer:
             scale = float(self.scale_entry.get())
             if scale <= 0:
                 raise ValueError("Scale must be positive")
-            img = self.page_images[self.current_page]
-            new_size = (int(img.width * scale), img.height)
-            resized = img.resize(new_size, Image.BILINEAR)
-            self.page_images[self.current_page] = resized
-            mask_img = self.mask_images[self.current_page]
-            resized_mask = mask_img.resize(new_size, Image.NEAREST)
-            self.mask_images[self.current_page] = resized_mask
+            page = self.current_page
+            if page in self.base_page_images:
+                base = self.base_page_images[page]
+                new_size = (int(base.width * scale), base.height)
+                resized_base = base.resize(new_size, Image.BILINEAR)
+                self.base_page_images[page] = resized_base
+            if page in self.mask_images:
+                mask_img = self.mask_images[page]
+                new_size = (int(mask_img.width * scale), mask_img.height)
+                resized_mask = mask_img.resize(new_size, Image.NEAREST)
+                self.mask_images[page] = resized_mask
+            self._rebuild_page_overlays(page)
             self.show_page()
         except ValueError:
             messagebox.showerror("Error", "Please enter a valid positive number for scale factor.")
@@ -3592,20 +4005,1270 @@ class PDFViewer:
             scale = float(self.scale_entry.get())
             if scale <= 0:
                 raise ValueError("Scale must be positive")
-            img = self.page_images[self.current_page]
-            new_size = (img.width, int(img.height * scale))
-            resized = img.resize(new_size, Image.BILINEAR)
-            self.page_images[self.current_page] = resized
-            mask_img = self.mask_images[self.current_page]
-            resized_mask = mask_img.resize(new_size, Image.NEAREST)
-            self.mask_images[self.current_page] = resized_mask
+            page = self.current_page
+            if page in self.base_page_images:
+                base = self.base_page_images[page]
+                new_size = (base.width, int(base.height * scale))
+                resized_base = base.resize(new_size, Image.BILINEAR)
+                self.base_page_images[page] = resized_base
+            if page in self.mask_images:
+                mask_img = self.mask_images[page]
+                new_size = (mask_img.width, int(mask_img.height * scale))
+                resized_mask = mask_img.resize(new_size, Image.NEAREST)
+                self.mask_images[page] = resized_mask
+            self._rebuild_page_overlays(page)
             self.show_page()
         except ValueError:
             messagebox.showerror("Error", "Please enter a valid positive number for scale factor.")
 
+    # ------------------------------------------------------------------
+    # NEW: Per-region select + rotate/scale for individual atlas zones
+    # ------------------------------------------------------------------
+
+    def select_region(self):
+        """Prompt user to click a named atlas region to select it for individual shape adjustment."""
+        if not self.atlas_filetype:
+            messagebox.showwarning("No Atlas", "Load an atlas first (Atlas > Import Atlas).")
+            return
+        self.save_state()
+        messagebox.showinfo(
+            "Select Region",
+            "Click inside a yellow/orange named region on the atlas to select it.\n"
+            "Then use 'Rotate Selected Region' or 'Scale Selected Region' from the Atlas menu."
+        )
+        # One-shot picker
+        self.output.bind("<Button-1>", self._pick_and_select_region)
+
+    def deselect_region(self):
+        """Clear current region selection (returns tint to normal yellow)."""
+        self._clear_edge_highlight()
+        self.edge_grab_active = False
+        self.active_edge = None
+        self.current_edited_contour = None
+        self.original_full_contour_for_edit = None
+        self.selected_edge_full_contour = None
+        self._edge_pending_deselect = False
+        self.region_translate_active = False
+        self.region_translate_original_mask = None
+        self.region_translate_zid = None
+        self.region_move_mode.set(False)
+        if self.selected_zone_id is not None:
+            self.selected_zone_id = None
+            self.selected_page = None
+            if self.current_page in self.base_page_images:
+                self._rebuild_page_overlays(self.current_page)
+            self.show_page()
+            self._update_ribbon_selection()
+
+    def _pick_and_select_region(self, event):
+        """Temporarily bound click handler to pick a zone from the mask under cursor."""
+        logger.debug(f"Region pick click at canvas ({event.x}, {event.y})")
+        try:
+            canvas_x = self.output.canvasx(event.x)
+            canvas_y = self.output.canvasy(event.y)
+            mx, my = self._canvas_to_atlas(canvas_x, canvas_y)
+            x, y = int(mx), int(my)
+
+            if self.current_page not in self.mask_images:
+                messagebox.showwarning("No Regions", "No zone mask for current atlas page.")
+                return
+
+            mask_img = self.mask_images[self.current_page]
+            w, h = mask_img.size
+            if x < 0 or y < 0 or x >= w or y >= h:
+                messagebox.showinfo("Click Outside", "Click inside the atlas overlay area.")
+                return
+
+            m = np.array(mask_img)
+            if 0 <= y < m.shape[0] and 0 <= x < m.shape[1]:
+                zid = int(m[y, x])
+            else:
+                zid = 0
+
+            if zid == 0:
+                messagebox.showwarning("No Region", "Clicked on background / unlabeled area. Click inside a named (yellow) region.")
+                return
+
+            # Ensure any mask-claimed zone (even if it lacked a name entry) gets a default and
+            # will appear in the Atlas Manager labeled list.
+            self._ensure_zone_has_name(self.current_page, zid)
+
+            self.selected_zone_id = zid
+            self.selected_page = self.current_page
+            self._clear_edge_highlight()
+            self.edge_grab_active = False
+            self.border_drag_active = False
+            self.active_edge = None
+            self.current_edited_contour = None
+            self.selected_edge_full_contour = None
+            self._edge_pending_deselect = False
+            self.region_move_mode.set(False)
+            self.region_translate_active = False
+            self.region_translate_original_mask = None
+            self.region_translate_zid = None
+            zname = self.zone_names.get(self.current_page, {}).get(zid, f"Zone {zid}")
+            messagebox.showinfo("Selected", f"Region '{zname}' (ID {zid}) is now selected for transform.\n\nUse Atlas menu Rotate/Scale Selected Region or drag its border (if enabled in ribbon).")
+            # Rebuild will show it in orange
+            self._rebuild_page_overlays(self.current_page)
+            self.show_page()
+            self._update_ribbon_selection()
+        finally:
+            # Restore normal left-click behavior (name/highlight regions)
+            self.output.bind("<Button-1>", self.highlight_region)
+            self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
+
+    def _has_selected_region(self):
+        if self.selected_zone_id is None or self.selected_page is None:
+            return False
+        if self.selected_page != self.current_page:
+            messagebox.showwarning("Page Mismatch", "The selected region is on a different atlas page. Please re-select on the current page.")
+            self.selected_zone_id = None
+            self.selected_page = None
+            return False
+        return True
+
+    def _ensure_zone_has_name(self, page, zid):
+        """If a positive zone id appears in the mask but has no friendly name in zone_names,
+        auto-register a default name so it shows up in the Labeled Regions manager and
+        canvas clicks on it will autoselect instead of re-prompting for a name.
+        Also bumps the zone counter so future new names don't collide with existing ids.
+        """
+        if zid <= 0:
+            return
+        if page not in self.zone_names:
+            self.zone_names[page] = {}
+        if zid not in self.zone_names[page]:
+            default_name = f"Region {zid}"
+            self.zone_names[page][zid] = default_name
+            logger.debug(f"Auto-registered default name for orphan zone {zid} on page {page}")
+        if page not in self.zone_counters:
+            self.zone_counters[page] = 0
+        if self.zone_counters[page] < zid:
+            self.zone_counters[page] = zid
+
+    def _apply_transform_to_region(self, page, zone_id, angle_deg=0.0, scale_x=1.0, scale_y=1.0):
+        """Rotate (around centroid) and/or scale the shape of a single zone in the label mask.
+        The underlying base atlas image is left unchanged (lines stay for reference); only the
+        zone's yellow area (for viz) and the mask pixels (for counting) are adjusted.
+        Centroid of the region is kept approximately in place.
+        """
+        if page not in self.mask_images or zone_id is None:
+            return False
+        mask_img = self.mask_images[page]
+        m = np.array(mask_img)
+        if zone_id not in m:
+            return False
+
+        region = (m == zone_id)
+        if not region.any():
+            return False
+
+        ys, xs = np.where(region)
+        cy = float(np.mean(ys))
+        cx = float(np.mean(xs))
+
+        # Compute tight bbox + pad
+        miny, maxy = int(ys.min()), int(ys.max())
+        minx, maxx = int(xs.min()), int(xs.max())
+        pad = 4
+        miny = max(0, miny - pad)
+        minx = max(0, minx - pad)
+        maxy = min(m.shape[0] - 1, maxy + pad)
+        maxx = min(m.shape[1] - 1, maxx + pad)
+
+        region_crop = region[miny:maxy+1, minx:maxx+1].astype(np.uint8) * 255
+        bin_img = Image.fromarray(region_crop, mode='L')
+
+        # Rotate around the crop center (approximates; we correct with centroid later)
+        if abs(angle_deg) > 0.0001:
+            bin_img = bin_img.rotate(angle_deg, resample=Image.NEAREST, expand=True)
+
+        # Scale (post-rotate)
+        if abs(scale_x - 1.0) > 0.0001 or abs(scale_y - 1.0) > 0.0001:
+            nw = max(1, int(bin_img.width * scale_x))
+            nh = max(1, int(bin_img.height * scale_y))
+            bin_img = bin_img.resize((nw, nh), Image.NEAREST)
+
+        new_bin = np.array(bin_img) > 127
+        if not new_bin.any():
+            return False
+
+        new_ys, new_xs = np.where(new_bin)
+        new_cy_loc = float(np.mean(new_ys))
+        new_cx_loc = float(np.mean(new_xs))
+
+        # Position the patch so its new centroid lands on the original world centroid
+        paste_x = int(round(cx - new_cx_loc))
+        paste_y = int(round(cy - new_cy_loc))
+
+        # Build new mask: clear old zone pixels, paste transformed
+        new_m = m.copy()
+        new_m[region] = 0
+
+        nh, nw = new_bin.shape
+        y1 = max(0, paste_y)
+        x1 = max(0, paste_x)
+        y2 = min(new_m.shape[0], paste_y + nh)
+        x2 = min(new_m.shape[1], paste_x + nw)
+
+        if y2 > y1 and x2 > x1:
+            sub = new_bin[(y1 - paste_y):(y2 - paste_y), (x1 - paste_x):(x2 - paste_x)]
+            new_m[y1:y2, x1:x2][sub] = zone_id
+
+        self.mask_images[page] = Image.fromarray(new_m.astype(np.uint8), mode='L')
+        clear_preprocess_cache()
+
+        # Update visuals from base + new mask (selected will be orange if still selected)
+        self._rebuild_page_overlays(page)
+        return True
+
+    def _apply_border_pull(self, pull_amount):
+        """One-sided border pull: only the side being dragged moves (the pulled "cap" of the region).
+        The opposite side stays fixed. This stretches/deforms the region from the contact edge.
+        pull_amount is the signed offset along the precomputed unit normal (positive = outward).
+        """
+        page = self.current_page
+        zid = self.border_drag_zone
+        if page not in self.mask_images or zid is None:
+            return False
+
+        orig = np.array(self.mask_images[page])
+        region = (orig == zid)
+        if not region.any():
+            return False
+
+        ys, xs = np.where(region)
+        cx, cy = self.border_drag_centroid
+        ux, uy = self.border_drag_unit
+
+        new_mask = orig.copy()
+        new_mask[region] = 0
+
+        for y, x in zip(ys, xs):
+            vx = x - cx
+            vy = y - cy
+            side = vx * ux + vy * uy
+            if side > 0:
+                # This point is on the pulled side -> shift it
+                nx = x + pull_amount * ux
+                ny = y + pull_amount * uy
+            else:
+                nx = x
+                ny = y
+
+            ix = int(round(nx))
+            iy = int(round(ny))
+            if 0 <= iy < new_mask.shape[0] and 0 <= ix < new_mask.shape[1]:
+                new_mask[iy, ix] = zid
+
+        # Fill gaps and make the deformed region solid (important for counting)
+        try:
+            bin_zone = (new_mask == zid)
+            # A little dilation helps connect the sampled points after rounding/shifting
+            thickened = ndi.binary_dilation(bin_zone, iterations=1)
+            filled = ndi.binary_fill_holes(thickened)
+            # Only fill holes that belong to this zone, protect other zones
+            new_mask[filled & (new_mask == 0)] = zid
+            other_zones = (orig != 0) & (orig != zid)
+            new_mask[other_zones] = orig[other_zones]
+        except Exception:
+            # Fallback: at least the sampled points are set
+            pass
+
+        self.mask_images[page] = Image.fromarray(new_mask.astype(np.uint8), mode='L')
+        clear_preprocess_cache()
+        self._rebuild_page_overlays(page)
+        return True
+
+    def show_rotate_selected_dialog(self):
+        if not self._has_selected_region():
+            messagebox.showwarning("No Region Selected", "Use 'Atlas > Select Region' then click a named region first.")
+            return
+        window = Toplevel(self.master)
+        window.attributes('-topmost', 'true')
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        self._register_transparent_window(window)
+        window.title("Rotate Selected Region")
+        rotation_label = ttk.Label(window, text="Degrees:")
+        rotation_label.grid(row=0, column=0)
+        self.region_rotation_entry = ttk.Entry(window, width=10)
+        self.region_rotation_entry.grid(row=0, column=1, padx=5, pady=5)
+        ttk.Button(window, text="Rotate", command=self.rotate_selected_region).grid(row=0, column=2, padx=5, pady=5)
+        close_button = tk.Button(window, text="Close", command=lambda: window.destroy())
+        close_button.grid(row=10, column=2, sticky=tk.SE, padx=5, pady=5)
+
+    def rotate_selected_region(self):
+        if not self._has_selected_region():
+            return
+        self.save_state()
+        try:
+            entry = getattr(self, 'region_rotation_entry', None)
+            degrees = float(entry.get()) if entry else 0.0
+            page = self.selected_page
+            zid = self.selected_zone_id
+            if self._apply_transform_to_region(page, zid, angle_deg=degrees, scale_x=1.0, scale_y=1.0):
+                self.show_page()
+                self._update_ribbon_selection()
+            else:
+                messagebox.showerror("Transform Failed", "Could not rotate the selected region.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Enter a valid number. {e}")
+
+    def show_scale_selected_dialog(self):
+        if not self._has_selected_region():
+            messagebox.showwarning("No Region Selected", "Use 'Atlas > Select Region' then click a named region first.")
+            return
+        window = Toplevel(self.master)
+        window.attributes('-topmost', 'true')
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        self._register_transparent_window(window)
+        window.title("Scale Selected Region")
+        scale_label = ttk.Label(window, text="Scale factor:")
+        scale_label.grid(row=0, column=0)
+        self.region_scale_entry = ttk.Entry(window, width=10)
+        self.region_scale_entry.grid(row=0, column=1, padx=5, pady=5)
+        ttk.Button(window, text="Resize", command=self.scale_selected_uniform).grid(row=1, column=0, padx=5, pady=5)
+        ttk.Button(window, text="Resize X", command=self.scale_selected_x).grid(row=1, column=1, padx=5, pady=5)
+        ttk.Button(window, text="Resize Y", command=self.scale_selected_y).grid(row=1, column=2, padx=5, pady=5)
+        close_button = tk.Button(window, text="Close", command=lambda: window.destroy())
+        close_button.grid(row=10, column=2, sticky=tk.SE, padx=5, pady=5)
+
+    def scale_selected_uniform(self):
+        if not self._has_selected_region():
+            return
+        self.save_state()
+        try:
+            entry = getattr(self, 'region_scale_entry', None)
+            s = float(entry.get()) if entry else 1.0
+            if s <= 0:
+                raise ValueError("Scale > 0")
+            page = self.selected_page
+            zid = self.selected_zone_id
+            if self._apply_transform_to_region(page, zid, angle_deg=0.0, scale_x=s, scale_y=s):
+                self.show_page()
+                self._update_ribbon_selection()
+        except Exception as e:
+            messagebox.showerror("Error", f"Invalid scale: {e}")
+
+    def scale_selected_x(self):
+        if not self._has_selected_region():
+            return
+        self.save_state()
+        try:
+            entry = getattr(self, 'region_scale_entry', None)
+            s = float(entry.get()) if entry else 1.0
+            if s <= 0:
+                raise ValueError("Scale > 0")
+            page = self.selected_page
+            zid = self.selected_zone_id
+            if self._apply_transform_to_region(page, zid, angle_deg=0.0, scale_x=s, scale_y=1.0):
+                self.show_page()
+                self._update_ribbon_selection()
+        except Exception as e:
+            messagebox.showerror("Error", f"Invalid scale: {e}")
+
+    def scale_selected_y(self):
+        if not self._has_selected_region():
+            return
+        self.save_state()
+        try:
+            entry = getattr(self, 'region_scale_entry', None)
+            s = float(entry.get()) if entry else 1.0
+            if s <= 0:
+                raise ValueError("Scale > 0")
+            page = self.selected_page
+            zid = self.selected_zone_id
+            if self._apply_transform_to_region(page, zid, angle_deg=0.0, scale_x=1.0, scale_y=s):
+                self.show_page()
+                self._update_ribbon_selection()
+        except Exception as e:
+            messagebox.showerror("Error", f"Invalid scale: {e}")
+
+    # --- Atlas Manager Ribbon UI ---
+    def _build_atlas_ribbon(self, parent):
+        """Builds a collapsible 'ribbon' / panel for Atlas region management.
+        Header always visible with toggle arrow and current selection summary.
+        Expanded content shows: selected region info, global tools (Crop/Move + quick global adjust),
+        per-region translate/edge, quick selected-region adjust, labeled regions list, border drag toggle.
+        """
+        self.atlas_ribbon = ttk.Frame(parent, relief=tk.GROOVE, borderwidth=1)
+
+        # Header row (always shown)
+        header = ttk.Frame(self.atlas_ribbon)
+        header.pack(fill='x', padx=2, pady=1)
+
+        self.ribbon_arrow_var = tk.StringVar(value="▶")
+        self.ribbon_toggle = ttk.Button(
+            header, textvariable=self.ribbon_arrow_var, width=3,
+            command=self._toggle_atlas_ribbon
+        )
+        self.ribbon_toggle.pack(side=tk.LEFT, padx=(2, 4))
+
+        ttk.Label(header, text="Atlas Manager", font=("Helvetica", 9, "bold")).pack(side=tk.LEFT)
+
+        self.ribbon_selected_var = tk.StringVar(value="No region selected")
+        ttk.Label(header, textvariable=self.ribbon_selected_var, foreground="#0066cc").pack(side=tk.LEFT, padx=8)
+
+        # Expandable content
+        self.ribbon_content = ttk.Frame(self.atlas_ribbon)
+
+        # Selection info
+        sel_frame = ttk.Frame(self.ribbon_content)
+        sel_frame.pack(fill='x', padx=4, pady=2)
+        ttk.Label(sel_frame, text="Selected Region:").pack(side=tk.LEFT)
+        self.ribbon_sel_name_var = tk.StringVar(value="None")
+        name_lbl = ttk.Label(sel_frame, textvariable=self.ribbon_sel_name_var, width=28, relief="sunken", padding=2)
+        name_lbl.pack(side=tk.LEFT, padx=4)
+        ttk.Button(sel_frame, text="Select Region", command=self.select_region, width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(sel_frame, text="Deselect", command=self.deselect_region, width=8).pack(side=tk.LEFT)
+
+        # Global atlas tools (Crop / Move for whole overlay alignment) - now checkboxes so user can see active state
+        global_frame = ttk.Frame(self.ribbon_content)
+        global_frame.pack(fill='x', padx=4, pady=2)
+        ttk.Label(global_frame, text="Global:").pack(side=tk.LEFT)
+        ttk.Checkbutton(global_frame, text="Crop", variable=self.crop_mode_var, command=self.toggle_crop_mode, width=7).pack(side=tk.LEFT, padx=1)
+        ttk.Checkbutton(global_frame, text="Move", variable=self.edit_mode_var, command=self.toggle_edit_mode, width=7).pack(side=tk.LEFT, padx=1)
+
+        # Global quick adjust (mirrors the selected-region quick adjust below)
+        global_manip_frame = ttk.Frame(self.ribbon_content)
+        global_manip_frame.pack(fill='x', padx=4, pady=2)
+        ttk.Label(global_manip_frame, text="Global Quick Adjust:").pack(side=tk.LEFT)
+        ttk.Button(global_manip_frame, text="Rot +5°", command=lambda: self._quick_rotate_global(5), width=8).pack(side=tk.LEFT, padx=1)
+        ttk.Button(global_manip_frame, text="Rot -5°", command=lambda: self._quick_rotate_global(-5), width=8).pack(side=tk.LEFT, padx=1)
+        ttk.Button(global_manip_frame, text="Scale +5%", command=lambda: self._quick_scale_global(1.05), width=9).pack(side=tk.LEFT, padx=1)
+        ttk.Button(global_manip_frame, text="Scale -5%", command=lambda: self._quick_scale_global(0.95), width=9).pack(side=tk.LEFT, padx=1)
+        ttk.Button(global_manip_frame, text="Dialogs...", command=self.show_rotate_settings, width=9).pack(side=tk.LEFT, padx=4)
+
+        # Move selected region (translate only this zone's area in the mask; underlying atlas stays fixed)
+        move_frame = ttk.Frame(self.ribbon_content)
+        move_frame.pack(fill='x', padx=4, pady=2)
+        ttk.Checkbutton(move_frame, text="Move Selected Region (click+drag inside orange to translate it)", variable=self.region_move_mode, command=self._on_region_move_mode_toggled).pack(anchor='w')
+
+        # Quick manip for selected region
+        manip_frame = ttk.Frame(self.ribbon_content)
+        manip_frame.pack(fill='x', padx=4, pady=2)
+        ttk.Label(manip_frame, text="Selected Region Quick Adjust:").pack(side=tk.LEFT)
+        ttk.Button(manip_frame, text="Rot +5°", command=lambda: self._quick_rotate_selected(5), width=8).pack(side=tk.LEFT, padx=1)
+        ttk.Button(manip_frame, text="Rot -5°", command=lambda: self._quick_rotate_selected(-5), width=8).pack(side=tk.LEFT, padx=1)
+        ttk.Button(manip_frame, text="Scale +5%", command=lambda: self._quick_scale_selected(1.05), width=9).pack(side=tk.LEFT, padx=1)
+        ttk.Button(manip_frame, text="Scale -5%", command=lambda: self._quick_scale_selected(0.95), width=9).pack(side=tk.LEFT, padx=1)
+        ttk.Button(manip_frame, text="Dialogs...", command=self._show_region_dialogs, width=9).pack(side=tk.LEFT, padx=4)
+
+        # Selectable list of all labeled regions for current page
+        list_frame = ttk.Frame(self.ribbon_content)
+        list_frame.pack(fill='both', expand=True, padx=4, pady=2)
+        ttk.Label(list_frame, text="Labeled Regions (current page) - click to select for edit:").pack(anchor='w')
+        lb_container = ttk.Frame(list_frame)
+        lb_container.pack(fill='both', expand=True)
+        self.region_listbox = tk.Listbox(lb_container, height=5, exportselection=False)
+        self.region_listbox.pack(side=tk.LEFT, fill='both', expand=True)
+        lb_scroll = ttk.Scrollbar(lb_container, orient=tk.VERTICAL, command=self.region_listbox.yview)
+        lb_scroll.pack(side=tk.RIGHT, fill='y')
+        self.region_listbox.configure(yscrollcommand=lb_scroll.set)
+        self.region_listbox.bind('<<ListboxSelect>>', self._on_region_list_select)
+
+        # Border drag help / toggle  (edge expand/shrink for selected region)
+        border_frame = ttk.Frame(self.ribbon_content)
+        border_frame.pack(fill='x', padx=4, pady=(2, 4))
+        ttk.Checkbutton(border_frame, text="Border drag resize enabled (when region selected)", variable=self.border_mode_var, command=self._on_border_mode_toggled).pack(side=tk.LEFT)
+        ttk.Label(border_frame, text="  Drag near the edges of the orange/yellow region to expand or shrink it from its center.", font=("Helvetica", 8, "italic")).pack(side=tk.LEFT)
+
+        # Start collapsed (value comes from __init__)
+
+    def _toggle_atlas_ribbon(self):
+        if getattr(self, 'atlas_ribbon_expanded', False):
+            self.ribbon_content.pack_forget()
+            self.ribbon_arrow_var.set("▶")
+            self.atlas_ribbon_expanded = False
+        else:
+            self.ribbon_content.pack(fill='x', padx=2, pady=1)
+            self.ribbon_arrow_var.set("▼")
+            self.atlas_ribbon_expanded = True
+            self._update_ribbon_selection()  # ensure list and selection are up to date when expanding content
+
+    def _toggle_atlas_ribbon_visibility(self):
+        """Called from View menu checkbutton to show or hide the entire Atlas Manager ribbon."""
+        if self.show_atlas_ribbon.get():
+            try:
+                self.atlas_ribbon.grid(row=0, column=0, columnspan=2, sticky='ew', padx=2, pady=1)
+                self._update_ribbon_selection()
+            except Exception:
+                pass
+        else:
+            try:
+                self.atlas_ribbon.grid_remove()
+            except Exception:
+                pass
+
+    def _on_region_move_mode_toggled(self):
+        if self.region_move_mode.get():
+            # If global layer Move (edit_mode) is active, its binding overrides <Button-1>,
+            # so exit it to let highlight_region see the clicks (delegation in drag_* also helps).
+            if getattr(self, 'edit_mode', False):
+                self.edit_mode = False
+                self.edit_mode_var.set(False)
+                self.output.bind("<Button-1>", self.highlight_region)
+                self.output.unbind("<B1-Motion>")
+                self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
+                self.output.bind("<ButtonRelease-1>", self._end_border_drag, add=True)
+            if getattr(self, 'crop_mode', False):
+                self.crop_mode = False
+                self.crop_mode_var.set(False)
+                self.output.bind("<Button-1>", self.highlight_region)
+                self.output.unbind("<B1-Motion>")
+                self.output.unbind("<ButtonRelease-1>")
+                self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
+                if self.crop_rect:
+                    self.output.delete(self.crop_rect)
+                    self.crop_rect = None
+            self.region_translate_active = False
+            self.region_translate_original_mask = None
+            self.region_translate_zid = None
+            self.border_drag_active = False
+            self.output.config(cursor="")
+        else:
+            self.region_translate_active = False
+            self.region_translate_original_mask = None
+            self.region_translate_zid = None
+            self.border_drag_active = False
+            self.output.config(cursor="")
+
+    def _on_border_mode_toggled(self):
+        """Called when the border drag (edge expand/shrink) checkbox is toggled.
+        Enforces mutual exclusion with global move/crop: enabling edge deselects globals.
+        """
+        if self.border_mode_var.get():
+            # Deselect global modes so user can tell edge expand is active (and avoid binding conflicts)
+            if getattr(self, 'edit_mode', False):
+                self.edit_mode = False
+                self.edit_mode_var.set(False)
+                self.output.bind("<Button-1>", self.highlight_region)
+                self.output.unbind("<B1-Motion>")
+                self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
+                self.output.bind("<ButtonRelease-1>", self._end_border_drag, add=True)
+            if getattr(self, 'crop_mode', False):
+                self.crop_mode = False
+                self.crop_mode_var.set(False)
+                self.output.bind("<Button-1>", self.highlight_region)
+                self.output.unbind("<B1-Motion>")
+                self.output.unbind("<ButtonRelease-1>")
+                self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
+                if self.crop_rect:
+                    self.output.delete(self.crop_rect)
+                    self.crop_rect = None
+            # also ensure region translate not conflicting
+            self.region_translate_active = False
+            self.region_translate_original_mask = None
+            self.region_translate_zid = None
+            self.border_drag_active = False
+            self.output.config(cursor="")
+        # when turning border drag off, no need to force globals on
+
+    def _update_ribbon_selection(self):
+        """Refresh the ribbon labels with current selection state."""
+        if not hasattr(self, 'ribbon_sel_name_var'):
+            return
+        if self.selected_zone_id is not None and self.selected_page == self.current_page:
+            zname = self.zone_names.get(self.current_page, {}).get(self.selected_zone_id, f"Zone{self.selected_zone_id}")
+            display = f"{zname} (#{self.selected_zone_id})"
+            self.ribbon_sel_name_var.set(display)
+            self.ribbon_selected_var.set(f"Selected: {zname}")
+        else:
+            self.ribbon_sel_name_var.set("None")
+            self.ribbon_selected_var.set("No region selected")
+
+        # Refresh the full list of labeled regions and sync selection highlight in list
+        self._populate_region_list()
+
+    def _populate_region_list(self):
+        """Populate (or refresh) the listbox with all labeled regions for the current atlas page.
+        Also tries to highlight the currently selected one in the list.
+        """
+        if not hasattr(self, 'region_listbox') or self.region_listbox is None:
+            return
+        self.region_listbox.delete(0, tk.END)
+        self.region_list_id_map = {}
+        page = self.current_page
+        names = self.zone_names.get(page, {}) if hasattr(self, 'zone_names') else {}
+        # Discover any zones present in the mask but missing from zone_names (orphans from
+        # paint force, undo, or legacy data) and auto-register defaults so they appear in
+        # the manager and can be autoselected on canvas clicks.
+        if page in self.mask_images:
+            try:
+                m = np.array(self.mask_images[page])
+                for zid in np.unique(m):
+                    if zid > 0 and zid not in names:
+                        self._ensure_zone_has_name(page, zid)
+                names = self.zone_names.get(page, {}) if hasattr(self, 'zone_names') else {}
+            except Exception:
+                pass
+        for i, (zid, zname) in enumerate(sorted(names.items())):
+            display = f"{zname} (ID={zid})"
+            self.region_listbox.insert(tk.END, display)
+            self.region_list_id_map[i] = zid
+
+        # If we have a current selection for this page, highlight it in the list
+        if (self.selected_zone_id is not None and
+                getattr(self, 'selected_page', None) == page):
+            for i, zid in list(self.region_list_id_map.items()):
+                if zid == self.selected_zone_id:
+                    self.region_listbox.selection_clear(0, tk.END)
+                    self.region_listbox.selection_set(i)
+                    self.region_listbox.see(i)
+                    break
+            else:
+                self.region_listbox.selection_clear(0, tk.END)
+
+    def _on_region_list_select(self, event=None):
+        """User clicked a region in the Atlas Manager list -> make it the transform target."""
+        if not hasattr(self, 'region_listbox') or self.region_listbox is None:
+            return
+        sel = self.region_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if not hasattr(self, 'region_list_id_map'):
+            self.region_list_id_map = {}
+        zid = self.region_list_id_map.get(idx)
+        if zid is None:
+            return
+        # Set as selected for editing
+        self.selected_zone_id = zid
+        self.selected_page = self.current_page
+        self._clear_edge_highlight()
+        self.edge_grab_active = False
+        self.active_edge = None
+        self.current_edited_contour = None
+        self.selected_edge_full_contour = None
+        self._edge_pending_deselect = False
+        self.region_move_mode.set(False)
+        self.region_translate_active = False
+        self.region_translate_original_mask = None
+        self.region_translate_zid = None
+        # Update visual (orange tint) and display
+        if self.current_page in self.base_page_images:
+            self._rebuild_page_overlays(self.current_page)
+        self.show_page()
+        self._update_ribbon_selection()  # will re-sync everything including list highlight
+
+    def _quick_rotate_selected(self, degrees):
+        if not self._has_selected_region():
+            return
+        self.save_state()
+        page = self.selected_page
+        zid = self.selected_zone_id
+        if self._apply_transform_to_region(page, zid, angle_deg=degrees, scale_x=1.0, scale_y=1.0):
+            self._update_ribbon_selection()
+            self.show_page()
+
+    def _quick_scale_selected(self, factor):
+        if not self._has_selected_region():
+            return
+        self.save_state()
+        page = self.selected_page
+        zid = self.selected_zone_id
+        if self._apply_transform_to_region(page, zid, angle_deg=0.0, scale_x=factor, scale_y=factor):
+            self._update_ribbon_selection()
+            self.show_page()
+
+    def _show_region_dialogs(self):
+        self.show_rotate_selected_dialog()
+
+    def _quick_rotate_global(self, degrees):
+        """Apply small rotation to the entire current atlas page (global, affects base + all masks)."""
+        self.save_state()
+        page = self.current_page
+        # Transform the clean base (the atlas artwork) and the zone mask
+        if page in self.base_page_images:
+            base = self.base_page_images[page]
+            rotated_base = base.rotate(degrees, expand=True)
+            self.base_page_images[page] = rotated_base
+        if page in self.mask_images:
+            mask_img = self.mask_images[page]
+            rotated_mask = mask_img.rotate(degrees, expand=True, resample=Image.NEAREST)
+            self.mask_images[page] = rotated_mask
+        clear_preprocess_cache()
+        self._rebuild_page_overlays(page)
+        self._clear_edge_highlight()
+        self.edge_grab_active = False
+        self.border_drag_active = False
+        self.active_edge = None
+        self.current_edited_contour = None
+        self.selected_edge_full_contour = None
+        self.show_page()
+
+    def _quick_scale_global(self, factor):
+        """Apply small uniform scale to the entire current atlas page (global, affects base + all masks)."""
+        self.save_state()
+        page = self.current_page
+        if page in self.base_page_images:
+            base = self.base_page_images[page]
+            new_size = (int(base.width * factor), int(base.height * factor))
+            resized_base = base.resize(new_size, Image.BILINEAR)
+            self.base_page_images[page] = resized_base
+        if page in self.mask_images:
+            mask_img = self.mask_images[page]
+            new_size = (int(mask_img.width * factor), int(mask_img.height * factor))
+            resized_mask = mask_img.resize(new_size, Image.NEAREST)
+            self.mask_images[page] = resized_mask
+        clear_preprocess_cache()
+        self._rebuild_page_overlays(page)
+        self._clear_edge_highlight()
+        self.edge_grab_active = False
+        self.border_drag_active = False
+        self.active_edge = None
+        self.current_edited_contour = None
+        self.selected_edge_full_contour = None
+        self.show_page()
+
+    # --- Border drag (expand/shrink selected region by grabbing its edge) ---
+    def _update_cursor_for_atlas_border(self, event):
+        """Change cursor when hovering near the border of the selected region (if border mode on)."""
+        if not getattr(self, 'border_mode_var', None) or not self.border_mode_var.get():
+            self.output.config(cursor="")
+            return
+        if not self.selected_zone_id or self.selected_page != self.current_page:
+            self.output.config(cursor="")
+            return
+        if self.crop_mode or self.edit_mode or getattr(self, 'current_state', None) == 'paint':
+            self.output.config(cursor="")
+            return
+        cx = self.output.canvasx(event.x)
+        cy = self.output.canvasy(event.y)
+        mx, my = self._canvas_to_atlas(cx, cy)
+        if self._is_near_selected_border(mx, my, screen_tol=8):
+            self.output.config(cursor="sizing")  # or "cross" / "fleur"
+        else:
+            self.output.config(cursor="")
+
+    def _try_start_border_drag(self, event):
+        """Click near edge of a named region: ensure the zone is the active one (orange fill),
+        illuminate the local edge in red (persistent, toggle by re-click), prepare for grab/pull of only that edge.
+        """
+        if not getattr(self, 'border_mode_var', None) or not self.border_mode_var.get():
+            return False
+        if self.crop_mode or self.edit_mode or getattr(self, 'current_state', None) == 'paint':
+            return False
+        cx = self.output.canvasx(event.x)
+        cy = self.output.canvasy(event.y)
+        mx, my = self._canvas_to_atlas(cx, cy)
+
+        # Priority: if we already have a selected/illuminated edge (red line), and click is on/near it,
+        # treat as intent to grab that specific edge (re-center or start drag). This makes "grab the red line" reliable.
+        if self.selected_edge_full_contour is not None and self._is_click_on_selected_edge(mx, my, screen_tol=10):
+            # re-center on this click pos for precise "click a position"
+            self._pick_local_edge(mx, my)
+            self.edge_grab_start_mouse = (mx, my)
+            self.edge_drag_start_pos = (mx, my)
+            self._edge_pending_deselect = True
+            self.edge_grab_active = False
+            self.border_drag_active = False
+            self.border_drag_active = True
+            return True
+
+        # Otherwise, find which named zone the click landed on (for initial edge illumination)
+        page = self.current_page
+        if page not in self.mask_images:
+            return False
+        m = np.array(self.mask_images[page])
+        if not (0 <= int(my) < m.shape[0] and 0 <= int(mx) < m.shape[1]):
+            return False
+        clicked_zid = int(m[int(my), int(mx)])
+        if clicked_zid == 0:
+            # Forgiving hit-test for edge grabs: if click landed just outside the mask (zid=0)
+            # but is near the border of the *currently selected* zone, treat as edge-grab intent
+            # for that zone. This makes illuminating/grabbing the edge (or the red line) more
+            # reliable, even if the exact integer pixel sample is outside the raster region.
+            if (getattr(self, 'selected_zone_id', None) and
+                    getattr(self, 'selected_page', None) == page and
+                    self._is_near_selected_border(mx, my, screen_tol=8)):
+                clicked_zid = self.selected_zone_id
+            else:
+                return False
+
+        # Any positive label under cursor means the area is already claimed by a region.
+        # Ensure it has a name entry (auto default if orphan) so it participates in the
+        # labeled regions manager and future clicks autoselect instead of naming.
+        self._ensure_zone_has_name(page, clicked_zid)
+
+        # Make sure this zone is the active selected (orange). Clear any prior edge.
+        if self.selected_zone_id != clicked_zid or getattr(self, 'selected_page', None) != page:
+            self._clear_edge_highlight()
+            self.edge_grab_active = False
+            self.border_drag_active = False
+            self.active_edge = None
+            self.current_edited_contour = None
+            self.selected_edge_full_contour = None
+            self.selected_zone_id = clicked_zid
+            self.selected_page = page
+            self._rebuild_page_overlays(page)
+            self.show_page()  # make the newly activated zone's orange fill visible immediately
+            self._update_ribbon_selection()
+
+        # Is the click on the border of the (now active) zone?
+        if not self._is_near_selected_border(mx, my, screen_tol=8):
+            # Interior click on the selected zone: if Move Selected Region mode, start translate
+            if self.region_move_mode.get() and self.selected_zone_id == clicked_zid:
+                self._start_region_translate(mx, my)
+                return True
+            # Claimed region (interior click on mask>0) -> autoselect in labeled regions manager
+            # (we ensured a name above). Prevents the name dialog for already-labeled areas.
+            return True  # always prevent falling through to name prompt for claimed zones
+
+
+        # Edge click on the active zone: toggle deselect or select new edge for editing
+        if self.selected_edge_full_contour is not None and self._is_click_on_selected_edge(mx, my, screen_tol=10):
+            # Click on the currently illuminated edge at a specific position:
+            # re-center the editable segment on *this* click point (so "click a position" chooses where to pull from),
+            # update the red to the new local, then prepare for drag or deselect.
+            self._pick_local_edge(mx, my)  # re-computes around the click pos, redraws red centered here
+            self.edge_grab_start_mouse = (mx, my)
+            self.edge_drag_start_pos = (mx, my)
+            self._edge_pending_deselect = True
+            self.edge_grab_active = False
+            self.border_drag_active = False
+            self.border_drag_active = True  # so motion handler proceeds to edge logic
+            return True
+
+        # Select/illuminate this local edge (red, persistent) and prepare for drag
+        self._pick_local_edge(mx, my)
+        self.edge_grab_start_mouse = (mx, my)
+        self.edge_drag_start_pos = (mx, my)
+        self.edge_grab_active = True
+        self.border_drag_active = True  # activate the combined motion handler
+        self._edge_pending_deselect = False
+        self.save_state()
+        return True
+
+    def _pick_local_edge(self, mx, my):
+        """Compute the local boundary segment around the click for the selected zone and draw it in red on the canvas."""
+        self._clear_edge_highlight()
+        self.active_edge = None
+        self.current_edited_contour = None
+
+        page = self.current_page
+        zid = self.selected_zone_id
+        if page not in self.mask_images:
+            return
+        m = np.array(self.mask_images[page])
+        binr = (m == zid).astype(float)
+        contours = measure.find_contours(binr, 0.5)
+        if not contours:
+            return
+        # Main (longest) contour
+        contour = max(contours, key=len)
+        self.original_full_contour_for_edit = contour.copy()
+        self.selected_edge_full_contour = contour.copy()
+
+        # Closest point on contour
+        dists = np.hypot(contour[:, 1] - mx, contour[:, 0] - my)
+        cidx = int(np.argmin(dists))
+        self.edge_closest_idx = cidx
+        self.selected_edge_closest = cidx
+        self.edge_window = 30
+        n = len(contour)
+
+        # Local window around the click (may wrap)
+        start = (cidx - self.edge_window) % n
+        end = (cidx + self.edge_window) % n
+        if start < end:
+            edge_pts = contour[start:end + 1].copy()
+            self.edge_start_idx = start
+            self.edge_end_idx = end
+            self.selected_edge_start_idx = start
+            self.selected_edge_end_idx = end
+        else:
+            edge_pts = np.vstack((contour[start:], contour[:end + 1])).copy()
+            self.edge_start_idx = start
+            self.edge_end_idx = end
+            self.selected_edge_start_idx = start
+            self.selected_edge_end_idx = end
+
+        self.active_edge = edge_pts
+        self._draw_edge_highlight(edge_pts)
+
+    def _is_click_on_selected_edge(self, mx, my, screen_tol=10):
+        """Return True if the click (in model coords) is close to the currently selected (illuminated) edge.
+        screen_tol is the hit radius in screen pixels; converted to model using current view_scale.
+        """
+        if self.selected_edge_full_contour is None:
+            return False
+        # Prefer the active local segment if available
+        if self.active_edge is not None and len(self.active_edge) > 0:
+            edge = self.active_edge
+        else:
+            start = getattr(self, 'selected_edge_start_idx', 0)
+            end = getattr(self, 'selected_edge_end_idx', 0)
+            full = self.selected_edge_full_contour
+            if start < end:
+                edge = full[start:end+1]
+            else:
+                edge = np.vstack((full[start:], full[:end+1]))
+        if len(edge) == 0:
+            return False
+        dists = np.hypot(edge[:,1] - mx, edge[:,0] - my)
+        scale = max(getattr(self, 'view_scale', 1.0), 0.01)
+        model_tol = screen_tol / scale
+        return np.min(dists) < model_tol
+
+    def _moved_enough_for_drag(self, event, threshold=5):
+        """Return True if mouse has moved enough from the drag start to treat as a drag (not a click)."""
+        if not hasattr(self, 'edge_drag_start_pos'):
+            return False
+        cx = self.output.canvasx(event.x)
+        cy = self.output.canvasy(event.y)
+        mx, my = self._canvas_to_atlas(cx, cy)
+        dx = mx - self.edge_drag_start_pos[0]
+        dy = my - self.edge_drag_start_pos[1]
+        return math.hypot(dx, dy) > threshold
+
+    def _draw_edge_highlight(self, edge_pts=None):
+        self._clear_edge_highlight()
+        if edge_pts is None:
+            edge_pts = getattr(self, 'active_edge', None)
+        if edge_pts is None or len(edge_pts) < 2:
+            return
+        scale = getattr(self, 'view_scale', 1.0)
+        ox = getattr(self, 'img_x', 0)
+        oy = getattr(self, 'img_y', 0)
+        flat = []
+        for y, x in edge_pts:
+            sx = x * scale + ox
+            sy = y * scale + oy
+            flat.append(sx)
+            flat.append(sy)
+        if len(flat) > 2:
+            try:
+                item = self.output.create_line(flat, fill='red', width=4, capstyle=tk.ROUND, joinstyle=tk.ROUND, tag='edge_highlight')
+                self.edge_highlight_item = item
+                try:
+                    self.output.tag_raise(item)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    def _update_edge_highlight(self, edge_pts=None):
+        if edge_pts is not None:
+            self.active_edge = edge_pts
+        if not hasattr(self, 'edge_highlight_item') or self.edge_highlight_item is None:
+            self._draw_edge_highlight(edge_pts)
+            return
+        if edge_pts is None:
+            edge_pts = getattr(self, 'active_edge', None)
+        if edge_pts is None or len(edge_pts) < 2:
+            return
+        scale = getattr(self, 'view_scale', 1.0)
+        ox = getattr(self, 'img_x', 0)
+        oy = getattr(self, 'img_y', 0)
+        flat = []
+        for y, x in edge_pts:
+            sx = x * scale + ox
+            sy = y * scale + oy
+            flat.append(sx)
+            flat.append(sy)
+        try:
+            self.output.coords(self.edge_highlight_item, *flat)
+        except Exception:
+            self._draw_edge_highlight(edge_pts)
+
+    def _clear_edge_highlight(self):
+        if hasattr(self, 'edge_highlight_item') and self.edge_highlight_item:
+            try:
+                self.output.delete(self.edge_highlight_item)
+            except Exception:
+                pass
+        self.edge_highlight_item = None
+        try:
+            self.output.delete('edge_highlight')
+        except Exception:
+            pass
+
+    def _start_region_translate(self, mx, my):
+        """Begin translating the selected region (only its mask pixels move; atlas base stays fixed)."""
+        page = self.current_page
+        zid = self.selected_zone_id
+        if page not in self.mask_images or zid is None:
+            return
+        self._clear_edge_highlight()
+        self.edge_grab_active = False
+        self.region_translate_active = True
+        self.region_translate_zid = zid
+        self.region_translate_start_mx = mx
+        self.region_translate_start_my = my
+        self.region_translate_original_mask = self.mask_images[page].copy()
+        self.border_drag_active = True  # so the motion handler runs the translate logic
+        self.save_state()
+        self.output.config(cursor="fleur")
+        # Optional: brief hint
+        # messagebox.showinfo("Region Translate", "Dragging will move only the selected region's area.", parent=self.master)  # avoid spam
+
+    def _apply_region_translation(self, dx, dy):
+        """Shift all pixels of the current translate zid by the (rounded) dx,dy from the snapshot."""
+        page = self.current_page
+        zid = self.region_translate_zid
+        if page not in self.mask_images or zid is None or self.region_translate_original_mask is None:
+            return
+        mask = np.array(self.region_translate_original_mask)
+        region = (mask == zid)
+        if not np.any(region):
+            return
+        ys, xs = np.where(region)
+        new_ys = ys + int(round(dy))
+        new_xs = xs + int(round(dx))
+        mask[region] = 0
+        h, w = mask.shape
+        valid = (new_ys >= 0) & (new_ys < h) & (new_xs >= 0) & (new_xs < w)
+        mask[new_ys[valid], new_xs[valid]] = zid
+        self.mask_images[page] = Image.fromarray(mask.astype(np.uint8), mode='L')
+        clear_preprocess_cache()
+        self._rebuild_page_overlays(page)
+
+    def _rasterize_contour_to_zone(self, contour, zid):
+        """Replace the zone zid in the current page mask by filling the (modified) contour as a polygon."""
+        if contour is None or len(contour) < 3:
+            return
+        page = self.current_page
+        orig = np.array(self.mask_images[page])
+        h, w = orig.shape
+        fill_img = Image.new('L', (w, h), 0)
+        dr = ImageDraw.Draw(fill_img)
+        # contour is [[y, x], ...] -> PIL wants [(x, y), ...]
+        pts = [(int(round(x)), int(round(y))) for y, x in contour]
+        if len(pts) >= 3:
+            dr.polygon(pts, fill=zid)
+        new_zone = np.array(fill_img)
+        current = orig.copy()
+        current[current == zid] = 0
+        current[new_zone == zid] = zid
+        self.mask_images[page] = Image.fromarray(current.astype(np.uint8), mode='L')
+        clear_preprocess_cache()
+        self._rebuild_page_overlays(page)
+
+    def _refresh_atlas_layer(self):
+        """Lightweight refresh of only the 'atlas' tagged image item.
+        Used for live preview during edge drag so the yellow region shape updates as you pull the red edge.
+        Must be called after _rasterize + _rebuild_page_overlays.
+        """
+        self.output.delete('atlas')
+        page = self.current_page
+        if page not in self.page_images:
+            return
+        img = self.page_images[page]
+        scale = getattr(self, 'view_scale', 1.0)
+        atlas_display = img
+        if scale != 1.0:
+            aw = max(1, int(img.width * scale))
+            ah = max(1, int(img.height * scale))
+            atlas_display = img.resize((aw, ah), Image.BILINEAR)
+        self.photo = ImageTk.PhotoImage(atlas_display)
+        display_img_x = getattr(self, 'img_x', 0)
+        display_img_y = getattr(self, 'img_y', 0)
+        self.output.create_image(display_img_x, display_img_y,
+                               image=self.photo,
+                               anchor='nw',
+                               tag='atlas')
+        # Ensure the red edge highlight (if any) stays on top of the refreshed atlas image
+        try:
+            self.output.tag_raise('edge_highlight')
+        except Exception:
+            pass
+
+    def _is_near_selected_border(self, model_x, model_y, screen_tol=8):
+        """Return True if (model_x, model_y) is inside or near the border of the selected zone.
+        screen_tol is desired hit radius in screen pixels (converted using view_scale).
+        """
+        page = self.current_page
+        zid = self.selected_zone_id
+        if page not in self.mask_images:
+            return False
+        m = np.array(self.mask_images[page])
+        if not (0 <= int(model_y) < m.shape[0] and 0 <= int(model_x) < m.shape[1]):
+            return False
+        region = (m == zid)
+        if not region.any():
+            return False
+        scale = max(getattr(self, 'view_scale', 1.0), 0.01)
+        model_tol = screen_tol / scale
+        # Use distance to the complement (outside the region) to detect border vicinity
+        # Points inside near the edge have small distance to outside.
+        try:
+            from scipy.ndimage import distance_transform_edt
+            # dist to nearest outside pixel
+            outside_dist = distance_transform_edt(region)
+            # Also consider if the point itself is on the region
+            if region[int(model_y), int(model_x)]:
+                d = outside_dist[int(model_y), int(model_x)]
+                return d <= model_tol
+            else:
+                # if just outside, also allow if close
+                # invert
+                inside_dist = distance_transform_edt(~region)
+                d = inside_dist[int(model_y), int(model_x)]
+                return d <= model_tol
+        except Exception:
+            # Fallback: simple bbox check + on region
+            ys, xs = np.where(region)
+            if len(ys) == 0:
+                return False
+            miny, maxy, minx, maxx = ys.min(), ys.max(), xs.min(), xs.max()
+            return (miny - model_tol <= model_y <= maxy + model_tol) and (minx - model_tol <= model_x <= maxx + model_tol) and region[int(model_y), int(model_x)]
+
+    def _handle_border_drag_motion(self, event):
+        if not getattr(self, 'border_drag_active', False):
+            return
+        if not self.border_mode_var.get() and not getattr(self, 'region_translate_active', False):
+            return
+        cx = self.output.canvasx(event.x)
+        cy = self.output.canvasy(event.y)
+        mx, my = self._canvas_to_atlas(cx, cy)
+
+        # --- New precise edge editing: live update only the red edge line ---
+        if getattr(self, '_edge_pending_deselect', False) or getattr(self, 'edge_grab_active', False):
+            if not getattr(self, 'edge_grab_active', False):
+                # First motion after mousedown on selected edge: decide if it's a drag
+                if self._moved_enough_for_drag(event):
+                    self.edge_grab_active = True
+                    self.border_drag_active = True
+                    self._edge_pending_deselect = False
+            if getattr(self, 'edge_grab_active', False):
+                if hasattr(self, 'original_full_contour_for_edit') and self.original_full_contour_for_edit is not None:
+                    full = self.original_full_contour_for_edit.copy()
+                    n = len(full)
+                    cidx = getattr(self, 'edge_closest_idx', 0)
+                    wnd = getattr(self, 'edge_window', 30)
+                    dx = mx - self.edge_grab_start_mouse[0]
+                    dy = my - self.edge_grab_start_mouse[1]
+                    for j in range(-wnd, wnd + 1):
+                        ii = (cidx + j) % n
+                        ww = max(0.0, 1.0 - abs(j) / float(wnd + 1))
+                        full[ii, 0] += dy * ww  # y
+                        full[ii, 1] += dx * ww  # x
+                    self.current_edited_contour = full
+                    self.selected_edge_full_contour = full  # keep in sync for commit
+                    # extract local for red highlight
+                    if self.edge_start_idx < self.edge_end_idx:
+                        local = full[self.edge_start_idx : self.edge_end_idx + 1]
+                    else:
+                        local = np.vstack((full[self.edge_start_idx:], full[:self.edge_end_idx + 1]))
+                    self.active_edge = local
+                    self._update_edge_highlight(local)
+
+                    # Live update the region shape (the yellow/orange fill) as you pull the red edge.
+                    # This fulfills "click a position to expand it or shrink it, and the shape of the region should adjust accordingly".
+                    if self.selected_edge_full_contour is not None:
+                        self._rasterize_contour_to_zone(self.selected_edge_full_contour, self.selected_zone_id)
+                        self._refresh_atlas_layer()
+            return
+
+        # Region translate (move only the selected zone's pixels in the mask; atlas image/lines stay fixed)
+        if getattr(self, 'region_translate_active', False):
+            mx, my = self._canvas_to_atlas(self.output.canvasx(event.x), self.output.canvasy(event.y))
+            dx = mx - self.region_translate_start_mx
+            dy = my - self.region_translate_start_my
+            if self.region_translate_original_mask is not None:
+                # restore snapshot then apply total offset (live)
+                self.mask_images[self.current_page] = self.region_translate_original_mask.copy()
+                self._apply_region_translation(dx, dy)
+                self._refresh_atlas_layer()
+            return
+
+        # Fallback / legacy one-sided (kept for compatibility but not primary now)
+        start_mx, start_my = getattr(self, 'border_drag_start_mouse', (0, 0))
+        dx = mx - start_mx
+        dy = my - start_my
+        ux, uy = getattr(self, 'border_drag_unit', (0.0, 1.0))
+        pull_amount = dx * ux + dy * uy
+        page = self.current_page
+        zid = getattr(self, 'border_drag_zone', None)
+        if page in self.mask_images and getattr(self, 'border_drag_original_mask', None) is not None and zid is not None:
+            self.mask_images[page] = self.border_drag_original_mask.copy()
+            self._apply_border_pull(pull_amount)
+            self.show_page()
+            if hasattr(self, '_update_ribbon_selection'):
+                self._update_ribbon_selection()
+
+    def _end_border_drag(self, event):
+        if getattr(self, '_edge_pending_deselect', False):
+            # It was a short click on the already illuminated edge → toggle deselect (highlight disappears)
+            self._clear_edge_highlight()
+            self.selected_edge_full_contour = None
+            self.active_edge = None
+            self.edge_grab_active = False
+            self.border_drag_active = False
+            self.border_drag_active = False
+            self._edge_pending_deselect = False
+            self.current_edited_contour = None
+            self.original_full_contour_for_edit = None
+            return
+
+        if getattr(self, 'edge_grab_active', False):
+            did_edit = False
+            if getattr(self, 'current_edited_contour', None) is not None and self.selected_edge_full_contour is not None:
+                self._rasterize_contour_to_zone(self.selected_edge_full_contour, self.selected_zone_id)
+                did_edit = True
+
+            self.edge_grab_active = False
+            self.border_drag_active = False
+            self.border_drag_active = False
+            self._edge_pending_deselect = False
+
+            if hasattr(self, '_update_ribbon_selection'):
+                self._update_ribbon_selection()
+
+            if did_edit:
+                # Only call show_page (which deletes all) when we actually changed the mask.
+                # Then re-draw red after.
+                self.show_page()
+                if self.selected_edge_full_contour is not None:
+                    start = getattr(self, 'selected_edge_start_idx', 0)
+                    end = getattr(self, 'selected_edge_end_idx', 0)
+                    if start < end:
+                        local = self.selected_edge_full_contour[start:end+1]
+                    else:
+                        local = np.vstack((self.selected_edge_full_contour[start:], self.selected_edge_full_contour[:end+1]))
+                    self.active_edge = local
+                    self._draw_edge_highlight(local)
+            # For pure select click (no edit), the red was drawn on mousedown and we avoid show_page
+            # so it doesn't disappear on release.
+
+            self.output.config(cursor="")
+            return
+
+        if getattr(self, 'region_translate_active', False):
+            self.region_translate_active = False
+            self.region_translate_original_mask = None
+            self.region_translate_zid = None
+            self.region_translate_start_mx = 0
+            self.region_translate_start_my = 0
+            self.border_drag_active = False
+            self.output.config(cursor="")
+            if hasattr(self, '_update_ribbon_selection'):
+                self._update_ribbon_selection()
+            self.show_page()
+            return
+
+        if not getattr(self, 'border_drag_active', False):
+            return
+        self.border_drag_active = False
+        self.border_drag_original_mask = None
+        self.border_drag_start_mouse = (0.0, 0.0)
+        self.region_translate_active = False
+        self.region_translate_original_mask = None
+        self.region_translate_zid = None
+        if hasattr(self, '_update_ribbon_selection'):
+            self._update_ribbon_selection()
+        self.show_page()
+        self.output.config(cursor="")
+
     def highlight_region(self, event):
         logger.debug(f"Highlighting region at ({event.x}, {event.y})")
         self.save_state()
+
+        # Intercept for border drag resize if a region is selected and border mode is active
+        if self._try_start_border_drag(event):
+            return
+
         if not self.atlas_filetype or self.crop_mode or self.edit_mode:
             logger.debug("Highlight region aborted: atlas_filetype=%s, crop_mode=%s, edit_mode=%s", 
                       self.atlas_filetype, self.crop_mode, self.edit_mode)
@@ -3613,7 +5276,8 @@ class PDFViewer:
 
         canvas_x = self.output.canvasx(event.x)
         canvas_y = self.output.canvasy(event.y)
-        x, y = int(canvas_x - self.img_x), int(canvas_y - self.img_y)  # convert to atlas-local coordinates
+        mx, my = self._canvas_to_atlas(canvas_x, canvas_y)
+        x, y = int(mx), int(my)  # convert to atlas model (native) coordinates, respecting view_scale
 
         img = self.load_page_image()
         if x < 0 or y < 0 or x >= img.width or y >= img.height:
@@ -3630,6 +5294,43 @@ class PDFViewer:
         except Exception as e:
             logger.error(f"Error getting pixel value: {e}")
             return
+
+        # If clicking inside an already-labeled region (mask zid>0), auto-select it in the
+        # labeled regions manager instead of re-prompting for a name that may already exist.
+        # The helper ensures a default name if the mask label was an orphan (so it appears
+        # in the manager list and satisfies "autoselect from the labeled regions manager").
+        if self.current_page in self.mask_images:
+            m = np.array(self.mask_images[self.current_page])
+            if 0 <= y < m.shape[0] and 0 <= x < m.shape[1]:
+                zid = int(m[y, x])
+                if zid == 0:
+                    # Forgiving: click just outside (zid=0 at exact pixel) but near the border
+                    # of the currently selected zone -> autoselect it instead of showing the
+                    # name dialog. This prevents unwanted "name region" prompts when trying to
+                    # grab the edge of an already-labeled/selected region.
+                    if (getattr(self, 'selected_zone_id', None) and
+                            getattr(self, 'selected_page', None) == self.current_page and
+                            self._is_near_selected_border(mx, my, screen_tol=8)):
+                        zid = self.selected_zone_id
+                if zid > 0:
+                    self._ensure_zone_has_name(self.current_page, zid)
+                    if self.selected_zone_id != zid or getattr(self, 'selected_page', None) != self.current_page:
+                        self.selected_zone_id = zid
+                        self.selected_page = self.current_page
+                        self._clear_edge_highlight()
+                        self.edge_grab_active = False
+                        self.active_edge = None
+                        self.current_edited_contour = None
+                        self.selected_edge_full_contour = None
+                        self._edge_pending_deselect = False
+                        self.region_move_mode.set(False)
+                        self.region_translate_active = False
+                        self.region_translate_original_mask = None
+                        self.region_translate_zid = None
+                        self._rebuild_page_overlays(self.current_page)
+                        self.show_page()
+                        self._update_ribbon_selection()
+                    return
 
         name = simpledialog.askstring("Region Name", "Enter a name for this region:")
         if name == None:
@@ -3651,12 +5352,15 @@ class PDFViewer:
         mask_array[mask] = zone_id
         self.mask_images[self.current_page] = Image.fromarray(mask_array)
 
-        img_array = np.array(img)
-        overlay = img_array.copy()
-        overlay[..., :3][mask] = [255, 255, 0]
-        overlay[..., 3][mask] = 18
-        updated_img = Image.fromarray(overlay).convert('RGBA')
-        self.page_images[self.current_page] = updated_img
+        # New zone created -> clear any previous edge edit state
+        self._clear_edge_highlight()
+        self.edge_grab_active = False
+        self.active_edge = None
+        self.current_edited_contour = None
+
+        # Rebuild display from clean base + current zones (including the newly named one).
+        # This also handles any previously baked yellows from old code paths.
+        self._rebuild_page_overlays(self.current_page)
         self.show_page()
 
     def count_cells(self):
@@ -3963,8 +5667,21 @@ class PDFViewer:
         self.current_page = None
         self.page_images = {}
         self.mask_images = {}
+        self.base_page_images = {}
         self.zone_counters = {}
         self.zone_names = {}
+        self.selected_zone_id = None
+        self.selected_page = None
+        self._clear_edge_highlight()
+        self.edge_grab_active = False
+        self.active_edge = None
+        self.current_edited_contour = None
+        self.original_full_contour_for_edit = None
+        self._edge_pending_deselect = False
+        self.region_translate_active = False
+        self.region_translate_original_mask = None
+        self.region_translate_zid = None
+        self.region_move_mode.set(False)
         self.last_df = None
         self.img_x = 0
         self.img_y = 0
@@ -4181,6 +5898,8 @@ class StateManager:
         viewer.zoom = state["zoom"]
         viewer.zone_counters = state["zone_counters"]
         viewer.zone_names = state["zone_names"]
+        viewer.selected_zone_id = None
+        viewer.selected_page = None
         viewer.show_page()
         logger.debug("Restored previous state")
 
@@ -4231,7 +5950,7 @@ def preprocess_for_highlighting(page_id, img, atlas_filetype):
         mag_binary = mag > thresh
 
         # Close small gaps in the binary edges
-        closed_binary = binary_closing(mag_binary)
+        closed_binary = closing(mag_binary)
 
         # Make bounds as thin as possible
         skel_binary = morphology.skeletonize(closed_binary)
