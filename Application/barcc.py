@@ -466,6 +466,10 @@ class PDFViewer:
         self.named_paint_groups = {}   # group_tag (e.g. 'paintgroup_5') -> name
         self.paint_group_data = {}     # durable: group_tag -> list of {'coords': [x1,y1,...], 'width': w}  (survives show_page/delete("all"))
 
+        # For painted regions that have been named: store the boundary outline so that
+        # edge/border deformation can refit the visible black drawn line to the new mask shape.
+        self.painted_zone_outlines = {}  # zid -> {'points': [(x,y), ...] in model space, 'width': int }
+
         # Crop / edit variables
         self.crop_mode = False
         self.crop_mode_var = tk.BooleanVar(value=False)
@@ -502,7 +506,7 @@ class PDFViewer:
         # Atlas ribbon visibility and state (must be created before _build_gui so View menu can reference it)
         self.show_atlas_ribbon = tk.BooleanVar(value=True)
         self.atlas_ribbon_expanded = False
-        self.border_mode_var = tk.BooleanVar(value=True)
+        self.border_mode_var = tk.BooleanVar(value=False)
         self.region_move_mode = tk.BooleanVar(value=False)
         self.region_translate_active = False
         self.count_button_packed = False
@@ -512,6 +516,9 @@ class PDFViewer:
         self.region_translate_start_my = 0.0
         self.region_translate_original_mask = None
         self.region_list_id_map = {}
+
+        # Paint mode indicator (updated in start_paint / stop_paint and similar)
+        self.paint_status_var = tk.StringVar(value="Paint: off")
 
         # Persistent paint layer (this is the key to zoom-safe painting)
         self.paint_layer = None  # RGBA PIL Image, created when background is loaded
@@ -550,6 +557,8 @@ class PDFViewer:
         self._build_gui()
         self.init_keybinds()
 
+        self._update_paint_indicator()
+
         self.root.mainloop()
 
     def init_keybinds(self):
@@ -557,6 +566,8 @@ class PDFViewer:
         self.master.bind('<q>', self.quit)
         self.master.bind('<Control-z>', self._undo_event)
         self.master.bind('<Control-s>', self.save_flattened_image)
+        self.master.bind('<Return>', self._commit_painted_border_refit)
+        self.master.bind('<KP_Enter>', self._commit_painted_border_refit)
 
         # Bind click event for highlighting
         self.output.bind("<Button-1>", self.highlight_region)
@@ -587,7 +598,9 @@ class PDFViewer:
         # Create Edit menu dropdown
         editmenu = tk.Menu(self.menu)
         self.menu.add_cascade(label="Edit", menu=editmenu)
-            # Add save paint command and create toplevels with widgets
+        editmenu.add_command(label="Undo", command=self.undo, accelerator="Ctrl+Z")
+        editmenu.add_separator()
+        # Add save paint command and create toplevels with widgets
         editmenu.add_command(label="Brightness", command=self.show_brightness_settings)
         editmenu.add_command(label="Save Picture", command=self.save_flattened_image)
         # editmenu.add_command(label="Save Paint", command=print("Save Paint", file=sys.stderr))
@@ -771,6 +784,32 @@ class PDFViewer:
         if path:
             split_stacked_tiff(path)
 
+    def _update_paint_indicator(self):
+        """Update the paint mode indicator label (in ribbon header) and window title."""
+        base_title = "Regional IF Analyzer"
+        if getattr(self, 'current_state', None) == 'paint':
+            self.paint_status_var.set("🎨 PAINT ON")
+            if hasattr(self, 'paint_status_label') and self.paint_status_label:
+                try:
+                    self.paint_status_label.configure(foreground="red", font=("Helvetica", 8, "bold"))
+                except Exception:
+                    pass
+            try:
+                self.master.title(base_title + " — 🎨 PAINT MODE")
+            except Exception:
+                pass
+        else:
+            self.paint_status_var.set("Paint: off")
+            if hasattr(self, 'paint_status_label') and self.paint_status_label:
+                try:
+                    self.paint_status_label.configure(foreground="gray", font=("Helvetica", 8))
+                except Exception:
+                    pass
+            try:
+                self.master.title(base_title)
+            except Exception:
+                pass
+
     def start_paint(self):
         if self.current_state == 'paint':
             return
@@ -798,7 +837,10 @@ class PDFViewer:
         self.draw_status = self.menu.add_command(label="Pen: "+str(self.draw_type))
         self.menu.update()
 
+        self._update_paint_indicator()
+
     def stop_paint(self):
+        self.save_state()  # Snapshot the state with open paint groups/names before we auto-default, convert, bake and clear
         self.output.unbind('<B1-Motion>')
         self.output.unbind('<ButtonRelease-1>') 
         self.output.unbind('<Button-1>')
@@ -857,6 +899,11 @@ class PDFViewer:
         self.paint_group_data.clear()
         self.current_paint_group = None
         self.show_page()
+
+        self._update_paint_indicator()
+
+        # Refresh ribbon so any auto-default "Painted Region N" names from Stop Paint appear immediately in the list
+        self._update_ribbon_selection()
 
     def save_paint(self):
         """Save canvas paint strokes to an image without using postscript.
@@ -1069,6 +1116,7 @@ class PDFViewer:
 
         # Start of a new continuous stroke?
         if self.old_x is None and self.old_y is None:
+            self.save_state()  # Snapshot before this new stroke so Undo can remove it
             self._paint_group_counter += 1
             self.current_paint_group = f"paintgroup_{self._paint_group_counter}"
             self.old_x = ix
@@ -1159,6 +1207,7 @@ class PDFViewer:
         # Redraw to make the newly committed stroke visible in the paint_layer image.
         # Without this, the stroke would only appear after the next show_page (e.g. Stop Paint or zoom).
         self.show_page()
+        self._update_ribbon_selection()
 
     def name_painted_region(self, event):
         """Right-click on a paint stroke to name the entire connected boundary.
@@ -1168,6 +1217,10 @@ class PDFViewer:
 
         Fixed to use proper canvas coordinates so labeling works after zoom.
         """
+        # Note: We intentionally do *not* call save_state here for paint naming.
+        # The drawing stroke was already snapshotted at the start of the group.
+        # This keeps "create painted region (draw + name)" undoable as a unit for the visual paint + banner entry.
+
         # Convert to canvas coordinates (critical after zoom + scrolling)
         cx = self.output.canvasx(event.x)
         cy = self.output.canvasy(event.y)
@@ -1282,6 +1335,11 @@ class PDFViewer:
 
         logger.info(f"Named paint group {group_tag} as '{name}' ({len(all_segments)} segments)")
 
+        # Immediately refresh the canvas (so new zone mask is visible) and the Atlas Manager ribbon list
+        # so the newly named painted region appears in "Labeled Regions" without requiring another action.
+        self.show_page()
+        self._update_ribbon_selection()
+
     def _commit_canvas_paint_to_layer(self):
         """Rasterize current 'paint' tagged canvas items into the persistent self.paint_layer.
         This makes painting survive zoom, show_page calls, etc.
@@ -1367,6 +1425,106 @@ class PDFViewer:
                 draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=fill)
             # Draw the full polyline with round joints for smooth thick stroke without per-vertex caps
             draw.line(points, fill=fill, width=width, joint="curve")
+
+    def _rebuild_paint_layer_from_data(self):
+        """Force the persistent paint_layer to exactly match the groups currently present
+        in self.paint_group_data (the durable source of truth for painted regions).
+
+        This is called after undo restores an older paint_group_data (and possibly an
+        older paint_layer snapshot) so that the *visible* baked strokes on the image
+        are removed when the corresponding drawn/named region is undone.
+        It re-rasterizes only the strokes that are still active in the restored history.
+        """
+        data = getattr(self, 'paint_group_data', None) or {}
+        # Determine target size (prefer the original background so strokes stay registered to the image)
+        size = None
+        if getattr(self, 'original_background', None) is not None:
+            size = self.original_background.size
+        elif getattr(self, 'background_image', None) is not None:
+            size = self.background_image.size
+        elif getattr(self, 'paint_layer', None) is not None:
+            size = self.paint_layer.size
+        else:
+            return
+
+        fresh = Image.new('RGBA', size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(fresh)
+        default_color = getattr(self, 'DEFAULT_COLOR', 'black')
+
+        for group_tag, recs in list(data.items()):
+            if not group_tag.startswith('paintgroup_') or not recs:
+                continue
+            points = []
+            width = 3
+            for rec in (recs or []):
+                mp = rec.get('model_points') or rec.get('coords') or []
+                if mp and len(mp) >= 2:
+                    for j in range(0, len(mp), 2):
+                        try:
+                            points.append((int(mp[j]), int(mp[j+1])))
+                        except Exception:
+                            pass
+                w = rec.get('width')
+                if w:
+                    try:
+                        width = max(width, int(w))
+                    except Exception:
+                        pass
+            if len(points) < 2:
+                continue
+            # Dedup
+            deduped = [points[0]]
+            for p in points[1:]:
+                if p != deduped[-1]:
+                    deduped.append(p)
+            points = deduped
+            if len(points) < 2:
+                continue
+            radius = max(1, width // 2)
+            # Caps at true start/end
+            if points:
+                px, py = points[0]
+                draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=default_color)
+                px, py = points[-1]
+                draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=default_color)
+            draw.line(points, fill=default_color, width=width, joint="curve")
+
+        # Also draw refittable boundaries for named painted zones (so edge/border deformation
+        # updates the visible black outline to match the new zone shape).
+        page = getattr(self, 'current_page', None)
+        if page is not None:
+            zone_names_page = self.zone_names.get(page, {}) if hasattr(self, 'zone_names') else {}
+            for zid, outline in list(getattr(self, 'painted_zone_outlines', {}).items()):
+                if zid not in zone_names_page:
+                    continue
+                points = outline.get('points', [])
+                w = outline.get('width', 3)
+                if len(points) < 2:
+                    continue
+                # Dedup
+                deduped = [points[0]]
+                for p in points[1:]:
+                    if p != deduped[-1]:
+                        deduped.append(p)
+                points = deduped
+                if len(points) < 2:
+                    continue
+                radius = max(1, w // 2)
+                if points:
+                    px, py = points[0]
+                    draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=default_color)
+                    px, py = points[-1]
+                    draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=default_color)
+                draw.line(points, fill=default_color, width=w, joint="curve")
+
+        self.paint_layer = fresh
+
+        # Keep self.img in sync for 'img' filetype code paths (load_page_image etc.)
+        if hasattr(self, 'img'):
+            try:
+                self.img = fresh.copy()
+            except Exception:
+                self.img = fresh
 
     def _convert_named_paints_to_zones(self):
         """Convert named paint *groups* (connected strokes) into zone entries.
@@ -1542,6 +1700,14 @@ class PDFViewer:
                 logger.debug(f"binary_fill_holes for zone {zone_id} skipped: {e}")
 
             logger.info(f"Converted named paint group '{clean_name}' ({group_tag}) → zone {zone_id}")
+
+            # Store the boundary outline for this painted zone so edge deformation can later
+            # refit the visible black drawn boundary to the (possibly edited) mask shape.
+            if zone_id not in self.painted_zone_outlines:
+                self.painted_zone_outlines[zone_id] = {
+                    'points': list(group_model_points),
+                    'width': group_width
+                }
 
             # Retire the group immediately after successful conversion so it cannot be re-discovered
             # (prevents the 3-drawn → 6-in-spreadsheet duplication when naming + later Count Cells / Stop Paint both process it)
@@ -2699,7 +2865,7 @@ class PDFViewer:
                 return
 
             config_data = {
-                "version": "8.02.002",
+                "version": "8.03.000",
                 "detection_method": self.image_processor.cell_config.detection_method,
                 "cell_detection": self.image_processor.cell_config.__dict__.copy(),
                 "preprocessing": self.image_processor.preprocess_config.__dict__.copy(),
@@ -2882,8 +3048,13 @@ class PDFViewer:
     def save_state(self):
         self.state_manager.save_state(self)
 
-    def _undo_event(self, event=None):
+    def undo(self, event=None):
+        """Undo the last user action. Can be called repeatedly."""
         self.state_manager.undo(self)
+
+    def _undo_event(self, event=None):
+        """Keyboard handler (Ctrl+Z)."""
+        self.undo(event)
 
     # ------------------------------------------------------------------
     # ZOOM FEATURE
@@ -3000,6 +3171,24 @@ class PDFViewer:
     def _image_to_canvas(self, ix, iy):
         """Convert image (model) coordinates to canvas coordinates for display."""
         return ix * self.view_scale, iy * self.view_scale
+
+    def _canvas_to_zone_model(self, cx, cy):
+        """Map canvas coordinates to the model/pixel space used by the zone mask for the
+        currently relevant layer (paint or atlas).
+
+        - Painted regions (and baked 'img'/'png' layers) store their masks in background/image
+          pixel space (no img_x/y offset). Use _canvas_to_image semantics.
+        - Atlas (pdf) regions use the rendered page's model space (with img_x/y placement offset).
+
+        This allows edge grab, border drag, and per-region translate/deform to work
+        correctly and consistently for painted regions exactly like atlas regions.
+        """
+        if getattr(self, 'atlas_filetype', None) == 'pdf':
+            return self._canvas_to_atlas(cx, cy)
+        else:
+            # Paint zones live in the main image/background pixel coordinate space
+            ix, iy = self._canvas_to_image(cx, cy)
+            return float(ix), float(iy)
 
     def _rebuild_paint_vectors(self):
         """Rebuild temporary 'paint' canvas items from paint_group_data for naming support.
@@ -3349,6 +3538,7 @@ class PDFViewer:
             self.edit_mode_var.set(False)
             self.named_paint_groups.clear()
             self.paint_group_data.clear()
+            self.painted_zone_outlines.clear()
             clear_preprocess_cache()
             self.show_page()
 
@@ -3356,6 +3546,7 @@ class PDFViewer:
         logger.info("Opening file dialog for TIFF selection")
         self.named_paint_groups.clear()
         self.paint_group_data.clear()
+        self.painted_zone_outlines.clear()
         self.current_paint_group = None
         self.view_scale = 1.0
         self.img_x = 0
@@ -3420,6 +3611,13 @@ class PDFViewer:
             self.paint_layer = Image.new('RGBA', self.original_background.size, (0, 0, 0, 0))
 
             self.show_page()
+
+            # New document loaded — previous undo history is no longer valid
+            # (different background size / coordinate system).
+            try:
+                self.state_manager.undo_stack.clear()
+            except Exception:
+                self.state_manager.undo_stack = []
 
     # ------------------------------------------------------------------
     # File Browser (Left Pane) - Directory TIFF selector
@@ -3571,6 +3769,7 @@ class PDFViewer:
         # Reset state similar to import_tiff
         self.named_paint_groups.clear()
         self.paint_group_data.clear()
+        self.painted_zone_outlines.clear()
         self.current_paint_group = None
         self.view_scale = 1.0
         self.img_x = 0
@@ -3623,6 +3822,12 @@ class PDFViewer:
             self.paint_layer = Image.new('RGBA', self.original_background.size, (0, 0, 0, 0))
 
             self.show_page()
+
+            # New document loaded via browser — clear undo history (incompatible prior masks).
+            try:
+                self.state_manager.undo_stack.clear()
+            except Exception:
+                self.state_manager.undo_stack = []
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load TIFF:\n{e}")
@@ -4409,6 +4614,14 @@ class PDFViewer:
         self.ribbon_selected_var = tk.StringVar(value="No region selected")
         ttk.Label(header, textvariable=self.ribbon_selected_var, foreground="#0066cc").pack(side=tk.LEFT, padx=8)
 
+        # Paint mode indicator (visible in the ribbon header)
+        self.paint_status_label = ttk.Label(header, textvariable=self.paint_status_var, foreground="gray", font=("Helvetica", 8))
+        self.paint_status_label.pack(side=tk.LEFT, padx=8)
+
+        # Prominent Undo button (works for paint, atlas edits, mask edits, etc.)
+        # Placed in the always-visible ribbon header so it's easy to reach.
+        ttk.Button(header, text="↶ Undo", command=self.undo, width=7).pack(side=tk.RIGHT, padx=4)
+
         # Expandable content
         self.ribbon_content = ttk.Frame(self.atlas_ribbon)
 
@@ -4471,7 +4684,7 @@ class PDFViewer:
         border_frame = ttk.Frame(self.ribbon_content)
         border_frame.pack(fill='x', padx=4, pady=(2, 4))
         ttk.Checkbutton(border_frame, text="Border drag resize enabled (when region selected)", variable=self.border_mode_var, command=self._on_border_mode_toggled).pack(side=tk.LEFT)
-        ttk.Label(border_frame, text="  Drag near the edges of the orange/yellow region to expand or shrink it from its center.", font=("Helvetica", 8, "italic")).pack(side=tk.LEFT)
+        ttk.Label(border_frame, text="  Drag near the edges of the orange/yellow region to expand or shrink it from its center. Press Enter to commit the expanded shape and refit the black boundary (for painted regions).", font=("Helvetica", 8, "italic")).pack(side=tk.LEFT)
 
         # Start collapsed (value comes from __init__)
 
@@ -4735,7 +4948,7 @@ class PDFViewer:
             return
         cx = self.output.canvasx(event.x)
         cy = self.output.canvasy(event.y)
-        mx, my = self._canvas_to_atlas(cx, cy)
+        mx, my = self._canvas_to_zone_model(cx, cy)
         if self._is_near_selected_border(mx, my, screen_tol=8):
             self.output.config(cursor="sizing")  # or "cross" / "fleur"
         else:
@@ -4751,7 +4964,7 @@ class PDFViewer:
             return False
         cx = self.output.canvasx(event.x)
         cy = self.output.canvasy(event.y)
-        mx, my = self._canvas_to_atlas(cx, cy)
+        mx, my = self._canvas_to_zone_model(cx, cy)
 
         # Priority: if we already have a selected/illuminated edge (red line), and click is on/near it,
         # treat as intent to grab that specific edge (re-center or start drag). This makes "grab the red line" reliable.
@@ -4917,7 +5130,7 @@ class PDFViewer:
             return False
         cx = self.output.canvasx(event.x)
         cy = self.output.canvasy(event.y)
-        mx, my = self._canvas_to_atlas(cx, cy)
+        mx, my = self._canvas_to_zone_model(cx, cy)
         dx = mx - self.edge_drag_start_pos[0]
         dy = my - self.edge_drag_start_pos[1]
         return math.hypot(dx, dy) > threshold
@@ -5121,7 +5334,7 @@ class PDFViewer:
             return
         cx = self.output.canvasx(event.x)
         cy = self.output.canvasy(event.y)
-        mx, my = self._canvas_to_atlas(cx, cy)
+        mx, my = self._canvas_to_zone_model(cx, cy)
 
         # --- New precise edge editing: live update only the red edge line ---
         if getattr(self, '_edge_pending_deselect', False) or getattr(self, 'edge_grab_active', False):
@@ -5163,7 +5376,7 @@ class PDFViewer:
 
         # Region translate (move only the selected zone's pixels in the mask; atlas image/lines stay fixed)
         if getattr(self, 'region_translate_active', False):
-            mx, my = self._canvas_to_atlas(self.output.canvasx(event.x), self.output.canvasy(event.y))
+            mx, my = self._canvas_to_zone_model(self.output.canvasx(event.x), self.output.canvasy(event.y))
             dx = mx - self.region_translate_start_mx
             dy = my - self.region_translate_start_my
             if self.region_translate_original_mask is not None:
@@ -5260,6 +5473,45 @@ class PDFViewer:
             self._update_ribbon_selection()
         self.show_page()
         self.output.config(cursor="")
+
+    def _commit_painted_border_refit(self, event=None):
+        """Called on Enter/Return after border drag on a painted region.
+        Commits the current mask shape (yellow expansion) by refitting the black drawn
+        boundary (updating painted_zone_outlines from the live mask contour and
+        rebuilding the paint_layer). This is the explicit 'save' step for the expanded shape.
+        """
+        zid = getattr(self, 'selected_zone_id', None)
+        if not zid or zid not in getattr(self, 'painted_zone_outlines', {}):
+            return
+        page = self.current_page
+        if page not in self.mask_images:
+            return
+
+        # Snapshot before committing the visual refit so this step is undoable independently
+        self.save_state()
+        m = np.array(self.mask_images[page])
+        binr = (m == zid).astype(float)
+        contours = measure.find_contours(binr, 0.5)
+        if not contours:
+            return
+        new_contour = max(contours, key=len)
+        new_points = [(int(round(x)), int(round(y))) for y, x in new_contour]
+        self.painted_zone_outlines[zid]['points'] = new_points
+        try:
+            self._rebuild_paint_layer_from_data()
+        except Exception:
+            pass
+        self.show_page()
+        # Clean up any lingering edge highlight/red segment after commit
+        self._clear_edge_highlight()
+        self.edge_grab_active = False
+        self.border_drag_active = False
+        self.active_edge = None
+        self.current_edited_contour = None
+        self.selected_edge_full_contour = None
+        self._edge_pending_deselect = False
+        if hasattr(self, '_update_ribbon_selection'):
+            self._update_ribbon_selection()
 
     def highlight_region(self, event):
         logger.debug(f"Highlighting region at ({event.x}, {event.y})")
@@ -5362,6 +5614,7 @@ class PDFViewer:
         # This also handles any previously baked yellows from old code paths.
         self._rebuild_page_overlays(self.current_page)
         self.show_page()
+        self._update_ribbon_selection()
 
     def count_cells(self):
         logger.info("Starting cell counting process")
@@ -5869,39 +6122,222 @@ def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_
     return annotated, df, counts
 
 class StateManager:
+    """Manages undo history for user actions (paint, atlas edits, mask edits, region transforms, etc.).
+
+    Snapshots are taken *before* mutating actions (via viewer.save_state() calls at the
+    start of user-initiated edit paths). Supports repeated undo.
+    """
+
+    MAX_HISTORY = 40
+
     def __init__(self):
         self.undo_stack = []
 
+    def _copy_image(self, img):
+        """Safely copy a PIL Image or return None."""
+        if img is None:
+            return None
+        try:
+            return img.copy()
+        except Exception:
+            return None
+
+    def _copy_image_dict(self, d):
+        """Deep copy a dict of page_id -> PIL.Image (or None)."""
+        if not d:
+            return {}
+        out = {}
+        for k, v in d.items():
+            out[k] = self._copy_image(v)
+        return out
+
     def save_state(self, viewer):
-        """Save the current state for undo functionality"""
-        state = {
-            "current_page": viewer.current_page,
-            "img_x": viewer.img_x,
-            "img_y": viewer.img_y,
-            "zoom": viewer.zoom,
-            "zone_counters": copy.deepcopy(viewer.zone_counters),
-            "zone_names": copy.deepcopy(viewer.zone_names),
-        }
-        self.undo_stack.append(state)
-        logger.debug("Saved state to undo stack")
+        """Capture a snapshot of all user-editable state before a mutation."""
+        try:
+            state = {
+                # View / placement
+                "current_page": viewer.current_page,
+                "img_x": viewer.img_x,
+                "img_y": viewer.img_y,
+                "view_scale": getattr(viewer, 'view_scale', 1.0),
+                "zoom": getattr(viewer, 'zoom', 1.0),
+
+                # Core editable data
+                "zone_counters": copy.deepcopy(getattr(viewer, 'zone_counters', {})),
+                "zone_names": copy.deepcopy(getattr(viewer, 'zone_names', {})),
+                "mask_images": self._copy_image_dict(getattr(viewer, 'mask_images', {})),
+                "base_page_images": self._copy_image_dict(getattr(viewer, 'base_page_images', {})),
+                "page_images": self._copy_image_dict(getattr(viewer, 'page_images', {})),
+
+                # Paint system (critical for repeated undo of drawing/naming)
+                "paint_group_data": copy.deepcopy(getattr(viewer, 'paint_group_data', {})),
+                "named_paint_groups": copy.deepcopy(getattr(viewer, 'named_paint_groups', {})),
+                "_paint_group_counter": getattr(viewer, '_paint_group_counter', 0),
+                "paint_layer": self._copy_image(getattr(viewer, 'paint_layer', None)),
+                "painted_zone_outlines": copy.deepcopy(getattr(viewer, 'painted_zone_outlines', {})),
+
+                # Manual cell edits
+                "manual_add_mask": self._copy_image(getattr(viewer, 'manual_add_mask', None)),
+                "manual_remove_mask": self._copy_image(getattr(viewer, 'manual_remove_mask', None)),
+
+                # Last count results (so visual + any derived state can be consistent)
+                "last_df": copy.deepcopy(getattr(viewer, 'last_df', None)),
+            }
+
+            # Bounded history: drop oldest when full
+            if len(self.undo_stack) >= self.MAX_HISTORY:
+                self.undo_stack.pop(0)
+
+            self.undo_stack.append(state)
+            logger.debug(f"Saved state to undo stack (depth={len(self.undo_stack)})")
+        except Exception as e:
+            logger.warning(f"Failed to save undo state: {e}")
 
     def undo(self, viewer):
-        """Restore the previous state"""
+        """Restore the previous snapshot and refresh the display."""
         if not self.undo_stack:
             logger.debug("No states to undo")
-            return
-        
-        state = self.undo_stack.pop()
-        viewer.current_page = state["current_page"]
-        viewer.img_x = state["img_x"]
-        viewer.img_y = state["img_y"]
-        viewer.zoom = state["zoom"]
-        viewer.zone_counters = state["zone_counters"]
-        viewer.zone_names = state["zone_names"]
-        viewer.selected_zone_id = None
-        viewer.selected_page = None
-        viewer.show_page()
-        logger.debug("Restored previous state")
+            return False
+
+        try:
+            state = self.undo_stack.pop()
+
+            # Restore scalars / view
+            viewer.current_page = state.get("current_page", 0)
+            viewer.img_x = state.get("img_x", 0)
+            viewer.img_y = state.get("img_y", 0)
+            if hasattr(viewer, 'view_scale'):
+                viewer.view_scale = state.get("view_scale", 1.0)
+            if hasattr(viewer, 'zoom'):
+                viewer.zoom = state.get("zoom", 1.0)
+
+            # Restore data structures
+            viewer.zone_counters = state.get("zone_counters", {})
+            viewer.zone_names = state.get("zone_names", {})
+            viewer.mask_images = state.get("mask_images", {})
+            viewer.base_page_images = state.get("base_page_images", {})
+            if hasattr(viewer, 'page_images'):
+                viewer.page_images = state.get("page_images", {})
+
+            # Prune the restored mask so it only contains zids present in the restored zone_names.
+            # This prevents the orphan-discovery logic in _populate_region_list (which scans
+            # the mask and auto _ensure_zone_has_name for any zid in the pixels) from
+            # immediately re-adding zones that the undo was supposed to remove (common for
+            # painted regions whose mask fills were created after the snapshot point).
+            # Without this, the banner/list would show "removed" painted regions.
+            page = getattr(viewer, 'current_page', 0)
+            if page in viewer.mask_images and page in viewer.zone_names:
+                try:
+                    m = np.array(viewer.mask_images[page])
+                    valid_zids = set(viewer.zone_names[page].keys())
+                    keep = np.isin(m, list(valid_zids) + [0])
+                    if not keep.all():
+                        m[~keep] = 0
+                        viewer.mask_images[page] = Image.fromarray(m.astype(np.uint8))
+                except Exception:
+                    pass
+
+            # Clear selection early so the forced ribbon update below shows "No region selected"
+            # and the list reflects only the restored names (without the undone painted regions).
+            viewer.selected_zone_id = None
+            viewer.selected_page = None
+
+            # Force the ribbon banner/list to immediately reflect the restored (pruned) zone_names
+            # so removed painted regions disappear from the Atlas Manager even before full show_page.
+            if hasattr(viewer, '_update_ribbon_selection'):
+                try:
+                    viewer._update_ribbon_selection()
+                except Exception:
+                    pass
+
+            viewer.paint_group_data = state.get("paint_group_data", {})
+            viewer.named_paint_groups = state.get("named_paint_groups", {})
+            viewer._paint_group_counter = state.get("_paint_group_counter", 0)
+            viewer.paint_layer = state.get("paint_layer")
+            viewer.painted_zone_outlines = state.get("painted_zone_outlines", {})
+
+            # Do NOT force _rebuild_paint_layer_from_data here.
+            # The paint_layer snapshot from the historical point already contains
+            # exactly the baked strokes up to that moment (including finalized/named
+            # ones whose groups were popped from data at naming time).
+            # Forcing rebuild from the (possibly empty) restored paint_group_data
+            # would blank previous named paints' visuals, causing "one undo removes
+            # multiple".
+            # Direct restore of the snapshot's paint_layer gives precise per-stroke
+            # visual undo.
+
+            viewer.manual_add_mask = state.get("manual_add_mask")
+            viewer.manual_remove_mask = state.get("manual_remove_mask")
+
+            if hasattr(viewer, 'last_df'):
+                viewer.last_df = state.get("last_df")
+
+            # Clear all transient editing / selection state (edge drag, move-selected, etc.)
+            # (already set above, but clear other transients)
+
+            for attr in (
+                'edge_grab_active', 'border_drag_active', 'active_edge',
+                'current_edited_contour', 'original_full_contour_for_edit',
+                'selected_edge_full_contour', '_edge_pending_deselect',
+                'region_translate_active', 'region_translate_original_mask',
+                'region_translate_zid', 'border_drag_original_mask',
+            ):
+                if hasattr(viewer, attr):
+                    setattr(viewer, attr, None if 'mask' in attr or 'contour' in attr or 'edge' in attr else False)
+
+            # Reset mode checkboxes/vars to neutral (show_page also does some of this)
+            for var_name, val in (
+                ('region_move_mode', False),
+                ('crop_mode_var', False),
+                ('edit_mode_var', False),
+                ('border_mode_var', False),  # default from init (unchecked; user must select it)
+            ):
+                var = getattr(viewer, var_name, None)
+                if var is not None:
+                    try:
+                        var.set(val)
+                    except Exception:
+                        pass
+
+            if hasattr(viewer, 'crop_mode'):
+                viewer.crop_mode = False
+            if hasattr(viewer, 'edit_mode'):
+                viewer.edit_mode = False
+            if hasattr(viewer, 'region_translate_active'):
+                viewer.region_translate_active = False
+
+            # Reset paint drawing transients so we don't have a dangling current stroke after undo
+            viewer.old_x = None
+            viewer.old_y = None
+            viewer.current_paint_group = None
+            viewer.current_state = None
+
+            if hasattr(viewer, '_update_paint_indicator'):
+                try:
+                    viewer._update_paint_indicator()
+                except Exception:
+                    pass
+
+            # Redraw everything from the restored data
+            viewer.show_page()
+
+            # Keep ribbon in sync if present
+            if hasattr(viewer, '_update_ribbon_selection'):
+                try:
+                    viewer._update_ribbon_selection()
+                except Exception:
+                    pass
+
+            logger.debug(f"Restored previous state (remaining undo depth={len(self.undo_stack)})")
+            return True
+        except Exception as e:
+            logger.warning(f"Undo failed: {e}")
+            # Attempt a safe redraw anyway
+            try:
+                viewer.show_page()
+            except Exception:
+                pass
+            return False
 
 class PDFHandler:
     def __init__(self):

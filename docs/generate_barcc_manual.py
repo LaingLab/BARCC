@@ -22,7 +22,7 @@ import os
 # ============================================================================
 MANUAL_TITLE = "BARCC - Brain Atlas Regional Cell Counter"
 MANUAL_SUBTITLE = "User Manual"
-VERSION = "8.03.000"
+VERSION = "8.04.000"
 OUTPUT_FILENAME = "BARCC_User_Manual.pdf"
 OUTPUT_DIR = ".."  # Place PDF in repository root
 
@@ -69,6 +69,10 @@ class BARCCUserManual(FPDF):
             '\u2023': '>',      # triangular bullet ‣
             '\u25b6': '>',      # black right-pointing triangle ▶ (ribbon arrow)
             '\u25bc': 'v',      # black down-pointing triangle ▼ (ribbon arrow)
+            '\u21b6': '<-',     # undo symbol ↶ (button / ribbon)
+            '\u2190': '<-',     # left arrow (already present, reinforce)
+            '\U0001F3A8': '[Paint]',  # artist palette 🎨 (paint indicator)
+            '\u270F': '[edit]',  # pencil (fallback)
         }
         for old, new in replacements.items():
             text = text.replace(old, new)
@@ -364,7 +368,32 @@ def build_manual():
     # 2. INSTALLATION
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
-    # What's New — 8.03.000
+    # What's New — 8.04.000
+    # ------------------------------------------------------------------
+    pdf.chapter_title("What's New in Version 8.04.000", 0)
+
+    pdf.body(
+        "BARCC 8.04.000 focuses on major improvements to the Paint tool workflow, undo reliability for custom regions, and precision editing of painted region boundaries."
+    )
+
+    pdf.bullet_list([
+        "Full repeated undo support for painted regions: Each individual paint stroke (mouse-down to mouse-up group) now creates its own undo checkpoint at the start of drawing. Naming a painted region, Stop Paint (auto-naming), Count Cells (force conversion), border/edge deformations, and Move Selected on painted zones are all fully undoable (up to 40 levels in the bounded history).",
+        "Undo button: Prominent ↶ Undo button added to the Atlas Manager ribbon header (always visible when ribbon is shown). Also available via Edit > Undo (with Ctrl+Z accelerator shown). Keyboard Ctrl+Z continues to work. The ribbon list/header and visual elements (including paint strokes) update immediately after each undo step.",
+        "Painted region border/edge expansion with deferred commit: When \"Border drag resize enabled\" is active and a painted region is selected, live dragging near the edge (or using the red local edge segment) updates the yellow/orange highlighted zone mask in real time for preview. The original black drawn boundary line stays in its previous position during the drag (providing a clear before/after view).",
+        "Press **Enter** (or keypad Enter) after adjusting the border to commit: The current mask contour is extracted, the stored painted zone outline points are updated to the final deformed shape, `_rebuild_paint_layer_from_data()` is called to re-rasterize a clean black boundary line from the new points (with proper caps and joints), and a full `show_page()` redraws it. This \"bakes\" the expanded painted region and refits the visible black outline exactly to the new mask shape. The mask/zone data was already updated live; Enter finalizes the visual boundary.",
+        "\"Border drag resize enabled\" checkbox now starts **unchecked** by default (in the Atlas Manager ribbon under the selected region tools). You must explicitly check it after selecting a region before edge or one-sided border drag tools will activate. This prevents accidental activation of the advanced editing mode.",
+        "Paint mode indicator: When the Paint tool is active (entered via Paint > Start Paint or equivalent), a clear \"🎨 PAINT ON\" label appears in bold red in the ribbon header. The main window title also updates to include \" — 🎨 PAINT MODE\". The indicator returns to \"Paint: off\" (gray) on Stop Paint, tool switches, or other exits from paint mode. The indicator is visible even if you hide the full ribbon (title bar fallback).",
+        "Edge/border manipulation, \"Move Selected Region\", and related per-region tools now work fully for painted regions (in addition to atlas regions) using correct coordinate mapping (background/image space vs. atlas page space). Deformations update both the mask (for counting and yellow tint) and, on Enter commit for painted, the black visual boundary.",
+        "Undo stack and state hygiene improvements: Painted region creation (draw + name), deformations, and finalization no longer cause unexpected batch undos or stale banner entries. The Atlas Manager \"Labeled Regions\" list and header now stay perfectly in sync with the actual zone data and visuals after paint actions and undos. Mask pruning on undo prevents the orphan auto-registration logic from re-adding removed painted zones.",
+        "All new paint editing and undo operations participate in the existing undo (save_state at the right points) and correctly refresh the ribbon, canvas, and paint_layer."
+    ])
+
+    pdf.body(
+        "These changes make precise, iterative editing of custom painted regions (with live mask preview and explicit commit for the visible black boundary) reliable and user-friendly, while keeping the powerful Atlas Manager ribbon workflow intact."
+    )
+
+    # ------------------------------------------------------------------
+    # What's New — 8.03.000 (previous major)
     # ------------------------------------------------------------------
     pdf.chapter_title("What's New in Version 8.03.000", 0)
 

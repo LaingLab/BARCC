@@ -2,7 +2,19 @@
 
 A GUI tool for analyzing immunofluorescence images with atlas region mapping and automated cell counting.
 
-**v8.03.000 Highlights** (current major release)
+**v8.04.000 Highlights** (current)
+- **Painted region border/edge editing with Enter-to-commit**: Live border drag or red-edge grab updates the yellow/orange zone mask (highlighted region) in real time for preview. The black drawn boundary line stays at the previous shape during adjustment. After releasing the mouse, **press Enter** (or keypad Enter) to commit: the current mask contour is extracted, the stored painted outline is updated, the paint layer is rebuilt, and a full redraw refits the visible black boundary exactly to the new expanded/deformed shape. This provides precise "preview then bake" control for custom painted regions.
+- **Undo button + repeated undo for paints**: Prominent ↶ Undo button in the Atlas Manager ribbon header (also Edit > Undo with accelerator shown). Full support for undoing individual paint strokes (one per mouse-down/up group), naming of painted regions, Stop/Count auto-conversion, border/edge deformations on painted zones, and atlas transforms. Up to 40 levels. Banner list, zone data, mask, and black boundary visuals now stay perfectly in sync after each undo.
+- **"Border drag resize enabled" now defaults to off**: The checkbox in the ribbon (under selected region tools) starts unchecked. You must explicitly enable it after selecting a painted or atlas region before edge/border drag or the red local segment tools activate. Prevents accidental advanced editing.
+- **Paint mode indicator**: When Paint tool is active, a bold red "🎨 PAINT ON" label appears in the ribbon header. The main window title also shows " — 🎨 PAINT MODE". Returns to normal (gray "Paint: off") on Stop Paint or tool switch. Visible in title bar even if ribbon is hidden.
+- **Edge / Move Selected / border tools for painted regions**: Full support (with correct coordinate handling for paint vs. atlas mask spaces) in addition to atlas regions. Combined with the Enter commit, you can now iteratively refine the shape of painted regions and have the black outline automatically follow.
+- **Undo reliability & hygiene**: Individual stroke granularity (no more unexpected multi-paint undos in common flows), immediate ribbon banner updates on undo, mask pruning to prevent re-orphaning of removed painted zones, and better state snapshots around paint naming and finalization.
+- Updated manual (regenerated with new "What's New in Version 8.04.000" covering the paint border Enter commit flow, undo button, paint indicator, checkbox default, and painted region editing).
+- Version in code/settings JSON: "8.04.000".
+
+See release-notes-v8.04.000.md for full details. The v8.03.000 Atlas Manager ribbon and prior Paint reliability work remain fully intact.
+
+**v8.03.000 Highlights** (previous major release)
 - **Atlas Manager Ribbon** (new central, discoverable UI for atlas region work; toggleable via View > "Show Atlas Manager Ribbon"):
   - Expandable header + content; always shows selected region.
   - Global Crop and Move now **checkboxes** (visible active state; enables whole-atlas click-drag modes).

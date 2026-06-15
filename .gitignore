@@ -1,6 +1,9 @@
 # generated files
 __pycache__
 *.xlsx
+*.csv
+*_masked.tif
+*.masked.tif
 
 # test directory
 Application/Random_code/
