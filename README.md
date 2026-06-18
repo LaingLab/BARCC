@@ -2,7 +2,17 @@
 
 A GUI tool for analyzing immunofluorescence images with atlas region mapping and automated cell counting.
 
-**v8.04.000 Highlights** (current)
+**v8.05.000 Highlights** (current)
+- **Critical fixes for Paint bundles + Count Cells on .tiff**:
+  - Fixed "failed to load paint bundle: ufunc 'less' did not contain a loop with signature matching types (UInt8DType...)" when loading a .barccpaint (with labeled painted regions) onto a .tiff. Root cause was JSON stringifying zone ID keys + uint8 label values from zones.png leading to type-mismatched comparisons inside `_populate_region_list` / `sorted` / ribbon updates after bundle load.
+  - Fixed silent "crash" on Count Cells after loading painted regions from bundle: no dialog shown, no .xlsx generated. Caused by uncaught numpy broadcast errors in cell marker viz drawing (edge/1px cases after window-fit scaling), progress dialog close timing vs results popups, and missing user feedback when directory state was slightly off in browser flows.
+  - Painted region load + name/shape restore + counting now works reliably end-to-end on TIFFs (regions + names appear in Atlas Manager and in the generated spreadsheet).
+- Robustness: zone ID keys normalized to int on every load path (bundle, legacy sidecars, state restore); explicit `int()` on mask-derived IDs; clean bool cell masks for watershed; viz errors wrapped so counts/df are always produced; manual cell-edit masks cleared on new TIFF load; progress dialog closed *before* results popups; always show a dialog even on skipped auto-save.
+- Version bumped to "8.05.000".
+
+See release-notes-v8.05.000.md for full details. v8.04.000 paint border/undo work and earlier remain intact.
+
+**v8.04.000 Highlights** (previous)
 - **Painted region border/edge editing with Enter-to-commit**: Live border drag or red-edge grab updates the yellow/orange zone mask (highlighted region) in real time for preview. The black drawn boundary line stays at the previous shape during adjustment. After releasing the mouse, **press Enter** (or keypad Enter) to commit: the current mask contour is extracted, the stored painted outline is updated, the paint layer is rebuilt, and a full redraw refits the visible black boundary exactly to the new expanded/deformed shape. This provides precise "preview then bake" control for custom painted regions.
 - **Undo button + repeated undo for paints**: Prominent ↶ Undo button in the Atlas Manager ribbon header (also Edit > Undo with accelerator shown). Full support for undoing individual paint strokes (one per mouse-down/up group), naming of painted regions, Stop/Count auto-conversion, border/edge deformations on painted zones, and atlas transforms. Up to 40 levels. Banner list, zone data, mask, and black boundary visuals now stay perfectly in sync after each undo.
 - **"Border drag resize enabled" now defaults to off**: The checkbox in the ribbon (under selected region tools) starts unchecked. You must explicitly enable it after selecting a painted or atlas region before edge/border drag or the red local segment tools activate. Prevents accidental advanced editing.
@@ -65,11 +75,11 @@ See release-notes-v8.03.000.md for full details. Previous v8.02.x Paint reliabil
   - Save Paint Layer now **auto-saves** directly into the folder currently open in the left File Browser (smart unique naming, no dialog). The file list refreshes automatically.
   - Load Paint and Import Paint default to the current left File Browser directory.
 - Critical stability fix: Closing the "Counting Cells" or "Detecting Cells" progress dialog early (X button) can no longer crash the application. All progress UI calls are now defensive.
-- Continuing from v8.01: Modern Blob Detection (default), Smart Suggest (Offline), left File Browser with counted status, automatic dual export (`.xlsx` + `_masked.tif`), and portable settings.
+- Continuing from v8.01: Modern Blob Detection (default), Smart Suggest (Pre-tuning smart settings), left File Browser with counted status, automatic dual export (`.xlsx` + `_masked.tif`), and portable settings.
 
 **v8.01.000 Highlights** (previous major release)
 - New modern Blob Detection engine (Laplacian of Gaussian) — significantly better results on most immunofluorescence images.
-- "Smart Suggest (Offline)" — a fully local, privacy-preserving tool that analyzes your image and recommends better detection parameters (with checkbox selection).
+- "Smart Suggest (Pre-tuning smart settings)" — a fully local, privacy-preserving tool that analyzes your image and recommends better detection parameters (with checkbox selection).
 - Live switching between Blob and legacy Watershed detection methods directly in Mask Settings.
 - Left-side File Browser pane: Select a folder to see all TIFFs, double-click to load, and see which images have already been counted (✓ indicator).
 - Automatic export on Count Cells: `{image}.xlsx` (with Cell Counts + full Detection Parameters metadata sheet) and `{image}_masked.tif` (original + red mask overlay).

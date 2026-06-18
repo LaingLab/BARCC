@@ -22,7 +22,7 @@ import os
 # ============================================================================
 MANUAL_TITLE = "BARCC - Brain Atlas Regional Cell Counter"
 MANUAL_SUBTITLE = "User Manual"
-VERSION = "8.04.000"
+VERSION = "8.05.000"
 OUTPUT_FILENAME = "BARCC_User_Manual.pdf"
 OUTPUT_DIR = ".."  # Place PDF in repository root
 
@@ -512,7 +512,7 @@ def build_manual():
     pdf.bullet_list([
         "New default detection engine based on Laplacian-of-Gaussian (blob_log) blob detection. This method is significantly more robust on typical immunofluorescence images than the previous watershed approach.",
         "Full set of Blob Detection parameters now exposed in Mask Settings with live preview.",
-        "New \"Smart Suggest (Offline)\" button — a completely local analysis tool that examines your image and current detections and recommends better parameter values. No data is ever transmitted.",
+        "New \"Smart Suggest (Pre-tuning smart settings)\" button — a completely local analysis tool that examines your image and current detections and recommends better parameter values (pre-tunes smart settings). No data is ever transmitted.",
         "Ability to instantly switch between the new Blob method and the legacy Watershed method.",
         "Autotune buttons now intelligently adapt their adjustments depending on the active detection method.",
         "When using Add Cell or Remove Cell, the Brush Settings dialog now opens automatically for immediate size control."
@@ -965,7 +965,7 @@ def build_manual():
     )
 
     pdf.note_box(
-        "A powerful new feature in v8.01 is the \"Smart Suggest (Offline)\" button. "
+        "A powerful new feature in v8.01 is the \"Smart Suggest (Pre-tuning smart settings)\" button. "
         "This fully local tool analyzes your current image and detection results and suggests "
         "better parameter values. No data ever leaves your computer."
     )
@@ -1165,7 +1165,7 @@ def build_manual():
 
     pdf.body(
         "Note: The Autotune buttons are intentionally conservative. For best results on difficult images, "
-        "use the new \"Smart Suggest (Offline)\" button instead (see below)."
+        "use the new \"Smart Suggest (Pre-tuning smart settings)\" button instead (see below)."
     )
 
     pdf.chapter_title("Export / Import Settings", 1)
@@ -1188,7 +1188,7 @@ def build_manual():
 
     pdf.chapter_title("Smart Suggest (Offline) – New in v8.01", 1)
     pdf.body(
-        "This is one of the most powerful new features in BARCC 8.01. Clicking \"Smart Suggest (Offline)\" "
+        "This is one of the most powerful new features in BARCC 8.01. Clicking \"Smart Suggest (Pre-tuning smart settings)\" "
         "runs a fully local analysis on your current image and detection results. It then proposes specific "
         "parameter improvements with clear explanations for each suggestion."
     )

@@ -42,6 +42,8 @@ from datetime import datetime
 import platform
 import subprocess
 import webbrowser
+import zipfile
+from io import BytesIO
 
 # Configure logging
 logging.basicConfig(
@@ -923,9 +925,17 @@ class PDFViewer:
             else:
                 logger.debug("No paint strokes to save")
             return
-            
-        # Get coordinates of entire painting area
-        x1, y1, x2, y2 = bbox
+
+        # Get coordinates of entire painting area (the active vector strokes)
+        try:
+            bbox = self.output.bbox('paint')
+            if bbox is None:
+                logger.debug("No paint bbox found")
+                return
+            x1, y1, x2, y2 = bbox
+        except Exception:
+            logger.debug("Failed to get paint bbox")
+            return
         # Modify coords so painting stays in the same place after conversion
         # This forces the bbox to start at the upper left corner of the canvas
         # This keeps the tiff and painting aligned even when importing the saved painting
@@ -988,15 +998,19 @@ class PDFViewer:
         This behaves like the Count Cells auto-export: it saves directly into the working directory
         the user has open in the left manager. After saving, the file list is refreshed.
         """
-        # If the user hasn't clicked Stop Paint yet, but has active paint strokes,
-        # bake them into self.img first so Save Paint Layer works without requiring Stop Paint.
-        if self.atlas_filetype != 'img':
-            paint_items = self.output.find_withtag('paint')
-            if paint_items:
-                self.save_paint()  # Bake current strokes into self.img and set atlas_filetype='img'
-            else:
-                logger.debug("No painting to save")
-                return
+        # Ensure any active vector paint strokes are committed to the persistent paint_layer
+        # (same as what reset() does on mouse up). This makes Save Paint Layer work
+        # reliably whether the user has just drawn or already released the mouse.
+        paint_items = self.output.find_withtag('paint')
+        if paint_items:
+            self._commit_canvas_paint_to_layer()
+            self.output.delete('paint')
+
+        # Nothing to save?
+        layer_check = self.paint_layer if self.paint_layer is not None else getattr(self, 'img', None)
+        if layer_check is None:
+            logger.debug("No painting to save")
+            return
 
         # === Determine target directory (priority: left File Browser > source image folder) ===
         target_dir = None
@@ -1011,21 +1025,61 @@ class PDFViewer:
         # === Build full save path with collision avoidance ===
         if target_dir:
             # Auto-save mode: save directly into the left-pane working directory
-            save_path = self._get_unique_paint_path(target_dir, base_name)
-            try:
-                # Prefer the persistent paint_layer (much more reliable after zooms/show_page)
-                layer = self.paint_layer if self.paint_layer is not None else getattr(self, 'img', None)
-                if layer is None:
-                    raise Exception("No paint content available to save")
-                layer.save(save_path)
-                messagebox.showinfo("Paint Saved", f"Paint layer saved to:\n{save_path}")
-                logger.info(f"Auto-saved paint to: {save_path}")
+            page = self.current_page
+            has_labeled_regions = bool(
+                self.zone_names.get(page, {}) or
+                getattr(self, 'painted_zone_outlines', {})
+            )
 
-                # Refresh left file manager so the saved paint appears in the current directory view
-                if hasattr(self, 'tiff_tree') and self.current_tiff_directory:
-                    self.refresh_tiff_file_list()
-            except Exception as e:
-                messagebox.showerror("Save Error", f"Failed to auto-save paint:\n{e}")
+            layer = self.paint_layer if self.paint_layer is not None else getattr(self, 'img', None)
+            if layer is None:
+                raise Exception("No paint content available to save")
+
+            if has_labeled_regions:
+                # New bundled format: single file containing strokes + zones mask + names
+                save_path = self._get_unique_paint_bundle_path(target_dir, base_name)
+                try:
+                    with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        # Visual painted strokes (the black lines)
+                        bio = BytesIO()
+                        layer.save(bio, format='PNG')
+                        zf.writestr('strokes.png', bio.getvalue())
+
+                        # Filled zone mask for the labeled region shapes
+                        if page in self.mask_images and self.mask_images[page] is not None:
+                            bio2 = BytesIO()
+                            self.mask_images[page].save(bio2, format='PNG')
+                            zf.writestr('zones.png', bio2.getvalue())
+
+                        # Metadata: names and outlines
+                        manifest = {
+                            "format_version": 1,
+                            "type": "paint_with_regions",
+                            "saved_background_size": list(layer.size),
+                            "zone_names": self.zone_names.get(page, {}),
+                            "painted_zone_outlines": getattr(self, 'painted_zone_outlines', {}),
+                        }
+                        zf.writestr('manifest.json', json.dumps(manifest, indent=2))
+
+                    messagebox.showinfo("Paint + Regions Saved", f"Paint file with labeled regions saved to:\n{save_path}")
+                    logger.info(f"Saved paint bundle with regions to: {save_path}")
+                except Exception as e:
+                    messagebox.showerror("Save Error", f"Failed to save paint bundle:\n{e}")
+                    return
+            else:
+                # Plain visual paint only (no labeled regions to bundle)
+                save_path = self._get_unique_paint_path(target_dir, base_name)
+                try:
+                    layer.save(save_path)
+                    messagebox.showinfo("Paint Saved", f"Paint layer saved to:\n{save_path}")
+                    logger.info(f"Auto-saved paint to: {save_path}")
+                except Exception as e:
+                    messagebox.showerror("Save Error", f"Failed to auto-save paint:\n{e}")
+                    return
+
+            # Refresh left file manager so the saved paint (or bundle) appears
+            if hasattr(self, 'tiff_tree') and self.current_tiff_directory:
+                self.refresh_tiff_file_list()
         else:
             # Fallback: no folder selected in browser → show traditional save dialog
             save_path = fd.asksaveasfilename(
@@ -1040,8 +1094,39 @@ class PDFViewer:
                 layer = self.paint_layer if self.paint_layer is not None else getattr(self, 'img', None)
                 if layer is None:
                     raise Exception("No paint content available to save")
-                layer.save(save_path)
-                messagebox.showinfo("Image Saved", f"Paint saved to: {save_path}")
+
+                page = self.current_page
+                has_labeled_regions = bool(
+                    self.zone_names.get(page, {}) or
+                    getattr(self, 'painted_zone_outlines', {})
+                )
+
+                if has_labeled_regions:
+                    # Use bundle format even for manual save
+                    # (user can rename extension if they want)
+                    bundle_path = save_path
+                    if not bundle_path.lower().endswith('.barccpaint'):
+                        bundle_path = os.path.splitext(save_path)[0] + '.barccpaint'
+                    with zipfile.ZipFile(bundle_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        bio = BytesIO()
+                        layer.save(bio, format='PNG')
+                        zf.writestr('strokes.png', bio.getvalue())
+                        if page in self.mask_images and self.mask_images[page] is not None:
+                            bio2 = BytesIO()
+                            self.mask_images[page].save(bio2, format='PNG')
+                            zf.writestr('zones.png', bio2.getvalue())
+                        manifest = {
+                            "format_version": 1,
+                            "type": "paint_with_regions",
+                            "saved_background_size": list(layer.size),
+                            "zone_names": self.zone_names.get(page, {}),
+                            "painted_zone_outlines": getattr(self, 'painted_zone_outlines', {}),
+                        }
+                        zf.writestr('manifest.json', json.dumps(manifest, indent=2))
+                    messagebox.showinfo("Paint + Regions Saved", f"Paint file with labeled regions saved to:\n{bundle_path}")
+                else:
+                    layer.save(save_path)
+                    messagebox.showinfo("Image Saved", f"Paint saved to: {save_path}")
             except Exception as e:
                 messagebox.showerror("Save Error", f"Failed to save the paint image:\n{e}")
 
@@ -1054,6 +1139,19 @@ class PDFViewer:
         counter = 2
         while True:
             candidate = os.path.join(directory, f"{base_name}_paint ({counter}).png")
+            if not os.path.exists(candidate):
+                return candidate
+            counter += 1
+
+    def _get_unique_paint_bundle_path(self, directory, base_name):
+        """Return a unique path for a paint + regions bundle."""
+        candidate = os.path.join(directory, f"{base_name}_paint_with_regions.barccpaint")
+        if not os.path.exists(candidate):
+            return candidate
+
+        counter = 2
+        while True:
+            candidate = os.path.join(directory, f"{base_name}_paint_with_regions ({counter}).barccpaint")
             if not os.path.exists(candidate):
                 return candidate
             counter += 1
@@ -1071,26 +1169,177 @@ class PDFViewer:
         path = fd.askopenfilename(
             title="Load Paint",
             initialdir=initial_dir,
-            filetypes=[("PNG files", "*.png")]
+            filetypes=[
+                ("BARCC Paint + Regions", "*.barccpaint"),
+                ("PNG files", "*.png"),
+                ("All files", "*.*")
+            ]
         )
         if path:
             logger.info(f"Opening paint file: {path}")
             self.path = path
-            self.img = Image.open(path)
-            self.atlas_filetype = 'png'
-            clear_preprocess_cache()
+            if path.lower().endswith('.barccpaint'):
+                self._load_barccpaint_bundle(path)
+            else:
+                self.img = Image.open(path)
+                clear_preprocess_cache()
 
-            # Ensure we have a paint layer even when loading a paint file as base
-            if self.original_background is not None and self.paint_layer is None:
-                self.paint_layer = Image.new('RGBA', self.original_background.size, (0, 0, 0, 0))
+                loaded_rgba = self.img.convert('RGBA') if self.img.mode != 'RGBA' else self.img
+                self.paint_layer = loaded_rgba
+                self.atlas_filetype = 'img'
 
-            self.show_page()
+                self.show_page()
+
+                # Legacy sidecar support (plain PNG + _regions.json + _zones.png)
+                try:
+                    loaded_base = os.path.splitext(os.path.basename(path))[0]
+                    load_dir = os.path.dirname(path) or "."
+                    regions_json = os.path.join(load_dir, loaded_base + "_regions.json")
+                    zones_png = os.path.join(load_dir, loaded_base + "_zones.png")
+
+                    restored = False
+                    page = self.current_page
+
+                    if os.path.exists(regions_json):
+                        with open(regions_json, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        names = data.get("zone_names", {})
+                        if names:
+                            names = {int(k): v for k, v in names.items()}
+                            if page not in self.zone_names:
+                                self.zone_names[page] = {}
+                            self.zone_names[page].update(names)
+                            restored = True
+                        outlines = data.get("painted_zone_outlines", {})
+                        if outlines:
+                            outlines = {int(k): v for k, v in outlines.items()}
+                            self.painted_zone_outlines.update(outlines)
+                            restored = True
+
+                    if os.path.exists(zones_png):
+                        zone_mask = Image.open(zones_png).convert('L')
+                        try:
+                            if zone_mask.mode != 'L':
+                                zone_mask = zone_mask.convert('L')
+                            zarr = np.array(zone_mask).astype(np.uint8)
+                            zone_mask = Image.fromarray(zarr, mode='L')
+                        except Exception:
+                            pass
+                        self.mask_images[page] = zone_mask
+                        restored = True
+
+                    if restored:
+                        if hasattr(self, '_update_ribbon_selection'):
+                            self._update_ribbon_selection()
+                        if hasattr(self, '_rebuild_page_overlays'):
+                            try:
+                                self._rebuild_page_overlays(page)
+                            except Exception:
+                                pass
+                        self.show_page()
+                        logger.info(f"Restored from legacy sidecars for {path}")
+                except Exception as e:
+                    logger.debug(f"No legacy sidecars: {e}")
 
     def load_paint(self):
         """Load a paint layer from the current working directory shown in the left File Browser.
         This is the recommended entry point from the Paint menu.
         """
         self.open_paint()
+
+    def _load_barccpaint_bundle(self, path):
+        """Load a .barccpaint bundle (strokes.png + zones.png + manifest with names).
+        Restores both the visual painted boundaries and the labeled regions (names + shapes)
+        into the Atlas Manager at the correct location relative to the current background.
+        """
+        try:
+            with zipfile.ZipFile(path, 'r') as zf:
+                manifest = json.loads(zf.read('manifest.json').decode('utf-8'))
+
+                # Visual strokes (black drawn boundaries)
+                strokes = Image.open(BytesIO(zf.read('strokes.png')))
+                self.paint_layer = strokes.convert('RGBA') if strokes.mode != 'RGBA' else strokes
+                self.img = self.paint_layer.copy()
+                self.atlas_filetype = 'img'
+
+                # Match strokes layer size to current background (handles window resize / refit between save/load)
+                if self.original_background is not None:
+                    target = self.original_background.size
+                    if self.paint_layer.size != target:
+                        try:
+                            self.paint_layer = self.paint_layer.resize(target, Image.NEAREST)
+                            self.img = self.paint_layer.copy()
+                        except Exception:
+                            pass
+                self.photo = ImageTk.PhotoImage(self.img)
+
+                page = self.current_page
+
+                # Zone mask (filled labeled region shapes)
+                if 'zones.png' in zf.namelist():
+                    zones = Image.open(BytesIO(zf.read('zones.png'))).convert('L')
+                    # If background size differs, resize to match (nearest for mask ids)
+                    if self.original_background is not None:
+                        if zones.size != self.original_background.size:
+                            zones = zones.resize(self.original_background.size, Image.NEAREST)
+                    # Ensure clean uint8 label mask (prevents any dtype surprises downstream)
+                    try:
+                        if not isinstance(zones, Image.Image):
+                            zones = Image.fromarray(np.asarray(zones).astype(np.uint8))
+                        if zones.mode != 'L':
+                            zones = zones.convert('L')
+                        zarr = np.array(zones).astype(np.uint8)
+                        zones = Image.fromarray(zarr, mode='L')
+                    except Exception:
+                        pass
+                    self.mask_images[page] = zones
+
+                # Names and outlines
+                # json turns int keys into str; normalize back to int so sorted() and 'in' checks
+                # with uint8 zids from masks don't trigger ufunc 'less' during comparisons.
+                names = manifest.get('zone_names', {})
+                if names:
+                    names = {int(k): v for k, v in names.items()}
+                    if page not in self.zone_names:
+                        self.zone_names[page] = {}
+                    self.zone_names[page].update(names)
+
+                outlines = manifest.get('painted_zone_outlines', {})
+                if outlines:
+                    outlines = {int(k): v for k, v in outlines.items()}
+                    self.painted_zone_outlines.update(outlines)
+
+                # Make sure the zone counter for this page is high enough for any loaded zone ids
+                # (prevents ID collisions on future naming, complements the ensure in ribbon populate).
+                if page in self.zone_names and self.zone_names[page]:
+                    try:
+                        max_loaded = max((int(k) for k in self.zone_names[page].keys()), default=0)
+                        if page not in self.zone_counters:
+                            self.zone_counters[page] = 0
+                        if self.zone_counters[page] < max_loaded:
+                            self.zone_counters[page] = max_loaded
+                    except Exception:
+                        pass
+
+                # Reset placement so everything lines up in background pixel space
+                self.img_x = 0
+                self.img_y = 0
+
+                self.show_page()
+
+                if hasattr(self, '_update_ribbon_selection'):
+                    self._update_ribbon_selection()
+                if hasattr(self, '_rebuild_page_overlays'):
+                    try:
+                        self._rebuild_page_overlays(page)
+                    except Exception:
+                        pass
+
+            messagebox.showinfo("Paint Loaded", f"Loaded paint + labeled regions from:\n{path}")
+            logger.info(f"Loaded barccpaint bundle: {path}")
+        except Exception as e:
+            messagebox.showerror("Load Error", f"Failed to load paint bundle:\n{e}")
+            logger.error(f"Failed to load barccpaint bundle {path}: {e}")
 
     def use_pen(self):
         # self.activate_button("Pen")
@@ -2288,8 +2537,8 @@ class PDFViewer:
         ttk.Button(auto_btns, text="Brighter cells", width=12, command=autotune_brighter_cells).grid(row=1, column=1, padx=2, pady=1)
         ttk.Button(auto_btns, text="Dimmer cells", width=12, command=autotune_dimmer_cells).grid(row=1, column=2, padx=2, pady=1)
 
-        # Smart Local Agent button (fully offline, no data leaves the computer)
-        ttk.Button(control_frame, text="Smart Suggest (Offline)", 
+        # Smart Suggest button (pre-tunes detection settings locally based on image analysis)
+        ttk.Button(control_frame, text="Smart Suggest (Pre-tuning smart settings)", 
                    command=self._show_smart_suggest_dialog).grid(row=1, column=4, padx=(15, 5), pady=(6, 2))
 
         # Presets row
@@ -2576,14 +2825,14 @@ class PDFViewer:
         messagebox.showinfo("Mask Editing", "Mask edits applied. You can now re-count cells.")
 
     # ==================================================================
-    # OFFLINE SMART SUGGEST AGENT (Fully local, no data leaves computer)
+    # SMART SUGGEST (Pre-tuning smart settings) - Fully local analysis
     # ==================================================================
 
     def _analyze_current_detection(self):
         """
-        Fully local analysis of the current image and detection result.
+        Local analysis of the current image and detection result.
         Returns useful statistics and suggestions for blob parameters.
-        Everything runs on the user's machine.
+        Everything runs on the user's machine (pre-tunes smart settings).
         """
         if self.original_background is None:
             return None
@@ -2690,7 +2939,7 @@ class PDFViewer:
         }
 
     def _show_smart_suggest_dialog(self):
-        """Shows suggestions from the fully local offline agent."""
+        """Shows suggestions from the local pre-tuning smart settings agent."""
         analysis = self._analyze_current_detection()
 
         if analysis is None:
@@ -2709,10 +2958,10 @@ class PDFViewer:
 
         # Build suggestion dialog
         dialog = Toplevel(self.root)
-        dialog.title("Smart Suggest (Fully Offline)")
+        dialog.title("Smart Suggest (Pre-tuning smart settings)")
         dialog.geometry("620x480")
 
-        ttk.Label(dialog, text="Local Analysis (no data leaves your computer)", font=("Helvetica", 11, "bold")).pack(pady=8)
+        ttk.Label(dialog, text="Pre-tuning analysis (fully local, no data leaves your computer)", font=("Helvetica", 11, "bold")).pack(pady=8)
 
         info = f"Detections found: {analysis['num_detections']}   |   Density: {analysis['detection_density']} per MP   |   Contrast: {analysis['contrast']}"
         ttk.Label(dialog, text=info).pack(pady=4)
@@ -2865,7 +3114,7 @@ class PDFViewer:
                 return
 
             config_data = {
-                "version": "8.03.000",
+                "version": "8.05.000",
                 "detection_method": self.image_processor.cell_config.detection_method,
                 "cell_detection": self.image_processor.cell_config.__dict__.copy(),
                 "preprocessing": self.image_processor.preprocess_config.__dict__.copy(),
@@ -3634,7 +3883,12 @@ class PDFViewer:
             self.file_browser_frame.after(50, self._update_folder_label_wraplength)
 
     def refresh_tiff_file_list(self):
-        """Scan the current directory for .tif / .tiff files and update the Treeview with counted status."""
+        """Scan the current directory for .tif / .tiff files and update the Treeview.
+        Shows counted status (✓) and child entries for generated artifacts:
+        - the counted .xlsx/.csv when Count Cells has run
+        - saved paint layer files (*.png or the new *_paint_with_regions.barccpaint bundle) when Save Paint Layer is used.
+        This makes the left pane act more like a live file manager for the working directory.
+        """
         if not self.current_tiff_directory or not os.path.isdir(self.current_tiff_directory):
             return
 
@@ -3648,18 +3902,44 @@ class PDFViewer:
 
             self.tiff_file_list = [os.path.join(self.current_tiff_directory, f) for f in tiff_files]
 
-            # Clear and repopulate Treeview
+            # Clear and repopulate Treeview (supports children for associated files)
             if hasattr(self, 'tiff_tree'):
                 for item in self.tiff_tree.get_children():
                     self.tiff_tree.delete(item)
 
                 for full_path in self.tiff_file_list:
                     filename = os.path.basename(full_path)
-                    has_csv = self._has_matching_csv(full_path)
-                    status = "✓" if has_csv else ""
+                    has_counted = self._has_matching_csv(full_path)
+                    status = "✓" if has_counted else ""
 
-                    iid = self.tiff_tree.insert("", "end", values=(filename, status))
+                    # Top-level TIFF row
+                    iid = self.tiff_tree.insert("", "end", values=(filename, status), open=True)
                     self._tree_iid_to_path[iid] = full_path
+
+                    directory = os.path.dirname(full_path)
+                    base = os.path.splitext(filename)[0]
+
+                    # Add child rows for counted results (the Excel the user mentioned)
+                    counted_cands = [
+                        f"{base}.xlsx", f"{base}.csv",
+                        f"{base}_counted.xlsx", f"{base}_counted.csv",
+                        f"{base} - counted.xlsx", f"{base} - counted.csv",
+                        f"{base}_cells.xlsx", f"{base}_cells.csv",
+                    ]
+                    for cand in counted_cands:
+                        cpath = os.path.join(directory, cand)
+                        if os.path.exists(cpath):
+                            self.tiff_tree.insert(iid, "end", values=(cand, ""))
+
+                    # Add child rows for saved paint images / bundles (when Save Paint Layer is used)
+                    try:
+                        for f in files:
+                            fl = f.lower()
+                            if fl.startswith(base.lower() + "_paint"):
+                                if fl.endswith('.png') or fl.endswith('.barccpaint'):
+                                    self.tiff_tree.insert(iid, "end", values=(f, ""))
+                    except Exception:
+                        pass
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to read directory:\n{e}")
@@ -3698,7 +3978,9 @@ class PDFViewer:
         return False
 
     def load_tiff_from_list(self, event=None):
-        """Load the TIFF file that was double-clicked in the file browser Treeview."""
+        """Load the TIFF file that was double-clicked in the file browser Treeview.
+        Child items (generated .xlsx or saved paint files/bundles) are ignored for loading.
+        """
         if not hasattr(self, 'tiff_tree'):
             return
 
@@ -3707,6 +3989,81 @@ class PDFViewer:
             return
 
         iid = selection[0]
+
+        parent_iid = self.tiff_tree.parent(iid)
+        if parent_iid:
+            # Child item - check if it's a paint accessory file
+            values = self.tiff_tree.item(iid, "values") or []
+            child_name = values[0] if values else ""
+            cl = child_name.lower()
+            if (cl.endswith('.barccpaint') or cl.endswith('.png')) and '_paint' in cl:
+                # Load the associated TIFF first if not already the current one
+                if parent_iid in self._tree_iid_to_path:
+                    parent_tiff_path = self._tree_iid_to_path[parent_iid]
+                    # Load the background if it's not the current or to ensure
+                    if not self.tiff_filename or self.tiff_filename not in os.path.basename(parent_tiff_path):
+                        self._load_tiff_file(parent_tiff_path)
+                    # Now load the paint onto it
+                    paint_full_path = os.path.join( os.path.dirname(parent_tiff_path), child_name )
+                    if paint_full_path.lower().endswith('.barccpaint'):
+                        self._load_barccpaint_bundle(paint_full_path)
+                    else:
+                        # plain paint png (legacy)
+                        self.img = Image.open(paint_full_path)
+                        clear_preprocess_cache()
+                        loaded_rgba = self.img.convert('RGBA') if self.img.mode != 'RGBA' else self.img
+                        self.paint_layer = loaded_rgba
+                        self.atlas_filetype = 'img'
+                        self.show_page()
+                        # try legacy sidecars relative to this paint file
+                        try:
+                            pbase = os.path.splitext(os.path.basename(paint_full_path))[0]
+                            pdir = os.path.dirname(paint_full_path)
+                            rj = os.path.join(pdir, pbase + "_regions.json")
+                            zp = os.path.join(pdir, pbase + "_zones.png")
+                            page = self.current_page
+                            restored = False
+                            if os.path.exists(rj):
+                                with open(rj, "r", encoding="utf-8") as f:
+                                    d = json.load(f)
+                                nm = d.get("zone_names", {})
+                                if nm:
+                                    nm = {int(k): v for k, v in nm.items()}
+                                    if page not in self.zone_names: self.zone_names[page] = {}
+                                    self.zone_names[page].update(nm)
+                                    restored = True
+                                ol = d.get("painted_zone_outlines", {})
+                                if ol:
+                                    ol = {int(k): v for k, v in ol.items()}
+                                    self.painted_zone_outlines.update(ol)
+                                    restored = True
+                            if os.path.exists(zp):
+                                zm = Image.open(zp).convert('L')
+                                try:
+                                    if zm.mode != 'L':
+                                        zm = zm.convert('L')
+                                    zarr = np.array(zm).astype(np.uint8)
+                                    zm = Image.fromarray(zarr, mode='L')
+                                except Exception:
+                                    pass
+                                self.mask_images[page] = zm
+                                restored = True
+                            if restored:
+                                if hasattr(self, '_update_ribbon_selection'):
+                                    self._update_ribbon_selection()
+                                if hasattr(self, '_rebuild_page_overlays'):
+                                    try:
+                                        self._rebuild_page_overlays(page)
+                                    except:
+                                        pass
+                                self.show_page()
+                        except:
+                            pass
+                return
+            else:
+                # other child, ignore
+                return
+
         if iid in self._tree_iid_to_path:
             full_path = self._tree_iid_to_path[iid]
             self._load_tiff_file(full_path)
@@ -3734,7 +4091,9 @@ class PDFViewer:
         # File list using Treeview for multiple columns (Filename + Counted status)
         columns = ("image", "counted")
         self.tiff_tree = ttk.Treeview(parent, columns=columns, show="tree", selectmode="browse")
-        self.tiff_tree.column("#0", width=0, stretch=False)  # Hide the tree column
+        # Give the tree column a little width so hierarchy/children (for .xlsx and saved paint .png / .barccpaint) are visible
+        self.tiff_tree.column("#0", width=20, minwidth=16, stretch=False)
+        self.tiff_tree.heading("#0", text="")
         self.tiff_tree.column("image", width=160, anchor="w")
         self.tiff_tree.column("counted", width=40, anchor="center")
 
@@ -3794,6 +4153,13 @@ class PDFViewer:
         self.crop_mode_var.set(False)
         self.edit_mode = False
         self.edit_mode_var.set(False)
+
+        # Clear manual cell edit masks so they don't carry over from a previous image (different size/content)
+        self.manual_add_mask = None
+        self.manual_remove_mask = None
+        self.editing_mask = False
+        self.current_mask = None
+        self.auto_mask = None
 
         self.tiff_dir = os.path.dirname(tiff_path)
         self.tiff_filename = os.path.splitext(os.path.basename(tiff_path))[0]
@@ -4338,6 +4704,7 @@ class PDFViewer:
         canvas clicks on it will autoselect instead of re-prompting for a name.
         Also bumps the zone counter so future new names don't collide with existing ids.
         """
+        zid = int(zid)
         if zid <= 0:
             return
         if page not in self.zone_names:
@@ -4802,7 +5169,14 @@ class PDFViewer:
         self.region_listbox.delete(0, tk.END)
         self.region_list_id_map = {}
         page = self.current_page
-        names = self.zone_names.get(page, {}) if hasattr(self, 'zone_names') else {}
+        raw_names = self.zone_names.get(page, {}) if hasattr(self, 'zone_names') else {}
+        # Normalize keys to int (json manifests, snapshots etc use str keys). Prevents
+        # 'uid not in names' false positives and ufunc 'less' in sorted when mixing with np.uint8 from mask.
+        names = {int(k): v for k, v in raw_names.items()} if raw_names else {}
+        if names:
+            if page not in self.zone_names:
+                self.zone_names[page] = {}
+            self.zone_names[page].update(names)
         # Discover any zones present in the mask but missing from zone_names (orphans from
         # paint force, undo, or legacy data) and auto-register defaults so they appear in
         # the manager and can be autoselected on canvas clicks.
@@ -4810,12 +5184,20 @@ class PDFViewer:
             try:
                 m = np.array(self.mask_images[page])
                 for zid in np.unique(m):
-                    if zid > 0 and zid not in names:
-                        self._ensure_zone_has_name(page, zid)
+                    if zid > 0:
+                        iz = int(zid)
+                        if iz not in names:
+                            self._ensure_zone_has_name(page, iz)
                 names = self.zone_names.get(page, {}) if hasattr(self, 'zone_names') else {}
+                names = {int(k): v for k, v in names.items()} if names else {}
             except Exception:
                 pass
-        for i, (zid, zname) in enumerate(sorted(names.items())):
+        # Force int keys for stable sort + display (defensive vs json str keys or np scalars)
+        try:
+            sorted_items = sorted((int(k), v) for k, v in names.items())
+        except Exception:
+            sorted_items = sorted(names.items())
+        for i, (zid, zname) in enumerate(sorted_items):
             display = f"{zname} (ID={zid})"
             self.region_listbox.insert(tk.END, display)
             self.region_list_id_map[i] = zid
@@ -5688,6 +6070,14 @@ class PDFViewer:
 
         # === Build Final Cell Mask ===
         progress.set_progress(25, "Running cell detection...")
+        if self.original_background is None:
+            if self.background_image is not None:
+                self.original_background = self.background_image.copy()
+            else:
+                if progress and not getattr(progress, 'closed', False):
+                    progress.close()
+                messagebox.showerror("Error", "No original background image available for cell detection.")
+                return
         background = self.original_background.convert('L')
         _, auto_labels = binary_mask_cell_count(background, processor=self.image_processor)
         auto_mask = auto_labels > 0  # Boolean array
@@ -5738,78 +6128,89 @@ class PDFViewer:
         progress.set_progress(85, "Generating annotated image...")
         self.show_page()
 
-        # === Automatic saving of results (new in 8.01, improved in 8.02) ===
-        base_name = self.tiff_filename
-        tiff_dir = self.tiff_dir
-
-        # 1. Save Excel file with two sheets (Counts + Detection Parameters)
-        xlsx_path = os.path.join(tiff_dir, f"{base_name}.xlsx")
-        excel_saved = False
-
-        for engine in ['openpyxl', 'xlsxwriter']:
-            try:
-                with pd.ExcelWriter(xlsx_path, engine=engine) as writer:
-                    df.to_excel(writer, sheet_name="Cell Counts", index=False)
-
-                    # Metadata sheet with all detection parameters
-                    meta_data = []
-                    cfg = self.image_processor.cell_config
-                    pcfg = self.image_processor.preprocess_config
-
-                    for k, v in cfg.__dict__.items():
-                        meta_data.append({"Category": "Cell Detection", "Parameter": k, "Value": str(v)})
-
-                    for k, v in pcfg.__dict__.items():
-                        meta_data.append({"Category": "Preprocessing", "Parameter": k, "Value": str(v)})
-
-                    meta_df = pd.DataFrame(meta_data)
-                    meta_df.to_excel(writer, sheet_name="Detection Parameters", index=False)
-
-                messagebox.showinfo("Results Saved", f"Excel file saved:\n{xlsx_path}")
-                excel_saved = True
-                break
-            except Exception:
-                continue  # try next engine
-
-        if not excel_saved:
-            # Final fallback to CSV
-            csv_path = os.path.join(tiff_dir, f"{base_name}.csv")
-            df.to_csv(csv_path, index=False)
-            messagebox.showwarning(
-                "Excel Export Failed",
-                f"Could not save as Excel (openpyxl or xlsxwriter not installed).\n"
-                f"Fell back to CSV:\n{csv_path}\n\n"
-                f"To enable .xlsx output with metadata sheet, run:\n"
-                f"pip install openpyxl xlsxwriter"
-            )
-
-        # 2. Automatically save the mask as a flattened overlay on the original image
-        try:
-            orig = self.original_background.convert('RGBA')
-
-            # Resize final cell mask to full resolution
-            mask_full = final_cell_mask
-            mask_resized = Image.fromarray((mask_full * 255).astype(np.uint8)).resize(orig.size, Image.NEAREST)
-
-            # Create semi-transparent red overlay
-            overlay = Image.new('RGBA', orig.size, (0, 0, 0, 0))
-            red_layer = Image.new('RGBA', orig.size, (255, 0, 0, 110))
-            overlay.paste(red_layer, mask=mask_resized)
-
-            masked_img = Image.alpha_composite(orig, overlay)
-
-            masked_path = os.path.join(tiff_dir, f"{base_name}_masked.tif")
-            masked_img.save(masked_path, compression='tiff_deflate')
-
-            logger.info(f"Masked image saved: {masked_path}")
-        except Exception as e:
-            logger.error(f"Failed to save _masked.tif: {e}")
-
+        # Close the progress dialog before showing final results popups.
+        # Leaving it open while showing messagebox + later close can cause focus/event
+        # issues or apparent crashes on some systems when the results dialog is dismissed.
         if progress and not getattr(progress, 'closed', False):
             progress.set_progress(100, "Done")
             progress.close()
 
+        # === Prepare save paths (must be before using in early masked save) ===
+        base_name = self.tiff_filename
+        tiff_dir = self.tiff_dir
+
+        # Run the masked overlay save early (before any final popups) so that when the
+        # user dismisses the "Results Saved" dialog there is no further work that could
+        # trigger a crash or bad state.
+        if tiff_dir and base_name and self.original_background is not None:
+            try:
+                orig = self.original_background.convert('RGBA')
+                mask_full = final_cell_mask
+                mask_resized = Image.fromarray((mask_full * 255).astype(np.uint8)).resize(orig.size, Image.NEAREST)
+                overlay = Image.new('RGBA', orig.size, (0, 0, 0, 0))
+                red_layer = Image.new('RGBA', orig.size, (255, 0, 0, 110))
+                overlay.paste(red_layer, mask=mask_resized)
+                masked_img = Image.alpha_composite(orig, overlay)
+                masked_path = os.path.join(tiff_dir, f"{base_name}_masked.tif")
+                masked_img.save(masked_path, compression='tiff_deflate')
+                logger.info(f"Masked image saved: {masked_path}")
+            except Exception as e:
+                logger.error(f"Failed to save _masked.tif: {e}")
+
+        # === Automatic saving of results (new in 8.01, improved in 8.02) ===
+
+        # 1. Save Excel file with two sheets (Counts + Detection Parameters)
+        excel_saved = False
+        if tiff_dir and base_name:
+            xlsx_path = os.path.join(tiff_dir, f"{base_name}.xlsx")
+            for engine in ['openpyxl', 'xlsxwriter']:
+                try:
+                    with pd.ExcelWriter(xlsx_path, engine=engine) as writer:
+                        df.to_excel(writer, sheet_name="Cell Counts", index=False)
+
+                        # Metadata sheet with all detection parameters
+                        meta_data = []
+                        cfg = self.image_processor.cell_config
+                        pcfg = self.image_processor.preprocess_config
+
+                        for k, v in cfg.__dict__.items():
+                            meta_data.append({"Category": "Cell Detection", "Parameter": k, "Value": str(v)})
+
+                        for k, v in pcfg.__dict__.items():
+                            meta_data.append({"Category": "Preprocessing", "Parameter": k, "Value": str(v)})
+
+                        meta_df = pd.DataFrame(meta_data)
+                        meta_df.to_excel(writer, sheet_name="Detection Parameters", index=False)
+
+                    messagebox.showinfo("Results Saved", f"Excel file saved:\n{xlsx_path}")
+                    excel_saved = True
+                    break
+                except Exception:
+                    continue  # try next engine
+
+            if not excel_saved:
+                # Final fallback to CSV
+                try:
+                    csv_path = os.path.join(tiff_dir, f"{base_name}.csv")
+                    df.to_csv(csv_path, index=False)
+                    messagebox.showwarning(
+                        "Excel Export Failed",
+                        f"Could not save as Excel (openpyxl or xlsxwriter not installed).\n"
+                        f"Fell back to CSV:\n{csv_path}\n\n"
+                        f"To enable .xlsx output with metadata sheet, run:\n"
+                        f"pip install openpyxl xlsxwriter"
+                    )
+                except Exception as e:
+                    logger.error(f"CSV fallback also failed: {e}")
+        else:
+            logger.warning("Skipping auto-save of count results (missing tiff_dir or base_name)")
+            try:
+                messagebox.showinfo("Count Complete", "Cells counted. No working TIFF directory was set, so no Excel/CSV was auto-saved.")
+            except Exception:
+                pass
+
         # Refresh file browser so the "counted" indicator updates
+        # (the progress dialog was already closed above before any results popups)
         if hasattr(self, 'tiff_tree') and self.current_tiff_directory:
             self.master.after(300, self.refresh_tiff_file_list)
 
@@ -5960,8 +6361,16 @@ class PDFViewer:
         self.atlas_filetype = None
 
         # TIFF filename
+        # Do NOT clear current_tiff_directory or the file browser list/tree
+        # so the user stays in the same directory.
         self.tiff_filename = None
         self.tiff_dir = None
+
+        # Clear paint states for full reset
+        self.named_paint_groups = {}
+        self.paint_group_data = {}
+        self.current_paint_group = None
+        self.paint_layer = None
 
         # Last DF for counts
         self.last_df = None
@@ -5973,6 +6382,12 @@ class PDFViewer:
         self.current_state = None
 
         self.show_page()
+
+        # Fully clear Atlas Manager state (labeled regions list, selection, etc.)
+        # and any remaining loaded content so it feels like a fresh start.
+        if hasattr(self, '_update_ribbon_selection'):
+            self._update_ribbon_selection()
+
         if self.last_df is not None:
             messagebox.showinfo("Next Image", f"Autosaved image to {image_path}\nAutosaved counts to {csv_path}") 
         else:
@@ -5997,7 +6412,7 @@ def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_
 
     # Include manual mask edits if provided
     if page_pil is not None:
-        binary = np.array(page_pil) #> 0
+        binary = np.array(page_pil) > 0
 
     logger.debug("Performing distance transform for watershed")
     distance = distance_transform_edt(binary)
@@ -6013,10 +6428,17 @@ def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_
     labels = segmentation.watershed(-distance, markers, mask=binary)
     props = measure.regionprops(labels)
 
-    counts = {}
-    max_zone = max(zone_counters.values()) if zone_counters else 0
-    for i in range(1, max_zone + 1):
-        counts[i] = 0
+    # Initialize counts for all known zones on this page (from zone_names).
+    # This ensures the output spreadsheet lists every named/painted region (with 0 if no cells found).
+    # Also seed from any ids present in the mask (for orphan labels).
+    counts = {int(zid): 0 for zid in (zone_names or {}).keys()}
+    try:
+        m0 = np.array(mask_pil)
+        for z in np.unique(m0):
+            if z > 0:
+                counts.setdefault(int(z), 0)
+    except Exception:
+        pass
     filtered_props = []
 
     # Filter props based on mask and count per zone.
@@ -6049,7 +6471,7 @@ def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_
                 if 0 <= qx < mask_w and 0 <= qy < mask_h:
                     val = mask_arr[qy, qx]
                     if val > 0:
-                        found_zone = val
+                        found_zone = int(val)
                         break
             if found_zone:
                 break
@@ -6059,58 +6481,68 @@ def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_
             counts[found_zone] += 1
             filtered_props.append(prop)
 
-    # Enhanced visualization
-    bg_min = img2d.min()
-    bg_max = img2d.max()
-    norm = (img2d - bg_min) / (bg_max - bg_min) if bg_max > bg_min else np.zeros_like(img2d)
-    img_uint8 = (norm * 255).astype('uint8')
-    img_rgb = np.stack([img_uint8]*3, axis=-1)
-    annotated = Image.fromarray(img_rgb)
-    draw = ImageDraw.Draw(annotated, 'RGBA')
-
+    # Enhanced visualization (wrapped so errors here don't lose the counts/df)
     try:
-        font = ImageFont.truetype("arial.ttf", 12)
+        bg_min = img2d.min()
+        bg_max = img2d.max()
+        norm = (img2d - bg_min) / (bg_max - bg_min) if bg_max > bg_min else np.zeros_like(img2d)
+        img_uint8 = (norm * 255).astype('uint8')
+        img_rgb = np.stack([img_uint8]*3, axis=-1)
+        annotated = Image.fromarray(img_rgb)
+        draw = ImageDraw.Draw(annotated, 'RGBA')
+
+        try:
+            font = ImageFont.truetype("arial.ttf", 12)
+        except Exception:
+            font = ImageFont.load_default()
+
+        # Add cell annotations with improved visibility
+        for i, prop in enumerate(filtered_props, start=1):
+            r, c = prop.centroid
+            draw.ellipse([int(c)-3, int(r)-3, int(c)+3, int(r)+3], outline=(255,0,0,200))
+            draw.text((int(c)+4, int(r)-6), str(i), fill=(255,0,0,200), font=font)
+
+        annotated = annotated.convert('RGBA')
+
+        # Create visualization
+        # Convert the original image to RGB for annotation
+        if background_array.ndim == 2:
+            rgb_img = np.stack([background_array] * 3, axis=-1)
+        else:
+            rgb_img = background_array[..., :3].copy()
+
+        # Draw detected cells
+        for i, prop in enumerate(filtered_props, start=1):
+            y, x = prop.centroid  # y is row, x is column
+            y, x = int(y), int(x)
+            
+            # Draw a small cross marker for each cell
+            marker_size = 3
+            
+            # Draw vertical line
+            y_start = max(0, y - marker_size)
+            y_end = min(rgb_img.shape[0] - 1, y + marker_size + 1)
+            x_pos = min(max(0, x), rgb_img.shape[1] - 1)
+            if y_start < y_end:
+                rgb_img[y_start:y_end, x_pos, :] = [255, 0, 0]
+            
+            # Draw horizontal line
+            x_start = max(0, x - marker_size)
+            x_end = min(rgb_img.shape[1] - 1, x + marker_size + 1)
+            y_pos = min(max(0, y), rgb_img.shape[0] - 1)
+            if x_start < x_end:
+                rgb_img[y_pos, x_start:x_end, :] = [255, 0, 0]
+
+        # Convert to PIL Image
+        annotated = Image.fromarray(rgb_img.astype(np.uint8))
     except Exception:
-        font = ImageFont.load_default()
+        # Fallback: just use a copy of the background as annotated if viz fails
+        if background_array.ndim == 2:
+            rgb_img = np.stack([background_array] * 3, axis=-1)
+        else:
+            rgb_img = background_array[..., :3].copy()
+        annotated = Image.fromarray(rgb_img.astype(np.uint8))
 
-    # Add cell annotations with improved visibility
-    for i, prop in enumerate(filtered_props, start=1):
-        r, c = prop.centroid
-        draw.ellipse([int(c)-3, int(r)-3, int(c)+3, int(r)+3], outline=(255,0,0,200))
-        draw.text((int(c)+4, int(r)-6), str(i), fill=(255,0,0,200), font=font)
-
-    annotated = annotated.convert('RGBA')
-
-    # Create visualization
-    # Convert the original image to RGB for annotation
-    if background_array.ndim == 2:
-        rgb_img = np.stack([background_array] * 3, axis=-1)
-    else:
-        rgb_img = background_array[..., :3].copy()
-
-    # Draw detected cells
-    for i, prop in enumerate(filtered_props, start=1):
-        y, x = prop.centroid  # y is row, x is column
-        y, x = int(y), int(x)
-        
-        # Draw a small cross marker for each cell
-        marker_size = 3
-        
-        # Draw vertical line
-        y_start = max(0, y - marker_size)
-        y_end = min(rgb_img.shape[0] - 1, y + marker_size + 1)
-        x_pos = min(max(0, x), rgb_img.shape[1] - 1)
-        rgb_img[y_start:y_end, x_pos] = [255, 0, 0]
-        
-        # Draw horizontal line
-        x_start = max(0, x - marker_size)
-        x_end = min(rgb_img.shape[1] - 1, x + marker_size + 1)
-        y_pos = min(max(0, y), rgb_img.shape[0] - 1)
-        rgb_img[y_pos, x_start:x_end] = [255, 0, 0]
-
-    # Convert to PIL Image
-    annotated = Image.fromarray(rgb_img.astype(np.uint8))
-    
     # Prepare results DataFrame
     zone_list, count_list = [], []
     for zid in sorted(counts.keys()):
@@ -6213,7 +6645,11 @@ class StateManager:
 
             # Restore data structures
             viewer.zone_counters = state.get("zone_counters", {})
-            viewer.zone_names = state.get("zone_names", {})
+            zn = state.get("zone_names", {})
+            if zn:
+                viewer.zone_names = {pg: {int(k): v for k, v in (zn.get(pg, {}) or {}).items()} for pg in zn}
+            else:
+                viewer.zone_names = {}
             viewer.mask_images = state.get("mask_images", {})
             viewer.base_page_images = state.get("base_page_images", {})
             if hasattr(viewer, 'page_images'):
@@ -6254,7 +6690,8 @@ class StateManager:
             viewer.named_paint_groups = state.get("named_paint_groups", {})
             viewer._paint_group_counter = state.get("_paint_group_counter", 0)
             viewer.paint_layer = state.get("paint_layer")
-            viewer.painted_zone_outlines = state.get("painted_zone_outlines", {})
+            pzo = state.get("painted_zone_outlines", {})
+            viewer.painted_zone_outlines = {int(k): v for k, v in (pzo or {}).items()} if pzo else {}
 
             # Do NOT force _rebuild_paint_layer_from_data here.
             # The paint_layer snapshot from the historical point already contains
