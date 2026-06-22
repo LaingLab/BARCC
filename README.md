@@ -2,15 +2,20 @@
 
 A GUI tool for analyzing immunofluorescence images with atlas region mapping and automated cell counting.
 
-**v8.05.000 Highlights** (current)
-- **Critical fixes for Paint bundles + Count Cells on .tiff**:
-  - Fixed "failed to load paint bundle: ufunc 'less' did not contain a loop with signature matching types (UInt8DType...)" when loading a .barccpaint (with labeled painted regions) onto a .tiff. Root cause was JSON stringifying zone ID keys + uint8 label values from zones.png leading to type-mismatched comparisons inside `_populate_region_list` / `sorted` / ribbon updates after bundle load.
-  - Fixed silent "crash" on Count Cells after loading painted regions from bundle: no dialog shown, no .xlsx generated. Caused by uncaught numpy broadcast errors in cell marker viz drawing (edge/1px cases after window-fit scaling), progress dialog close timing vs results popups, and missing user feedback when directory state was slightly off in browser flows.
-  - Painted region load + name/shape restore + counting now works reliably end-to-end on TIFFs (regions + names appear in Atlas Manager and in the generated spreadsheet).
-- Robustness: zone ID keys normalized to int on every load path (bundle, legacy sidecars, state restore); explicit `int()` on mask-derived IDs; clean bool cell masks for watershed; viz errors wrapped so counts/df are always produced; manual cell-edit masks cleared on new TIFF load; progress dialog closed *before* results popups; always show a dialog even on skipped auto-save.
-- Version bumped to "8.05.000".
+**v8.06.000 Highlights** (current)
+- **Show Zone Labels & Counts** (Cell menu): Opens a table window with zone names and cell counts for the current TIFF (session counts, saved .xlsx/.csv, or defined zones). Total footer, auto-refresh after counting, syncs with file browser.
+- **Count Cells crash fix (Windows):** `_masked.tif` auto-save no longer uses `tiff_deflate` (segfault on many Pillow/libtiff builds). Counting now completes with results dialog and spreadsheet.
+- **Memory / performance:** TIFFs no longer load at full native resolution when the canvas is not laid out; fit-to-window scaling via `_resize_tiff_for_viewer()`.
+- **Count pipeline:** Lightweight paint finalize (no mid-count `stop_paint`); skip redundant watershed when mask exists; try/except/finally + mask shape guards.
+- Version: **8.06.000**. Updated manual and release notes.
 
-See release-notes-v8.05.000.md for full details. v8.04.000 paint border/undo work and earlier remain intact.
+See [release-notes-v8.06.000.md](release-notes-v8.06.000.md) for full details.
+
+**v8.05.000 Highlights** (previous)
+- Paint bundle (.barccpaint) load on TIFF: fixed ufunc 'less' / uint8 zone ID issues; Count Cells silent failure fixes after bundle load; zone ID int normalization.
+- See [release-notes-v8.05.000.md](release-notes-v8.05.000.md).
+
+v8.04.000 paint border/undo work and earlier remain intact.
 
 **v8.04.000 Highlights** (previous)
 - **Painted region border/edge editing with Enter-to-commit**: Live border drag or red-edge grab updates the yellow/orange zone mask (highlighted region) in real time for preview. The black drawn boundary line stays at the previous shape during adjustment. After releasing the mouse, **press Enter** (or keypad Enter) to commit: the current mask contour is extracted, the stored painted outline is updated, the paint layer is rebuilt, and a full redraw refits the visible black boundary exactly to the new expanded/deformed shape. This provides precise "preview then bake" control for custom painted regions.

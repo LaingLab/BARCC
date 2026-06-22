@@ -499,7 +499,8 @@ class PDFViewer:
         self.max_scale = 8.0
 
         # Display options
-        self.show_zone_labels = False
+        self.show_zone_labels_var = tk.BooleanVar(value=False)
+        self.zone_counts_window = None
 
         # Transparent menu / window mode
         self.transparent_mode = tk.BooleanVar(value=False)
@@ -683,13 +684,11 @@ class PDFViewer:
         self.menu.add_cascade(label="Cell", menu=cellmenu)
         cellmenu.add_command(label="Count Cells", command=self.count_cells)
 
-        def toggle_zone_labels():
-            self.show_zone_labels = not self.show_zone_labels
-            self.show_page()
-
-        cellmenu.add_checkbutton(label="Show Zone Labels & Counts", 
-                                 variable=tk.BooleanVar(value=self.show_zone_labels),
-                                 command=toggle_zone_labels)
+        cellmenu.add_checkbutton(
+            label="Show Zone Labels & Counts",
+            variable=self.show_zone_labels_var,
+            command=self._toggle_zone_labels_counts,
+        )
 
 
         # Add highlight regions button to manually enable this
@@ -849,7 +848,7 @@ class PDFViewer:
         self.output.unbind('<Button-3>')
         self.output.bind('<Button-1>', self.highlight_region)
         self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
-        self.menu.delete(8)
+        self._remove_paint_pen_menu_item()
         self.current_state = None
         self.region_move_mode.set(False)
         self.region_translate_active = False
@@ -3114,7 +3113,7 @@ class PDFViewer:
                 return
 
             config_data = {
-                "version": "8.05.000",
+                "version": "8.06.000",
                 "detection_method": self.image_processor.cell_config.detection_method,
                 "cell_detection": self.image_processor.cell_config.__dict__.copy(),
                 "preprocessing": self.image_processor.preprocess_config.__dict__.copy(),
@@ -3632,7 +3631,7 @@ class PDFViewer:
                                    tag='atlas')
 
         # --- Draw Zone Labels and Counts on the main image ---
-        if self.show_zone_labels and self.last_df is not None and self.current_page in self.mask_images:
+        if self.show_zone_labels_var.get() and self.last_df is not None and self.current_page in self.mask_images:
             try:
                 mask = np.array(self.mask_images[self.current_page])
                 mask_h, mask_w = mask.shape
@@ -3791,6 +3790,25 @@ class PDFViewer:
             clear_preprocess_cache()
             self.show_page()
 
+    def _compute_tiff_fit_scale(self, img_w, img_h):
+        """Scale factor to fit a TIFF into the viewer without loading full resolution blindly."""
+        ww = self.output.winfo_width()
+        wh = self.output.winfo_height()
+        if ww <= 1 or wh <= 1:
+            # Canvas not laid out yet (common at startup) — estimate from window size.
+            ww = max(self.master.winfo_width() - 280, 800)
+            wh = max(self.master.winfo_height() - 120, 600)
+        return min(ww / img_w, wh / img_h, 1.0)
+
+    def _resize_tiff_for_viewer(self, bg_RGBA):
+        """Return a display-sized RGBA copy suitable for in-memory processing."""
+        bw, bh = bg_RGBA.size
+        scale = self._compute_tiff_fit_scale(bw, bh)
+        new_size = (max(1, int(bw * scale)), max(1, int(bh * scale)))
+        if new_size == (bw, bh):
+            return bg_RGBA.copy()
+        return bg_RGBA.resize(new_size, Image.BILINEAR)
+
     def import_tiff(self):
         logger.info("Opening file dialog for TIFF selection")
         self.named_paint_groups.clear()
@@ -3849,11 +3867,7 @@ class PDFViewer:
             else:
                 bg_RGBA = bg.convert('RGBA')
 
-            ww, wh = self.output.winfo_width(), self.output.winfo_height()
-            bw, bh = bg_RGBA.size
-            scale = min(ww / bw, wh / bh)
-            new_size = (int(bw * scale), int(bh * scale))
-            self.background_image = bg_RGBA.resize(new_size, Image.BILINEAR)
+            self.background_image = self._resize_tiff_for_viewer(bg_RGBA)
             self.original_background = self.background_image.copy()
 
             # Create fresh transparent paint layer at native resolution
@@ -4160,6 +4174,7 @@ class PDFViewer:
         self.editing_mask = False
         self.current_mask = None
         self.auto_mask = None
+        self.last_df = None
 
         self.tiff_dir = os.path.dirname(tiff_path)
         self.tiff_filename = os.path.splitext(os.path.basename(tiff_path))[0]
@@ -4178,16 +4193,13 @@ class PDFViewer:
             else:
                 bg_RGBA = bg.convert('RGBA')
 
-            ww, wh = self.output.winfo_width(), self.output.winfo_height()
-            bw, bh = bg_RGBA.size
-            scale = min(ww / bw, wh / bh) if ww > 1 and wh > 1 else 1.0
-            new_size = (int(bw * scale), int(bh * scale))
-            self.background_image = bg_RGBA.resize(new_size, Image.BILINEAR)
+            self.background_image = self._resize_tiff_for_viewer(bg_RGBA)
             self.original_background = self.background_image.copy()
 
             self.paint_layer = Image.new('RGBA', self.original_background.size, (0, 0, 0, 0))
 
             self.show_page()
+            self._refresh_zone_counts_table()
 
             # New document loaded via browser — clear undo history (incompatible prior masks).
             try:
@@ -5998,6 +6010,243 @@ class PDFViewer:
         self.show_page()
         self._update_ribbon_selection()
 
+    def _toggle_zone_labels_counts(self):
+        """Show or hide the zone labels & counts table for the current file."""
+        if self.show_zone_labels_var.get():
+            self._open_zone_counts_window()
+        else:
+            self._close_zone_counts_window()
+        self.show_page()
+
+    def _get_zone_counts_dataframe(self):
+        """Return (DataFrame, source_note) for the current file's zone counts."""
+        if self.last_df is not None and not self.last_df.empty:
+            if 'Zone' in self.last_df.columns and 'Cell_Count' in self.last_df.columns:
+                return self.last_df.copy(), "Current session counts"
+
+        saved_df = self._load_saved_counts_df()
+        if saved_df is not None and not saved_df.empty:
+            return saved_df, "Loaded from saved results file"
+
+        page_zones = self.zone_names.get(self.current_page, {})
+        if not page_zones and self.current_page in self.mask_images:
+            try:
+                mask_arr = np.array(self.mask_images[self.current_page])
+                for zid in np.unique(mask_arr):
+                    if int(zid) > 0:
+                        page_zones.setdefault(int(zid), f"Zone {int(zid)}")
+            except Exception:
+                pass
+
+        if page_zones:
+            rows = []
+            for zid in sorted(page_zones.keys(), key=lambda x: int(x) if str(x).isdigit() else str(x)):
+                rows.append({'Zone': page_zones[zid], 'Cell_Count': '—'})
+            return pd.DataFrame(rows), "Zones defined — run Count Cells to populate counts"
+
+        return None, ""
+
+    def _load_saved_counts_df(self):
+        """Load zone counts from a saved CSV/XLSX for the current TIFF, if present."""
+        if not self.tiff_dir or not self.tiff_filename:
+            return None
+
+        base_name = self.tiff_filename
+        directory = self.tiff_dir
+        candidates = [
+            (os.path.join(directory, f"{base_name}.xlsx"), 'xlsx'),
+            (os.path.join(directory, f"{base_name}.csv"), 'csv'),
+            (os.path.join(directory, f"{base_name}_counted.xlsx"), 'xlsx'),
+            (os.path.join(directory, f"{base_name}_counted.csv"), 'csv'),
+            (os.path.join(directory, f"{base_name} - counted.xlsx"), 'xlsx'),
+            (os.path.join(directory, f"{base_name} - counted.csv"), 'csv'),
+            (os.path.join(directory, f"{base_name}_cells.xlsx"), 'xlsx'),
+            (os.path.join(directory, f"{base_name}_cells.csv"), 'csv'),
+        ]
+
+        for path, fmt in candidates:
+            if not os.path.exists(path):
+                continue
+            try:
+                if fmt == 'xlsx':
+                    df = pd.read_excel(path, sheet_name='Cell Counts')
+                else:
+                    df = pd.read_csv(path)
+                if 'Zone' in df.columns and 'Cell_Count' in df.columns:
+                    return df[['Zone', 'Cell_Count']].copy()
+            except Exception as e:
+                logger.debug(f"Could not load counts from {path}: {e}")
+                continue
+        return None
+
+    def _open_zone_counts_window(self):
+        """Open (or refresh) a tabular view of zone names and cell counts."""
+        df, source_note = self._get_zone_counts_dataframe()
+        if df is None or df.empty:
+            self.show_zone_labels_var.set(False)
+            messagebox.showinfo(
+                "No Zones",
+                "No zones are defined for this file.\n\n"
+                "Define regions on the atlas or with the Paint tool, then run Count Cells."
+            )
+            return
+
+        if self.zone_counts_window is not None and self.zone_counts_window.winfo_exists():
+            self._populate_zone_counts_tree(df, source_note)
+            self.zone_counts_window.lift()
+            return
+
+        win = Toplevel(self.master)
+        self.zone_counts_window = win
+        title_name = self.tiff_filename or "current file"
+        win.title(f"Zone Labels & Counts — {title_name}")
+        win.geometry("480x360")
+        win.transient(self.master)
+
+        header = ttk.Frame(win, padding=(8, 8, 8, 4))
+        header.pack(fill='x')
+        ttk.Label(
+            header,
+            text=f"Zone labels and cell counts for {title_name}",
+            font=("Helvetica", 10, "bold"),
+        ).pack(anchor='w')
+        self.zone_counts_source_label = ttk.Label(header, text=source_note, foreground='gray')
+        self.zone_counts_source_label.pack(anchor='w')
+
+        table_frame = ttk.Frame(win, padding=(8, 4, 8, 8))
+        table_frame.pack(fill='both', expand=True)
+
+        columns = ("zone", "count")
+        self.zone_counts_tree = ttk.Treeview(
+            table_frame, columns=columns, show='headings', selectmode='browse'
+        )
+        self.zone_counts_tree.heading("zone", text="Zone")
+        self.zone_counts_tree.heading("count", text="Cell Count")
+        self.zone_counts_tree.column("zone", width=300, anchor='w')
+        self.zone_counts_tree.column("count", width=100, anchor='center')
+
+        yscroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.zone_counts_tree.yview)
+        self.zone_counts_tree.configure(yscrollcommand=yscroll.set)
+        self.zone_counts_tree.pack(side='left', fill='both', expand=True)
+        yscroll.pack(side='right', fill='y')
+
+        footer = ttk.Frame(win, padding=(8, 0, 8, 8))
+        footer.pack(fill='x')
+        self.zone_counts_total_label = ttk.Label(footer, text="")
+        self.zone_counts_total_label.pack(anchor='w')
+
+        def on_close():
+            self.show_zone_labels_var.set(False)
+            self.zone_counts_window = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        self._populate_zone_counts_tree(df, source_note)
+
+    def _populate_zone_counts_tree(self, df, source_note=""):
+        """Fill the zone counts Treeview from a DataFrame."""
+        if not hasattr(self, 'zone_counts_tree') or self.zone_counts_tree is None:
+            return
+        if not self.zone_counts_tree.winfo_exists():
+            return
+
+        for item in self.zone_counts_tree.get_children():
+            self.zone_counts_tree.delete(item)
+
+        total = 0
+        has_numeric_counts = False
+        for _, row in df.iterrows():
+            zone_name = str(row.get('Zone', ''))
+            count_val = row.get('Cell_Count', '')
+            if pd.isna(count_val):
+                count_display = '—'
+            elif isinstance(count_val, (int, float, np.integer, np.floating)):
+                count_display = str(int(count_val))
+                total += int(count_val)
+                has_numeric_counts = True
+            else:
+                count_display = str(count_val)
+                if str(count_val).isdigit():
+                    total += int(count_val)
+                    has_numeric_counts = True
+            self.zone_counts_tree.insert("", "end", values=(zone_name, count_display))
+
+        if hasattr(self, 'zone_counts_source_label') and self.zone_counts_source_label.winfo_exists():
+            self.zone_counts_source_label.config(text=source_note)
+
+        if hasattr(self, 'zone_counts_total_label') and self.zone_counts_total_label.winfo_exists():
+            if has_numeric_counts:
+                self.zone_counts_total_label.config(text=f"Total cells: {total}")
+            else:
+                self.zone_counts_total_label.config(text="")
+
+    def _close_zone_counts_window(self):
+        """Hide the zone counts table window."""
+        if self.zone_counts_window is not None and self.zone_counts_window.winfo_exists():
+            self.zone_counts_window.destroy()
+        self.zone_counts_window = None
+
+    def _refresh_zone_counts_table(self):
+        """Refresh the open zone counts table after counts change."""
+        if not self.show_zone_labels_var.get():
+            return
+        if self.zone_counts_window is None or not self.zone_counts_window.winfo_exists():
+            return
+        df, source_note = self._get_zone_counts_dataframe()
+        if df is not None and not df.empty:
+            self._populate_zone_counts_tree(df, source_note)
+
+    def _remove_paint_pen_menu_item(self):
+        """Remove the transient 'Pen: …' entry added during Start Paint."""
+        try:
+            end = self.menu.index('end')
+            if end is None:
+                return
+            for i in range(end, -1, -1):
+                try:
+                    if str(self.menu.entrycget(i, 'label')).startswith('Pen:'):
+                        self.menu.delete(i)
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _finalize_paint_for_counting(self):
+        """Commit active paint into zones without stop_paint side effects (save_state, save_paint, show_page)."""
+        if getattr(self, 'current_state', None) != 'paint':
+            return
+
+        self.output.unbind('<B1-Motion>')
+        self.output.unbind('<ButtonRelease-1>')
+        self.output.unbind('<Button-1>')
+        self.output.unbind('<Button-3>')
+        self.output.bind('<Button-1>', self.highlight_region)
+        self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
+        self._remove_paint_pen_menu_item()
+        self.current_state = None
+        self.region_move_mode.set(False)
+        self.region_translate_active = False
+        self.region_translate_original_mask = None
+        self.region_translate_zid = None
+        self._update_paint_indicator()
+
+        all_current_groups = set()
+        for item in (self.output.find_withtag('paint') or []):
+            for tag in self.output.gettags(item):
+                if tag.startswith('paintgroup_'):
+                    all_current_groups.add(tag)
+        for gtag in list(self.paint_group_data.keys()):
+            if gtag.startswith('paintgroup_'):
+                all_current_groups.add(gtag)
+        for group_tag in all_current_groups:
+            if group_tag not in self.named_paint_groups:
+                self.named_paint_groups[group_tag] = None
+
+        if self.paint_layer is not None:
+            self._commit_canvas_paint_to_layer()
+        self.output.delete('paint')
+
     def count_cells(self):
         logger.info("Starting cell counting process")
         if self.background_image is None:
@@ -6005,11 +6254,9 @@ class PDFViewer:
             messagebox.showerror("Error", "Please import a TIFF file first.")
             return
 
-        # Automatically stop the paint tool if it's still active.
-        # This ensures any painted regions are committed to the zone system
-        # before we try to count cells.
-        if getattr(self, 'current_state', None) == 'paint':
-            self.stop_paint()
+        # Finalize paint into zones without stop_paint (which runs save_state/save_paint/show_page
+        # and can crash or corrupt UI state mid-count).
+        self._finalize_paint_for_counting()
 
         # Ensure zone structures exist for the current page (important for pure Paint workflows)
         if self.current_page not in self.zone_names:
@@ -6066,153 +6313,155 @@ class PDFViewer:
             return
 
         progress = self._show_busy_dialog("Counting Cells")
-        progress.set_progress(10, "Preparing data...")
+        final_cell_mask = None
+        df = None
+        try:
+            progress.set_progress(10, "Preparing data...")
 
-        # === Build Final Cell Mask ===
-        progress.set_progress(25, "Running cell detection...")
-        if self.original_background is None:
-            if self.background_image is not None:
-                self.original_background = self.background_image.copy()
-            else:
-                if progress and not getattr(progress, 'closed', False):
-                    progress.close()
-                messagebox.showerror("Error", "No original background image available for cell detection.")
-                return
-        background = self.original_background.convert('L')
-        _, auto_labels = binary_mask_cell_count(background, processor=self.image_processor)
-        auto_mask = auto_labels > 0  # Boolean array
+            # === Build Final Cell Mask ===
+            progress.set_progress(25, "Running cell detection...")
+            if self.original_background is None:
+                if self.background_image is not None:
+                    self.original_background = self.background_image.copy()
+                else:
+                    messagebox.showerror("Error", "No original background image available for cell detection.")
+                    return
+            background = self.original_background.convert('L')
+            _, auto_labels = binary_mask_cell_count(background, processor=self.image_processor)
+            auto_mask = np.asarray(auto_labels, dtype=bool).squeeze()
+            if auto_mask.ndim != 2:
+                raise ValueError(f"Cell detection mask must be 2D, got shape {auto_mask.shape}")
 
-        progress.set_progress(45, "Processing manual edits...")
-        # Convert manual edit masks to boolean arrays
-        base_size = background.size
-        add_mask = np.zeros(auto_mask.shape, dtype=bool)
-        remove_mask = np.zeros(auto_mask.shape, dtype=bool)
+            progress.set_progress(45, "Processing manual edits...")
+            base_size = background.size
+            add_mask = np.zeros(auto_mask.shape, dtype=bool)
+            remove_mask = np.zeros(auto_mask.shape, dtype=bool)
 
-        if self.manual_add_mask is not None:
-            logger.debug(f"Manual add mask nonzero pixels: {np.count_nonzero(np.array(self.manual_add_mask))}")
-        if self.manual_remove_mask is not None:
-            logger.debug(f"Manual remove mask nonzero pixels: {np.count_nonzero(np.array(self.manual_remove_mask))}")
+            if self.manual_add_mask is not None:
+                add_mask_arr = np.array(self.manual_add_mask.resize(base_size, Image.NEAREST))
+                if add_mask_arr.ndim > 2:
+                    add_mask_arr = add_mask_arr.squeeze()
+                add_mask = add_mask_arr > 0
 
-        if self.manual_add_mask is not None:
-            add_mask_arr = np.array(self.manual_add_mask.resize(base_size, Image.NEAREST))
-            add_mask = add_mask_arr > 0
+            if self.manual_remove_mask is not None:
+                remove_mask_arr = np.array(self.manual_remove_mask.resize(base_size, Image.NEAREST))
+                if remove_mask_arr.ndim > 2:
+                    remove_mask_arr = remove_mask_arr.squeeze()
+                remove_mask = remove_mask_arr > 0
 
-        if self.manual_remove_mask is not None:
-            remove_mask_arr = np.array(self.manual_remove_mask.resize(base_size, Image.NEAREST))
-            remove_mask = remove_mask_arr > 0
-
-        # Combine all
-        final_cell_mask = (auto_mask | add_mask) & ~remove_mask
-
-        # Convert to PIL (L mode)
-        cell_mask_pil = Image.fromarray((final_cell_mask * 255).astype(np.uint8))
-
-        # Use the region mask (zone map) separately
-        region_mask_pil = self.mask_images[self.current_page]
-
-        progress.set_progress(65, "Counting cells per region...")
-
-        annotated, df, counts = count_cells_in_zones(
-            self.original_background,
-            region_mask_pil,
-            cell_mask_pil,
-            self.img_x,
-            self.img_y,
-            self.zone_counters,
-            self.zone_names.get(self.current_page, {}),
-        )
-
-        self.background_image = annotated
-        self.last_df = df
-
-        progress.set_progress(85, "Generating annotated image...")
-        self.show_page()
-
-        # Close the progress dialog before showing final results popups.
-        # Leaving it open while showing messagebox + later close can cause focus/event
-        # issues or apparent crashes on some systems when the results dialog is dismissed.
-        if progress and not getattr(progress, 'closed', False):
-            progress.set_progress(100, "Done")
-            progress.close()
-
-        # === Prepare save paths (must be before using in early masked save) ===
-        base_name = self.tiff_filename
-        tiff_dir = self.tiff_dir
-
-        # Run the masked overlay save early (before any final popups) so that when the
-        # user dismisses the "Results Saved" dialog there is no further work that could
-        # trigger a crash or bad state.
-        if tiff_dir and base_name and self.original_background is not None:
-            try:
-                orig = self.original_background.convert('RGBA')
-                mask_full = final_cell_mask
-                mask_resized = Image.fromarray((mask_full * 255).astype(np.uint8)).resize(orig.size, Image.NEAREST)
-                overlay = Image.new('RGBA', orig.size, (0, 0, 0, 0))
-                red_layer = Image.new('RGBA', orig.size, (255, 0, 0, 110))
-                overlay.paste(red_layer, mask=mask_resized)
-                masked_img = Image.alpha_composite(orig, overlay)
-                masked_path = os.path.join(tiff_dir, f"{base_name}_masked.tif")
-                masked_img.save(masked_path, compression='tiff_deflate')
-                logger.info(f"Masked image saved: {masked_path}")
-            except Exception as e:
-                logger.error(f"Failed to save _masked.tif: {e}")
-
-        # === Automatic saving of results (new in 8.01, improved in 8.02) ===
-
-        # 1. Save Excel file with two sheets (Counts + Detection Parameters)
-        excel_saved = False
-        if tiff_dir and base_name:
-            xlsx_path = os.path.join(tiff_dir, f"{base_name}.xlsx")
-            for engine in ['openpyxl', 'xlsxwriter']:
-                try:
-                    with pd.ExcelWriter(xlsx_path, engine=engine) as writer:
-                        df.to_excel(writer, sheet_name="Cell Counts", index=False)
-
-                        # Metadata sheet with all detection parameters
-                        meta_data = []
-                        cfg = self.image_processor.cell_config
-                        pcfg = self.image_processor.preprocess_config
-
-                        for k, v in cfg.__dict__.items():
-                            meta_data.append({"Category": "Cell Detection", "Parameter": k, "Value": str(v)})
-
-                        for k, v in pcfg.__dict__.items():
-                            meta_data.append({"Category": "Preprocessing", "Parameter": k, "Value": str(v)})
-
-                        meta_df = pd.DataFrame(meta_data)
-                        meta_df.to_excel(writer, sheet_name="Detection Parameters", index=False)
-
-                    messagebox.showinfo("Results Saved", f"Excel file saved:\n{xlsx_path}")
-                    excel_saved = True
-                    break
-                except Exception:
-                    continue  # try next engine
-
-            if not excel_saved:
-                # Final fallback to CSV
-                try:
-                    csv_path = os.path.join(tiff_dir, f"{base_name}.csv")
-                    df.to_csv(csv_path, index=False)
-                    messagebox.showwarning(
-                        "Excel Export Failed",
-                        f"Could not save as Excel (openpyxl or xlsxwriter not installed).\n"
-                        f"Fell back to CSV:\n{csv_path}\n\n"
-                        f"To enable .xlsx output with metadata sheet, run:\n"
-                        f"pip install openpyxl xlsxwriter"
+            if add_mask.shape != auto_mask.shape:
+                add_mask = np.array(
+                    Image.fromarray(add_mask.astype(np.uint8) * 255).resize(
+                        (auto_mask.shape[1], auto_mask.shape[0]), Image.NEAREST
                     )
-                except Exception as e:
-                    logger.error(f"CSV fallback also failed: {e}")
-        else:
-            logger.warning("Skipping auto-save of count results (missing tiff_dir or base_name)")
-            try:
-                messagebox.showinfo("Count Complete", "Cells counted. No working TIFF directory was set, so no Excel/CSV was auto-saved.")
-            except Exception:
-                pass
+                ) > 0
+            if remove_mask.shape != auto_mask.shape:
+                remove_mask = np.array(
+                    Image.fromarray(remove_mask.astype(np.uint8) * 255).resize(
+                        (auto_mask.shape[1], auto_mask.shape[0]), Image.NEAREST
+                    )
+                ) > 0
 
-        # Refresh file browser so the "counted" indicator updates
-        # (the progress dialog was already closed above before any results popups)
-        if hasattr(self, 'tiff_tree') and self.current_tiff_directory:
-            self.master.after(300, self.refresh_tiff_file_list)
+            final_cell_mask = (auto_mask | add_mask) & ~remove_mask
+            cell_mask_pil = Image.fromarray((final_cell_mask * 255).astype(np.uint8))
+
+            region_mask_pil = self.mask_images[self.current_page]
+            model_img_x = self.img_x / self.view_scale if self.view_scale else self.img_x
+            model_img_y = self.img_y / self.view_scale if self.view_scale else self.img_y
+
+            progress.set_progress(65, "Counting cells per region...")
+
+            annotated, df, counts = count_cells_in_zones(
+                self.original_background,
+                region_mask_pil,
+                cell_mask_pil,
+                model_img_x,
+                model_img_y,
+                self.zone_counters,
+                self.zone_names.get(self.current_page, {}),
+            )
+
+            self.background_image = annotated
+            self.last_df = df
+
+            progress.set_progress(85, "Generating annotated image...")
+            self.show_page()
+            self._refresh_zone_counts_table()
+
+            if progress and not getattr(progress, 'closed', False):
+                progress.set_progress(100, "Done")
+                progress.close()
+                progress = None
+
+            base_name = self.tiff_filename
+            tiff_dir = self.tiff_dir
+
+            if tiff_dir and base_name and self.original_background is not None and final_cell_mask is not None:
+                try:
+                    orig = self.original_background.convert('RGBA')
+                    mask_resized = Image.fromarray((final_cell_mask * 255).astype(np.uint8)).resize(orig.size, Image.NEAREST)
+                    overlay = Image.new('RGBA', orig.size, (0, 0, 0, 0))
+                    red_layer = Image.new('RGBA', orig.size, (255, 0, 0, 110))
+                    overlay.paste(red_layer, mask=mask_resized)
+                    masked_img = Image.alpha_composite(orig, overlay)
+                    masked_path = os.path.join(tiff_dir, f"{base_name}_masked.tif")
+                    # Avoid tiff_deflate — it segfaults some Pillow/libtiff builds on Windows.
+                    masked_img.save(masked_path)
+                    logger.info(f"Masked image saved: {masked_path}")
+                except Exception as e:
+                    logger.error(f"Failed to save _masked.tif: {e}")
+
+            excel_saved = False
+            if tiff_dir and base_name and df is not None:
+                xlsx_path = os.path.join(tiff_dir, f"{base_name}.xlsx")
+                for engine in ['openpyxl', 'xlsxwriter']:
+                    try:
+                        with pd.ExcelWriter(xlsx_path, engine=engine) as writer:
+                            df.to_excel(writer, sheet_name="Cell Counts", index=False)
+                            meta_data = []
+                            cfg = self.image_processor.cell_config
+                            pcfg = self.image_processor.preprocess_config
+                            for k, v in cfg.__dict__.items():
+                                meta_data.append({"Category": "Cell Detection", "Parameter": k, "Value": str(v)})
+                            for k, v in pcfg.__dict__.items():
+                                meta_data.append({"Category": "Preprocessing", "Parameter": k, "Value": str(v)})
+                            meta_df = pd.DataFrame(meta_data)
+                            meta_df.to_excel(writer, sheet_name="Detection Parameters", index=False)
+                        messagebox.showinfo("Results Saved", f"Excel file saved:\n{xlsx_path}")
+                        excel_saved = True
+                        break
+                    except Exception:
+                        continue
+
+                if not excel_saved:
+                    try:
+                        csv_path = os.path.join(tiff_dir, f"{base_name}.csv")
+                        df.to_csv(csv_path, index=False)
+                        messagebox.showwarning(
+                            "Excel Export Failed",
+                            f"Could not save as Excel (openpyxl or xlsxwriter not installed).\n"
+                            f"Fell back to CSV:\n{csv_path}\n\n"
+                            f"To enable .xlsx output with metadata sheet, run:\n"
+                            f"pip install openpyxl xlsxwriter"
+                        )
+                    except Exception as e:
+                        logger.error(f"CSV fallback also failed: {e}")
+            else:
+                logger.warning("Skipping auto-save of count results (missing tiff_dir or base_name)")
+                try:
+                    messagebox.showinfo("Count Complete", "Cells counted. No working TIFF directory was set, so no Excel/CSV was auto-saved.")
+                except Exception:
+                    pass
+
+            if hasattr(self, 'tiff_tree') and self.current_tiff_directory:
+                self.master.after(300, self.refresh_tiff_file_list)
+
+        except Exception as e:
+            logger.error(f"Cell counting failed: {e}", exc_info=True)
+            messagebox.showerror("Count Failed", f"Cell counting failed:\n{e}")
+        finally:
+            if progress and not getattr(progress, 'closed', False):
+                progress.close()
 
     def show_cell_mask_threshold(self, event=None, calculate=True):
         """Display the combined (auto + manual) mask overlay"""
@@ -6407,26 +6656,41 @@ def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_
     # Normalize to float [0, 1]
     background_norm = (background_gray - background_gray.min()) / (background_gray.max() - background_gray.min() + 1e-8)
     
-    # Detect cells
-    img2d, binary = binary_mask_cell_count(Image.fromarray((background_norm * 255).astype(np.uint8)))
+    img2d = background_norm
 
-    # Include manual mask edits if provided
     if page_pil is not None:
-        binary = np.array(page_pil) > 0
+        # Caller already ran detection and merged manual edits — avoid a second
+        # detect + watershed pass (crashes/OOM on large microscopy frames).
+        binary = np.asarray(page_pil)
+        if binary.ndim > 2:
+            binary = binary.squeeze()
+        binary = binary > 0
+        labels = measure.label(binary)
+        props = measure.regionprops(labels)
+    else:
+        # Legacy path when no precomputed mask is supplied.
+        _, binary = binary_mask_cell_count(Image.fromarray((background_norm * 255).astype(np.uint8)))
+        binary = np.asarray(binary, dtype=bool)
 
-    logger.debug("Performing distance transform for watershed")
-    distance = distance_transform_edt(binary)
+        logger.debug("Performing distance transform for watershed")
+        distance = distance_transform_edt(binary)
 
-    # Find local maxima as markers
-    coords = feature.peak_local_max(distance, min_distance=5, exclude_border=True)
-    markers = np.zeros(distance.shape, dtype=bool)
-    if coords.size:
-        markers[tuple(coords.T)] = True
-    markers = measure.label(markers)
+        try:
+            coords = feature.peak_local_max(distance, min_distance=5, exclude_border=True)
+        except TypeError:
+            coords = feature.peak_local_max(distance, min_distance=5)
+        if isinstance(coords, tuple):
+            coords = np.column_stack(coords)
+        markers = np.zeros(distance.shape, dtype=bool)
+        if getattr(coords, 'size', 0):
+            markers[tuple(coords.T)] = True
+        markers = measure.label(markers)
 
-    # Watershed segmentation
-    labels = segmentation.watershed(-distance, markers, mask=binary)
-    props = measure.regionprops(labels)
+        if markers.max() == 0:
+            labels = measure.label(binary)
+        else:
+            labels = segmentation.watershed(-distance, markers, mask=binary)
+        props = measure.regionprops(labels)
 
     # Initialize counts for all known zones on this page (from zone_names).
     # This ensures the output spreadsheet lists every named/painted region (with 0 if no cells found).

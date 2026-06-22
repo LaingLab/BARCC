@@ -22,7 +22,7 @@ import os
 # ============================================================================
 MANUAL_TITLE = "BARCC - Brain Atlas Regional Cell Counter"
 MANUAL_SUBTITLE = "User Manual"
-VERSION = "8.05.000"
+VERSION = "8.06.000"
 OUTPUT_FILENAME = "BARCC_User_Manual.pdf"
 OUTPUT_DIR = ".."  # Place PDF in repository root
 
@@ -367,6 +367,43 @@ def build_manual():
     # ------------------------------------------------------------------
     # 2. INSTALLATION
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # What's New — 8.06.000
+    # ------------------------------------------------------------------
+    pdf.chapter_title("What's New in Version 8.06.000", 0)
+
+    pdf.body(
+        "BARCC 8.06.000 is a stability and usability release focused on Count Cells reliability and the Zone Labels & Counts viewer."
+    )
+
+    pdf.bullet_list([
+        "Show Zone Labels & Counts now works: Cell > \"Show Zone Labels & Counts\" opens a dedicated table window listing every zone name and its cell count for the current file. Data comes from the latest Count Cells run, saved .xlsx/.csv results in the TIFF folder, or defined zone names (with dashes if not yet counted). A total row appears when numeric counts are available. The window refreshes after counting and when switching files in the left browser.",
+        "Fixed hard crash at end of Count Cells on Windows: Saving the automatic `_masked.tif` overlay used `compression='tiff_deflate'`, which can segfault some Pillow/libtiff builds. The masked image is now saved as a standard uncompressed TIFF (same filename, stable on all platforms).",
+        "Fixed Count Cells loading full-resolution TIFFs into memory when the canvas was not yet laid out (1x1 pixel at startup), which caused extreme slowdowns and apparent crashes on large microscopy frames. TIFFs now scale to fit the viewer window using screen/window dimensions as a fallback.",
+        "Count Cells no longer calls the full Stop Paint path mid-count (which triggered save_state, save_paint, menu corruption, and extra redraws). A lightweight finalize step commits paint strokes to zones without UI side effects.",
+        "Faster, safer per-zone counting: when a final cell mask is already computed, the redundant second watershed pass is skipped (connected components are used instead).",
+        "Additional guards: try/except around the full count pipeline with user-visible error dialogs; 2D mask shape validation; progress dialog always closes in a finally block.",
+    ])
+
+    pdf.body(
+        "Together these changes make Count Cells complete reliably on typical Windows installations and give users an immediate tabular summary of regional results."
+    )
+
+    # ------------------------------------------------------------------
+    # What's New — 8.05.000
+    # ------------------------------------------------------------------
+    pdf.chapter_title("What's New in Version 8.05.000", 0)
+
+    pdf.body(
+        "BARCC 8.05.000 fixed critical issues when loading painted region bundles (.barccpaint) onto TIFFs and running Count Cells."
+    )
+
+    pdf.bullet_list([
+        "Fixed \"ufunc 'less'\" error when loading .barccpaint bundles with named painted regions (JSON string zone IDs vs uint8 mask labels).",
+        "Fixed silent Count Cells failures after bundle load: numpy edge cases in marker drawing, progress dialog timing vs results popups, and missing feedback when save paths were unset.",
+        "Zone ID keys normalized to int on every load path; manual cell-edit masks cleared on new TIFF load.",
+    ])
+
     # ------------------------------------------------------------------
     # What's New — 8.04.000
     # ------------------------------------------------------------------
@@ -1238,6 +1275,13 @@ def build_manual():
     )
 
     pdf.body(
+        "To review results without re-running detection, use Cell > \"Show Zone Labels & Counts\". "
+        "This opens a table window with Zone and Cell Count columns for the current TIFF. "
+        "Toggle the same menu item again (or close the window) to hide it. Yellow on-image labels "
+        "also appear when counts are in memory and the option is enabled."
+    )
+
+    pdf.body(
         "BARCC will compute the number of detected cells within each named region. "
         "Results are now saved **automatically** (no file dialog) with the following files created in the same folder as your source TIFF:"
     )
@@ -1306,6 +1350,8 @@ def build_manual():
     pdf.body("- Too many false positives: Increase Min Cell Size and Circularity Threshold.")
     pdf.body("- Atlas looks blurry: Re-render at higher zoom or adjust brightness settings.")
     pdf.body("- Performance is slow: Close other applications; very large images benefit from 16 GB+ RAM.")
+    pdf.body("- Count Cells crashes or hangs: Ensure you are on v8.06.000+ (fixes Windows TIFF deflate crash and full-resolution load issues). Re-import the TIFF if it was opened before the window finished drawing.")
+    pdf.body("- Show Zone Labels & Counts appears empty: Define regions and run Count Cells first, or ensure a matching .xlsx/.csv exists beside the TIFF.")
 
     pdf.chapter_title("Getting Help", 1)
     pdf.body(
