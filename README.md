@@ -2,7 +2,16 @@
 
 A GUI tool for analyzing immunofluorescence images with atlas region mapping and automated cell counting.
 
-**v8.06.000 Highlights** (current)
+**v8.07.000 Highlights** (current)
+- **Save Flattened Image now fully flattens the mask**: TIFF base + yellow filled painted region areas (from the zone `mask_images`, so regions are area-filled not just boundaries) + black paint boundaries (`paint_layer`) + red masked cells (from last Count, properly alpha-blended). Previously only included paint + base image.
+- Uses `alpha_composite` for clean layering. Default filename is `{original}_flattened.tif` (with correct initial directory).
+- Works for both the menu command and internal autosave (Next Image etc.).
+- Overlay code hardened with size guards, 2D handling, and try/except so partial failures don't crash (base is always saved).
+- Version: **8.07.000**.
+
+See [release-notes-v8.07.000.md](release-notes-v8.07.000.md) for full details.
+
+**v8.06.000 Highlights** (previous)
 - **Show Zone Labels & Counts** (Cell menu): Opens a table window with zone names and cell counts for the current TIFF (session counts, saved .xlsx/.csv, or defined zones). Total footer, auto-refresh after counting, syncs with file browser.
 - **Count Cells crash fix (Windows):** `_masked.tif` auto-save no longer uses `tiff_deflate` (segfault on many Pillow/libtiff builds). Counting now completes with results dialog and spreadsheet.
 - **Memory / performance:** TIFFs no longer load at full native resolution when the canvas is not laid out; fit-to-window scaling via `_resize_tiff_for_viewer()`.

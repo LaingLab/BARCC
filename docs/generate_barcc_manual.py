@@ -22,7 +22,7 @@ import os
 # ============================================================================
 MANUAL_TITLE = "BARCC - Brain Atlas Regional Cell Counter"
 MANUAL_SUBTITLE = "User Manual"
-VERSION = "8.06.000"
+VERSION = "8.07.000"
 OUTPUT_FILENAME = "BARCC_User_Manual.pdf"
 OUTPUT_DIR = ".."  # Place PDF in repository root
 

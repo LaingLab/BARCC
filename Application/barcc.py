@@ -546,6 +546,7 @@ class PDFViewer:
 
         # Last DF for counts
         self.last_df = None
+        self.last_cell_mask = None  # for flattened save including masked cells
 
         # Brightness
         self.brightness = 0.0
@@ -3113,7 +3114,7 @@ class PDFViewer:
                 return
 
             config_data = {
-                "version": "8.06.000",
+                "version": "8.07.000",
                 "detection_method": self.image_processor.cell_config.detection_method,
                 "cell_detection": self.image_processor.cell_config.__dict__.copy(),
                 "preprocessing": self.image_processor.preprocess_config.__dict__.copy(),
@@ -3524,6 +3525,21 @@ class PDFViewer:
             logger.debug(f"Loaded page image: mode={current_img.mode}, size={current_img.size}")
             return current_img
 
+        # No atlas_filetype (e.g. after reset or pure TIFF/paint start) or page not populated:
+        # return/provide a safe blank so show_page doesn't crash on KeyError.
+        if self.current_page not in self.page_images:
+            if getattr(self, 'img', None) is not None:
+                img = self.img
+                if self.current_page not in getattr(self, 'base_page_images', {}):
+                    self.base_page_images[self.current_page] = img.copy()
+                self.page_images[self.current_page] = img
+            else:
+                img = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
+                self.page_images[self.current_page] = img
+        current_img = self.page_images[self.current_page]
+        logger.debug(f"Loaded page image: mode={current_img.mode}, size={current_img.size}")
+        return current_img
+
     def show_page(self, mask=None):
         if mask is None:
             self.showing_auto_mask = False
@@ -3818,6 +3834,7 @@ class PDFViewer:
         self.view_scale = 1.0
         self.img_x = 0
         self.img_y = 0
+        self.last_cell_mask = None
 
         # Full reset of zone/mask system on every new image load.
         # This ensures painted regions from previous images do not leak into new ones.
@@ -4147,6 +4164,7 @@ class PDFViewer:
         self.view_scale = 1.0
         self.img_x = 0
         self.img_y = 0
+        self.last_cell_mask = None
 
         # Also clear any stale region selection / edge edit state (same as import_tiff).
         self.selected_zone_id = None
@@ -4213,80 +4231,186 @@ class PDFViewer:
 
     def save_flattened_image(self, event=None):
         logger.info("Attempting to save flattened image")
-        if self.background_image is None or self.current_page not in self.page_images:
-            logger.warning("Save flattened image failed: Missing TIFF or PDF file")
-            messagebox.showerror("Error", "Please import a TIFF and open a PDF file first.")
+        # Support TIFF + paint + count workflows even without page_images entry
+        base_img = getattr(self, 'original_background', None) or getattr(self, 'background_image', None)
+        if base_img is None or not hasattr(base_img, 'size') or base_img.size[0] <= 0 or base_img.size[1] <= 0:
+            logger.warning("Save flattened image failed: No valid background image")
+            messagebox.showerror("Error", "Please load a valid TIFF image first.")
             return
 
-        bg_img = self.background_image
-        at_img = self.page_images[self.current_page]
+        bg_w, bg_h = base_img.size
 
-        bg_w, bg_h = bg_img.size
-        at_w, at_h = at_img.size
+        # Start with base TIFF as RGBA
+        composite = base_img.convert('RGBA')
 
-        left = min(0, self.img_x)
-        top = min(0, self.img_y)
-        right = max(bg_w, self.img_x + at_w)
-        bottom = max(bg_h, self.img_y + at_h)
+        # Use integer offsets (img_x/y can become float after zoom)
+        paste_x = int(self.img_x) if self.img_x is not None else 0
+        paste_y = int(self.img_y) if self.img_y is not None else 0
 
-        width = right - left
-        height = bottom - top
+        try:
+            # Explicit zone mask fill (yellow for painted regions) so filled areas are visible in flat.
+            # (The page_images tint may only tint stroke pixels in paint-on-TIFF flows, not fill the region.)
+            if self.current_page in getattr(self, 'mask_images', {}) and self.mask_images.get(self.current_page) is not None:
+                try:
+                    m = np.array(self.mask_images[self.current_page])
+                    if m.shape[:2] != (bg_h, bg_w):
+                        m_pil = Image.fromarray(m.astype(np.uint8), mode='L').resize((bg_w, bg_h), Image.NEAREST)
+                        m = np.array(m_pil)
+                    zone_tint = np.zeros((bg_h, bg_w, 4), dtype=np.uint8)
+                    for zid in np.unique(m):
+                        if zid == 0:
+                            continue
+                        reg = (m == zid)
+                        zone_tint[reg, :3] = [255, 255, 0]  # yellow
+                        zone_tint[reg, 3] = 55  # visible fill in flattened
+                    if np.any(zone_tint[..., 3] > 0):
+                        zone_img = Image.fromarray(zone_tint, 'RGBA')
+                        composite = Image.alpha_composite(composite, zone_img)
+                except Exception as e:
+                    logger.debug(f"Could not apply zone mask fill: {e}")
 
-        base = Image.new('RGBA', (width, height), (255, 255, 255, 255))
+            # Overlay zone tints / atlas content if present (yellow/orange painted or atlas regions)
+            if self.current_page in getattr(self, 'page_images', {}):
+                at_img = self.page_images[self.current_page]
+                if at_img.mode != 'RGBA':
+                    at_img = at_img.convert('RGBA')
+                composite.paste(at_img, (paste_x, paste_y), at_img)
 
-        bg_offset_x = -left
-        bg_offset_y = -top
-        # base.paste(bg_img, (bg_offset_x, bg_offset_y), bg_img)
-        base.paste(bg_img, (bg_offset_x, bg_offset_y))
+            # Overlay painted regions (black boundaries from paint tool)
+            if getattr(self, 'paint_layer', None) is not None:
+                pl = self.paint_layer
+                if pl.mode != 'RGBA':
+                    pl = pl.convert('RGBA')
+                # Paint is registered to background pixel space (usually at 0,0 after bundle load)
+                composite.paste(pl, (0, 0), pl)
 
-        at_offset_x = self.img_x - left
-        at_offset_y = self.img_y - top
-        base.paste(at_img, (at_offset_x, at_offset_y), at_img)
+            # Overlay masked cells (red semi-transparent from last Count Cells) using alpha_composite for proper blending
+            if getattr(self, 'last_cell_mask', None) is not None:
+                try:
+                    cell_mask = np.asarray(self.last_cell_mask).squeeze()
+                    if cell_mask.ndim != 2:
+                        if cell_mask.size > 0:
+                            cell_mask = cell_mask.reshape(cell_mask.shape[0], -1)
+                        else:
+                            cell_mask = np.zeros((bg_h, bg_w), dtype=bool)
+                    cell_mask = (cell_mask > 0)
+                    if cell_mask.shape[:2] != (bg_h, bg_w):
+                        cm_pil = Image.fromarray((cell_mask.astype(np.uint8) * 255).astype(np.uint8), mode='L')
+                        cm_pil = cm_pil.resize((bg_w, bg_h), Image.NEAREST)
+                        cell_mask = np.array(cm_pil) > 0
+                    cell_mask_pil = Image.fromarray((cell_mask.astype(np.uint8) * 255).astype(np.uint8), mode='L')
+                    overlay = Image.new('RGBA', (bg_w, bg_h), (0, 0, 0, 0))
+                    red_layer = Image.new('RGBA', (bg_w, bg_h), (255, 0, 0, 120))
+                    overlay.paste(red_layer, mask=cell_mask_pil)
+                    composite = Image.alpha_composite(composite, overlay)
+                except Exception as e:
+                    logger.debug(f"Could not overlay cell mask: {e}")
+        except Exception as e:
+            logger.debug(f"Could not apply overlays in flattened save (saving base only): {e}")
 
-        final = base.convert('RGB')
+        final = composite.convert('RGB')
 
-        save_path = fd.asksaveasfilename(title="Save Flattened Image", defaultextension=".jpg", filetypes=[("JPEG files", "*.jpg")])
+        # Default filename: original image name + _flattened + .tif
+        default_name = "flattened.tif"
+        if getattr(self, 'tiff_filename', None):
+            default_name = f"{self.tiff_filename}_flattened.tif"
+
+        initialdir = getattr(self, 'tiff_dir', None) or getattr(self, 'current_tiff_directory', None) or "."
+        save_path = fd.asksaveasfilename(
+            title="Save Flattened Image",
+            initialdir=initialdir,
+            initialfile=default_name,
+            defaultextension=".tif",
+            filetypes=[("TIFF files", "*.tif *.tiff"), ("JPEG files", "*.jpg"), ("All files", "*.*")]
+        )
         if save_path:
-            final.save(save_path)
-            messagebox.showinfo("Image Saved", f"Flattened image saved to: {save_path}")
+            try:
+                # Do not pass compression='tiff_deflate' — it can segfault on some Windows Pillow + libtiff builds.
+                # Just use default save for .tif (like the internal _masked.tif logic).
+                final.save(save_path)  # plain save to avoid segfaults on some Windows + Pillow + libtiff combos
+                messagebox.showinfo("Image Saved", f"Flattened image (TIFF + painted regions + masked cells) saved to: {save_path}")
+            except Exception as e:
+                logger.error(f"Failed to save flattened: {e}")
+                messagebox.showerror("Save Error", f"Could not save the image:\n{e}")
 
     def autosave_flattened_image(self, filename):
-        if self.background_image is None or self.current_page not in self.page_images:
+        base_img = getattr(self, 'original_background', None) or getattr(self, 'background_image', None)
+        if base_img is None or not hasattr(base_img, 'size') or base_img.size[0] <= 0 or base_img.size[1] <= 0:
             return
 
-        # Get the background and atlas images
-        bg_img = self.background_image
-        at_img = self.page_images[self.current_page]
-        
-        # Get dimensions
-        bg_w, bg_h = bg_img.size
-        at_w, at_h = at_img.size
+        bg_w, bg_h = base_img.size
 
-        # Calculate the canvas size needed
-        left = min(0, self.img_x)
-        top = min(0, self.img_y)
-        right = max(bg_w, self.img_x + at_w)
-        bottom = max(bg_h, self.img_y + at_h)
-        width = right - left
-        height = bottom - top
+        # Start with base
+        composite = base_img.convert('RGBA')
 
-        # Create a new RGB image with white background
-        base = Image.new('RGB', (width, height), (255, 255, 255))
+        paste_x = int(self.img_x) if self.img_x is not None else 0
+        paste_y = int(self.img_y) if self.img_y is not None else 0
 
-        # First paste the background image without transparency
-        bg_rgb = bg_img.convert('RGB')
-        base.paste(bg_rgb, (-left, -top))
+        try:
+            # Explicit zone mask fill (yellow for painted regions) so filled areas are visible in flat.
+            if self.current_page in getattr(self, 'mask_images', {}) and self.mask_images.get(self.current_page) is not None:
+                try:
+                    m = np.array(self.mask_images[self.current_page])
+                    if m.shape[:2] != (bg_h, bg_w):
+                        m_pil = Image.fromarray(m.astype(np.uint8), mode='L').resize((bg_w, bg_h), Image.NEAREST)
+                        m = np.array(m_pil)
+                    zone_tint = np.zeros((bg_h, bg_w, 4), dtype=np.uint8)
+                    for zid in np.unique(m):
+                        if zid == 0:
+                            continue
+                        reg = (m == zid)
+                        zone_tint[reg, :3] = [255, 255, 0]
+                        zone_tint[reg, 3] = 55
+                    if np.any(zone_tint[..., 3] > 0):
+                        zone_img = Image.fromarray(zone_tint, 'RGBA')
+                        composite = Image.alpha_composite(composite, zone_img)
+                except Exception:
+                    pass
 
-        # Then paste the atlas with transparency
-        if at_img.mode == 'RGBA':
-            # Extract the alpha channel to use as mask
-            r, g, b, a = at_img.split()
-            at_rgb = Image.merge('RGB', (r, g, b))
-            base.paste(at_rgb, (self.img_x - left, self.img_y - top), a)
-        else:
-            base.paste(at_img, (self.img_x - left, self.img_y - top))
+            # Overlay page/atlas tints if present
+            if self.current_page in getattr(self, 'page_images', {}):
+                at_img = self.page_images[self.current_page]
+                if at_img.mode != 'RGBA':
+                    at_img = at_img.convert('RGBA')
+                composite.paste(at_img, (paste_x, paste_y), at_img)
 
-        base.save(filename)
+            # Overlay painted regions
+            if getattr(self, 'paint_layer', None) is not None:
+                pl = self.paint_layer
+                if pl.mode != 'RGBA':
+                    pl = pl.convert('RGBA')
+                composite.paste(pl, (0, 0), pl)
+
+            # Overlay masked cells if available using alpha_composite (safe pattern)
+            if getattr(self, 'last_cell_mask', None) is not None:
+                try:
+                    cell_mask = np.asarray(self.last_cell_mask).squeeze()
+                    if cell_mask.ndim != 2:
+                        if cell_mask.size > 0:
+                            cell_mask = cell_mask.reshape(cell_mask.shape[0], -1)
+                        else:
+                            cell_mask = np.zeros((bg_h, bg_w), dtype=bool)
+                    cell_mask = (cell_mask > 0)
+                    if cell_mask.shape[:2] != (bg_h, bg_w):
+                        cm_pil = Image.fromarray((cell_mask.astype(np.uint8) * 255).astype(np.uint8), mode='L')
+                        cm_pil = cm_pil.resize((bg_w, bg_h), Image.NEAREST)
+                        cell_mask = np.array(cm_pil) > 0
+                    cell_mask_pil = Image.fromarray((cell_mask.astype(np.uint8) * 255).astype(np.uint8), mode='L')
+                    overlay = Image.new('RGBA', (bg_w, bg_h), (0, 0, 0, 0))
+                    red_layer = Image.new('RGBA', (bg_w, bg_h), (255, 0, 0, 120))
+                    overlay.paste(red_layer, mask=cell_mask_pil)
+                    composite = Image.alpha_composite(composite, overlay)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        final = composite.convert('RGB')
+        try:
+            # Do not pass compression='tiff_deflate' — it can segfault on some Windows Pillow + libtiff builds.
+            final.save(filename)
+        except Exception as e:
+            logger.error(f"Autosave flattened failed: {e}")
 
     def toggle_crop_mode(self):
         self.save_state()
@@ -6363,6 +6487,7 @@ class PDFViewer:
                 ) > 0
 
             final_cell_mask = (auto_mask | add_mask) & ~remove_mask
+            self.last_cell_mask = final_cell_mask
             cell_mask_pil = Image.fromarray((final_cell_mask * 255).astype(np.uint8))
 
             region_mask_pil = self.mask_images[self.current_page]
@@ -6544,30 +6669,41 @@ class PDFViewer:
         PDFViewer()
 
     def next_image(self):
-        logger.info("Processing next image")
-        if self.tiff_filename is None:
-            logger.warning("Next image failed: No TIFF loaded")
-            messagebox.showerror("Error", "No TIFF loaded.")
-            return
+        """Clear all loaded images, paint, zones, counts, and overlays so the user
+        can start over with a fresh canvas (as if the app was just opened), while
+        preserving the current directory and file browser tree so they can pick
+        the next image from the list.
+        """
+        logger.info("Processing next image / reset for new image")
 
-        image_path = os.path.join(self.tiff_dir, f"{self.tiff_filename}_counted.jpg")
-        csv_path = os.path.join(self.tiff_dir, f"{self.tiff_filename}_data.csv")
+        # Autosave current state if we have content (using flattened which now includes paint + cells)
+        did_autosave = False
+        if getattr(self, 'original_background', None) or getattr(self, 'background_image', None):
+            try:
+                if self.tiff_dir and self.tiff_filename:
+                    image_path = os.path.join(self.tiff_dir, f"{self.tiff_filename}_flattened.tif")
+                    self.autosave_flattened_image(image_path)
+                    did_autosave = True
+                if self.last_df is not None and self.tiff_dir and self.tiff_filename:
+                    csv_path = os.path.join(self.tiff_dir, f"{self.tiff_filename}_counts.csv")
+                    self.last_df.to_csv(csv_path, index=False)
+            except Exception as e:
+                logger.warning(f"Autosave on next image failed: {e}")
 
-        self.autosave_flattened_image(image_path)
+        # Preserve directory and browser state
+        saved_current_dir = getattr(self, 'current_tiff_directory', None)
+        saved_tree = getattr(self, 'tiff_tree', None)
+        saved_iid_map = getattr(self, '_tree_iid_to_path', None)
+        saved_file_list = getattr(self, 'tiff_file_list', None)
+        saved_folder_label = getattr(self, 'folder_label', None)
 
-        if self.last_df is not None:
-            self.last_df.to_csv(csv_path, index=False)
-
-        # This is SO UGLY, see if there is a cleaner way to re-init tkinter without breaking everything
-        # Could I do .destroy() and then call the program again?
         clear_preprocess_cache()
-        self.preprocess_image = None
-        self.background_image = None
-        self.original_background = None
-        self.img = None
-        self.atlas_filetype = None
+
+        # Full reset of loaded content and analysis state
         self.doc = None
-        self.current_page = None
+        self.path = None
+        self.atlas_filetype = None
+        self.current_page = 0
         self.page_images = {}
         self.mask_images = {}
         self.base_page_images = {}
@@ -6577,70 +6713,97 @@ class PDFViewer:
         self.selected_page = None
         self._clear_edge_highlight()
         self.edge_grab_active = False
+        self.border_drag_active = False
         self.active_edge = None
         self.current_edited_contour = None
         self.original_full_contour_for_edit = None
+        self.selected_edge_full_contour = None
         self._edge_pending_deselect = False
         self.region_translate_active = False
         self.region_translate_original_mask = None
         self.region_translate_zid = None
         self.region_move_mode.set(False)
+        self.crop_mode = False
+        if hasattr(self, 'crop_mode_var'):
+            self.crop_mode_var.set(False)
+        self.edit_mode = False
+        if hasattr(self, 'edit_mode_var'):
+            self.edit_mode_var.set(False)
+
+        self.named_paint_groups = {}
+        self.paint_group_data = {}
+        self.painted_zone_outlines = {}
+        self.current_paint_group = None
+        self.paint_layer = None
+        self.img = None
+        self.background_image = None
+        self.original_background = None
+        self.bg_photo_id = None
         self.last_df = None
+        self.last_cell_mask = None
         self.img_x = 0
         self.img_y = 0
+        self.view_scale = 1.0
+        self.zoom = 1.0
+        self.brightness = 0.0
+        self.current_state = None
 
         self.manual_add_mask = None
         self.manual_remove_mask = None
         self.editing_mask = False
-        self.mask_edit_add = True  # True = add cells, False = remove cells
+        self.mask_edit_add = True
         self.mask_photo = False
         self.mask_photo_id = False
-        self.current_mask = None   # reference to the current mask being edited
+        self.current_mask = None
         self.auto_mask = None
         self.showing_auto_mask = False
 
-        # Manual edit masks
-        self.manual_add_mask = None
-        self.manual_remove_mask = None
+        # Clear undo
+        try:
+            self.state_manager.undo_stack.clear()
+        except Exception:
+            self.state_manager.undo_stack = []
 
-        # Background (TIFF) image
-        self.background_image = None
-        self.original_background = None
-        self.bg_photo_id = None
-        self.atlas_filetype = None
+        # Restore directory/browser so user stays in same folder and can pick next image
+        if saved_current_dir:
+            self.current_tiff_directory = saved_current_dir
+        if saved_tree is not None:
+            self.tiff_tree = saved_tree
+        if saved_iid_map is not None:
+            self._tree_iid_to_path = saved_iid_map
+        if saved_file_list is not None:
+            self.tiff_file_list = saved_file_list
+        if saved_folder_label is not None:
+            self.folder_label = saved_folder_label
+        # Do not clear folder_label or tree contents
 
-        # TIFF filename
-        # Do NOT clear current_tiff_directory or the file browser list/tree
-        # so the user stays in the same directory.
-        self.tiff_filename = None
-        self.tiff_dir = None
+        # Do not clear tiff_dir / tiff_filename here if they help the browser,
+        # but clear current loaded image name conceptually by leaving no bg.
+        # User can double-click another from the preserved tree.
 
-        # Clear paint states for full reset
-        self.named_paint_groups = {}
-        self.paint_group_data = {}
-        self.current_paint_group = None
-        self.paint_layer = None
+        if hasattr(self, 'output'):
+            try:
+                self.output.delete("all")
+            except Exception:
+                pass
 
-        # Last DF for counts
-        self.last_df = None
+        try:
+            self.show_page()
 
-        # Brightness
-        self.brightness = 0.0
+            # Clear Atlas Manager list/selection
+            if hasattr(self, '_update_ribbon_selection'):
+                self._update_ribbon_selection()
 
-        # Mouse state tracking
-        self.current_state = None
+            # Optionally refresh the file list to keep it in sync (non-destructive)
+            if hasattr(self, 'refresh_tiff_file_list') and self.current_tiff_directory:
+                self.refresh_tiff_file_list()
+        except Exception as e:
+            logger.warning(f"Error during next_image UI reset: {e}")
 
-        self.show_page()
-
-        # Fully clear Atlas Manager state (labeled regions list, selection, etc.)
-        # and any remaining loaded content so it feels like a fresh start.
-        if hasattr(self, '_update_ribbon_selection'):
-            self._update_ribbon_selection()
-
-        if self.last_df is not None:
-            messagebox.showinfo("Next Image", f"Autosaved image to {image_path}\nAutosaved counts to {csv_path}") 
+        if did_autosave:
+            messagebox.showinfo("Next Image / Reset", "Current image cleared. You can now load another from the file list (directory preserved). Previous flattened/counts were auto-saved where possible.")
         else:
-            messagebox.showinfo("Next Image", f"Autosaved image to {image_path}")
+            messagebox.showinfo("Next Image / Reset", "App state cleared. Ready to load a new image from the current directory.")
 
 def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_counters, zone_names):
     """Enhanced cell counting with improved visualization"""
