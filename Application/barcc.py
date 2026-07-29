@@ -587,6 +587,7 @@ class PDFViewer:
         self.cell_mask_source_path = None
         # Ground-truth vs random null distribution (cyan overlay; GT stays red)
         self.random_cell_mask = None
+        self.random_cell_labels = None  # int32 label map (1..N matched pairs)
         self.random_cell_mask_meta = None  # dict: n_cells, stratified, seed, etc.
         # Perineuronal (PNN) shells: outer disk area = 1.5 × cell area, minus cell body
         self.perineuronal_mask = None           # bool union (GT cells)
@@ -4443,10 +4444,11 @@ class PDFViewer:
             out[r0:r1, c0:c1] |= disk
         return out
 
-    def _stamp_cell_footprint(self, out_mask, cell, center_rc):
+    def _stamp_cell_footprint(self, out_mask, cell, center_rc, require_full=False):
         """Stamp a cell's exact GT footprint at a new center. Returns pixels written.
 
-        Matched-pair placement: identical shape and area (if fully in-bounds).
+        If ``require_full`` is True, only stamps when every footprint pixel fits
+        in-bounds (exact area match); returns 0 otherwise.
         """
         h, w = out_mask.shape[:2]
         nr = int(round(center_rc[0]))
@@ -4458,10 +4460,49 @@ class PDFViewer:
         rs = offs_r + nr
         cs = offs_c + nc
         valid = (rs >= 0) & (rs < h) & (cs >= 0) & (cs < w)
-        if not np.any(valid):
+        n_valid = int(np.sum(valid))
+        if n_valid == 0:
+            return 0
+        if require_full and n_valid < int(cell["area"]):
             return 0
         out_mask[rs[valid], cs[valid]] = True
-        return int(np.sum(valid))
+        return n_valid
+
+    def _stamp_cell_footprint_labeled(
+        self, out_labels, cell, center_rc, label_id, require_full=True, only_empty=True
+    ):
+        """Stamp footprint with a unique label id (prevents fragment over-counting).
+
+        Returns pixels written, or 0 on failure.
+        """
+        h, w = out_labels.shape[:2]
+        nr = int(round(center_rc[0]))
+        nc = int(round(center_rc[1]))
+        offs_r = cell["offs_r"]
+        offs_c = cell["offs_c"]
+        if offs_r is None or len(offs_r) == 0:
+            return 0
+        rs = offs_r.astype(np.int32) + nr
+        cs = offs_c.astype(np.int32) + nc
+        valid = (rs >= 0) & (rs < h) & (cs >= 0) & (cs < w)
+        n_valid = int(np.sum(valid))
+        if n_valid == 0:
+            return 0
+        if require_full and n_valid != int(cell["area"]):
+            return 0
+        rs_v = rs[valid]
+        cs_v = cs[valid]
+        if only_empty:
+            empty = out_labels[rs_v, cs_v] == 0
+            if require_full and int(np.sum(empty)) != int(cell["area"]):
+                # Would collide / partial — reject so we try another center
+                return 0
+            if not np.any(empty):
+                return 0
+            out_labels[rs_v[empty], cs_v[empty]] = int(label_id)
+            return int(np.sum(empty))
+        out_labels[rs_v, cs_v] = int(label_id)
+        return n_valid
 
     def _sample_random_centers_in_region(self, region_bool, n, rng, min_sep=None):
         """Sample n (row, col) centers inside a boolean region (with light anti-overlap)."""
@@ -4469,12 +4510,10 @@ class PDFViewer:
         if coords.shape[0] == 0 or n <= 0:
             return []
         if n >= coords.shape[0]:
-            # Degenerate: place on all pixels (or with replacement)
             idx = rng.choice(coords.shape[0], size=n, replace=True)
             return [(float(coords[i, 0]), float(coords[i, 1])) for i in idx]
 
         chosen = []
-        # Shuffle candidates
         order = rng.permutation(coords.shape[0])
         min_sep = float(min_sep) if min_sep is not None else 0.0
         min_sep2 = min_sep * min_sep
@@ -4492,12 +4531,9 @@ class PDFViewer:
                     continue
             chosen.append((r, c))
 
-        # If anti-overlap left us short, fill without separation constraint
         if len(chosen) < n:
             remaining = n - len(chosen)
-            used = set(
-                (int(round(r)), int(round(c))) for r, c in chosen
-            )
+            used = set((int(round(r)), int(round(c))) for r, c in chosen)
             for i in order:
                 if remaining <= 0:
                     break
@@ -4508,44 +4544,53 @@ class PDFViewer:
                 used.add((r, c))
                 remaining -= 1
         if len(chosen) < n:
-            # with replacement as last resort
             extra = n - len(chosen)
             idx = rng.choice(coords.shape[0], size=extra, replace=True)
             for i in idx:
                 chosen.append((float(coords[i, 0]), float(coords[i, 1])))
         return chosen[:n]
 
-    def _sample_center_for_matched_cell(self, cell, placeable, h, w, rng, occupied=None, min_sep=None):
-        """Pick a random center so the matched footprint preferably fits fully in-bounds.
-
-        Prefers centers inside ``placeable`` (atlas zone or tissue). Returns (row, col)
-        or None if no candidate exists.
-        """
-        # Valid centers where full footprint stays in image
+    def _candidate_centers_for_cell(self, cell, placeable, h, w, max_candidates=8000):
+        """Boolean mask of centers where the full footprint fits in-bounds and
+        the center lies in ``placeable`` (region/tissue)."""
         min_r = max(0, -int(cell["min_dr"]))
         max_r = min(h - 1, h - 1 - int(cell["max_dr"]))
         min_c = max(0, -int(cell["min_dc"]))
         max_c = min(w - 1, w - 1 - int(cell["max_dc"]))
-        if max_r < min_r or max_c < min_c:
-            # Footprint larger than image in one axis — allow any placeable pixel
-            min_r, max_r, min_c, max_c = 0, h - 1, 0, w - 1
-
         fit = np.zeros((h, w), dtype=bool)
-        fit[min_r : max_r + 1, min_c : max_c + 1] = True
+        if max_r >= min_r and max_c >= min_c:
+            fit[min_r : max_r + 1, min_c : max_c + 1] = True
         if placeable is not None:
-            cand_mask = fit & placeable
-            if not cand_mask.any():
-                cand_mask = fit
+            cand = fit & placeable
         else:
-            cand_mask = fit
+            cand = fit
+        return cand
+
+    def _sample_center_for_matched_cell(
+        self, cell, placeable, h, w, rng, occupied=None, min_sep=None, max_tries=400
+    ):
+        """Pick a random center for a full in-bounds stamp inside placeable."""
+        cand_mask = self._candidate_centers_for_cell(cell, placeable, h, w)
         coords = np.column_stack(np.where(cand_mask))
+        if coords.shape[0] == 0:
+            # Relax: any full-fit center in image
+            cand_mask = self._candidate_centers_for_cell(cell, None, h, w)
+            coords = np.column_stack(np.where(cand_mask))
         if coords.shape[0] == 0:
             return None
 
         min_sep = float(min_sep) if min_sep is not None else 0.0
         min_sep2 = min_sep * min_sep
-        order = rng.permutation(coords.shape[0])
-        for i in order:
+        n = coords.shape[0]
+        # Sample without building huge permutations when n is large
+        if n > max_tries * 4:
+            picks = rng.choice(n, size=min(max_tries * 3, n), replace=False)
+        else:
+            picks = rng.permutation(n)
+
+        for j, i in enumerate(picks):
+            if j >= max_tries * 3:
+                break
             r, c = float(coords[i, 0]), float(coords[i, 1])
             if occupied and min_sep2 > 0:
                 ok = True
@@ -4557,19 +4602,19 @@ class PDFViewer:
                     continue
             return (r, c)
         # Fallback: ignore separation
-        i = int(order[0])
+        i = int(picks[0])
         return (float(coords[i, 0]), float(coords[i, 1]))
 
     def generate_random_cell_mask(self):
-        """Build a null cell mask via matched pairs to the ground-truth mask.
+        """Build a null cell mask via region-aware matched pairs to the GT mask.
 
-        For each true cell, place **one** random cell with the **identical
-        footprint** (same shape and pixel area) at a new XY location
-        (matched-pair / size-preserving null).
+        For each true cell, place **exactly one** random cell with the **identical
+        footprint** (same shape and pixel area) at a new XY. Uses a **labeled**
+        stamp map so clipping cannot invent extra connected components.
 
-        If a zone atlas / .catlas is loaded, each cell is placed inside the
-        **same region** its GT centroid occupied (stratified). Displayed in
-        **cyan**; GT remains **red**.
+        If a zone atlas / .catlas is loaded, pairing is **region-specific**: each
+        GT cell is assigned to the zone of its centroid and placed only inside
+        that same zone (matched size + matched region count).
         """
         try:
             if self.original_background is None and self.background_image is None:
@@ -4603,17 +4648,17 @@ class PDFViewer:
                 )
                 return
 
-            # Optional seed dialog
+            n_gt = len(cells)
             seed_str = simpledialog.askstring(
                 "Random Cell Mask",
-                f"Ground-truth cells: {len(cells)}\n"
-                f"Strategy: matched pairs (each random cell = same size/shape as one true cell).\n\n"
-                "Optional random seed (integer) for reproducibility.\n"
-                "Leave blank for a new random draw:",
+                f"Ground-truth cells: {n_gt}\n"
+                f"Strategy: region-matched pairs (1 random cell per true cell,\n"
+                f"same size/shape, new XY; same atlas region when .catlas is loaded).\n\n"
+                "Optional random seed (integer). Leave blank for a new draw:",
                 parent=self.master,
             )
             if seed_str is None:
-                return  # cancelled
+                return
             seed_str = seed_str.strip()
             if seed_str == "":
                 seed = int(np.random.randint(0, 2**31 - 1))
@@ -4628,7 +4673,7 @@ class PDFViewer:
                     return
             rng = np.random.default_rng(seed)
 
-            # Stratify using atlas zone mask if present
+            # Region mask for stratification
             page = self.current_page if self.current_page is not None else 0
             zone_mask = None
             stratified = False
@@ -4644,94 +4689,166 @@ class PDFViewer:
                     zone_mask = None
                     stratified = False
 
-            # Global placeable tissue mask (used when not stratified / outside zones)
             try:
                 gray = self._pil_to_gray_float(bg)
                 thr = float(np.percentile(gray, 5))
                 tissue = gray > thr
-                if tissue.sum() < len(cells) * 10:
+                if int(tissue.sum()) < n_gt * 10:
                     tissue = np.ones((th, tw), dtype=bool)
             except Exception:
                 tissue = np.ones((th, tw), dtype=bool)
 
-            random_mask = np.zeros((th, tw), dtype=bool)
-            occupied_centers = []
-            n_full_area = 0
-            n_clipped = 0
-            placed = 0
-            total_gt_area = 0
-            total_rand_area_written = 0
-
-            # Matched pair: each GT cell → one random stamp of the same footprint
-            order = rng.permutation(len(cells))
-            for idx in order:
-                cell = cells[int(idx)]
-                total_gt_area += int(cell["area"])
-
-                # Placement domain
+            # Group cells by zone of GT centroid (region-specific matched pairs)
+            by_zone = {}  # zid -> list of cells
+            for cell in cells:
                 if stratified and zone_mask is not None:
                     r0 = min(max(int(round(cell["row"])), 0), th - 1)
                     c0 = min(max(int(round(cell["col"])), 0), tw - 1)
                     zid = int(zone_mask[r0, c0])
-                    if zid > 0:
-                        placeable = zone_mask == zid
-                    else:
-                        placeable = (zone_mask == 0) | tissue
-                        if not placeable.any():
-                            placeable = tissue
+                else:
+                    zid = 0
+                cell = dict(cell)
+                cell["zone_id"] = zid
+                by_zone.setdefault(zid, []).append(cell)
+
+            # Labeled map: exactly one id per successfully placed matched cell
+            random_labels = np.zeros((th, tw), dtype=np.int32)
+            occupied_centers = []
+            placed = 0
+            n_full_area = 0
+            n_failed = 0
+            total_gt_area = sum(int(c["area"]) for c in cells)
+            next_id = 1
+            per_zone_counts = {}  # zid -> (gt_n, placed_n)
+
+            for zid in sorted(by_zone.keys()):
+                zone_cells = by_zone[zid]
+                if stratified and zone_mask is not None and zid > 0:
+                    placeable = zone_mask == int(zid)
+                elif stratified and zone_mask is not None and zid == 0:
+                    placeable = (zone_mask == 0) | tissue
+                    if not placeable.any():
+                        placeable = tissue
                 else:
                     placeable = tissue
 
-                min_sep = max(2.0, float(cell["radius"]) * 1.2)
-                center = self._sample_center_for_matched_cell(
-                    cell,
-                    placeable,
-                    th,
-                    tw,
-                    rng,
-                    occupied=occupied_centers,
-                    min_sep=min_sep,
-                )
-                if center is None:
-                    # Last resort: any in-bounds center
-                    center = (
-                        float(rng.integers(0, th)),
-                        float(rng.integers(0, tw)),
-                    )
+                zone_placed = 0
+                # Shuffle order within zone only (keeps per-zone multiset of sizes)
+                order = rng.permutation(len(zone_cells))
+                for j in order:
+                    cell = zone_cells[int(j)]
+                    min_sep = max(2.0, float(cell["radius"]) * 1.15)
+                    success = False
+                    # Several attempts: full stamp, empty space, in-region
+                    for attempt in range(60):
+                        use_sep = min_sep if attempt < 40 else 0.0
+                        center = self._sample_center_for_matched_cell(
+                            cell,
+                            placeable,
+                            th,
+                            tw,
+                            rng,
+                            occupied=occupied_centers,
+                            min_sep=use_sep,
+                        )
+                        if center is None:
+                            break
+                        # Prefer full-area non-overlapping stamp
+                        n_pix = self._stamp_cell_footprint_labeled(
+                            random_labels,
+                            cell,
+                            center,
+                            next_id,
+                            require_full=True,
+                            only_empty=True,
+                        )
+                        if n_pix == int(cell["area"]):
+                            occupied_centers.append(center)
+                            placed += 1
+                            zone_placed += 1
+                            n_full_area += 1
+                            next_id += 1
+                            success = True
+                            break
+                    if not success:
+                        # Last resort: full stamp allowing overlap on empty only, no sep
+                        for attempt in range(40):
+                            center = self._sample_center_for_matched_cell(
+                                cell,
+                                placeable,
+                                th,
+                                tw,
+                                rng,
+                                occupied=None,
+                                min_sep=0.0,
+                            )
+                            if center is None:
+                                break
+                            n_pix = self._stamp_cell_footprint_labeled(
+                                random_labels,
+                                cell,
+                                center,
+                                next_id,
+                                require_full=True,
+                                only_empty=False,
+                            )
+                            if n_pix == int(cell["area"]):
+                                occupied_centers.append(center)
+                                placed += 1
+                                zone_placed += 1
+                                n_full_area += 1
+                                next_id += 1
+                                success = True
+                                break
+                    if not success:
+                        n_failed += 1
+                        logger.debug(
+                            f"Matched pair failed for cell area={cell['area']} "
+                            f"zone={zid}"
+                        )
 
-                n_pix = self._stamp_cell_footprint(random_mask, cell, center)
-                if n_pix <= 0:
-                    continue
-                placed += 1
-                total_rand_area_written += n_pix
-                if n_pix >= int(cell["area"]):
-                    n_full_area += 1
-                else:
-                    n_clipped += 1
-                occupied_centers.append(center)
+                per_zone_counts[int(zid)] = (len(zone_cells), zone_placed)
+
+            random_mask = random_labels > 0
+            # Component count must equal number of unique labels used
+            n_rand = int(random_labels.max()) if random_mask.any() else 0
+            # Safety: if boolean connectivity somehow differs, re-count labels
+            n_unique = len(np.unique(random_labels)) - (1 if 0 in random_labels else 0)
+            n_rand = n_unique
 
             self.random_cell_mask = random_mask
-            # Invalidate random PNN shells (must re-run Draw Perineuronal Masks)
+            self.random_cell_labels = random_labels  # keep for diagnostics / PNN
             self.random_perineuronal_mask = None
             self.random_perineuronal_labels = None
             self.random_perineuronal_cells = None
-            n_gt = len(cells)
-            n_rand = (
-                int(measure.label(random_mask, connectivity=2).max())
-                if random_mask.any()
-                else 0
-            )
+
+            # Per-zone summary string
+            zone_lines = []
+            if stratified:
+                for zid in sorted(per_zone_counts.keys()):
+                    gt_n, pl_n = per_zone_counts[zid]
+                    zname = (
+                        (self.zone_names.get(page, {}) or {}).get(zid, f"Zone {zid}")
+                        if zid > 0
+                        else "Outside regions"
+                    )
+                    zone_lines.append(f"  {zname}: GT {gt_n} → random {pl_n}")
+
             self.random_cell_mask_meta = {
                 "n_ground_truth": n_gt,
                 "n_random_components": n_rand,
                 "n_placed": placed,
+                "n_failed": n_failed,
                 "matched_pairs": True,
-                "strategy": "matched_pair_exact_footprint",
+                "strategy": "matched_pair_exact_footprint_labeled_region",
                 "total_gt_area_px": total_gt_area,
                 "total_random_area_px": int(random_mask.sum()),
                 "stamps_full_area": n_full_area,
-                "stamps_clipped": n_clipped,
                 "stratified": stratified,
+                "per_zone_gt_placed": {
+                    str(k): {"gt": v[0], "placed": v[1]}
+                    for k, v in per_zone_counts.items()
+                },
                 "seed": seed,
                 "atlas_zones_used": (
                     int(np.max(zone_mask))
@@ -4740,25 +4857,30 @@ class PDFViewer:
                 ),
             }
 
-            # Display both
             self.show_ground_truth_and_random_masks()
 
-            area_note = (
-                f"GT total area: {total_gt_area} px\n"
-                f"Random total area: {int(random_mask.sum())} px\n"
-                f"Full-size stamps: {n_full_area}  |  edge-clipped: {n_clipped}\n"
-            )
-            # Offer to save
+            zone_txt = ("\n".join(zone_lines) + "\n") if zone_lines else ""
+            warn = ""
+            if n_rand != n_gt or placed != n_gt:
+                warn = (
+                    f"\nNote: placed {placed}/{n_gt} matched cells "
+                    f"({n_failed} could not be placed without clipping/collision).\n"
+                )
             save_it = messagebox.askyesno(
                 "Random Cell Mask Generated",
-                f"Matched-pair random null created.\n\n"
+                f"Region-matched pair random null created.\n\n"
                 f"Ground-truth cells: {n_gt}\n"
-                f"Random cells placed: {placed}\n"
-                f"{area_note}"
+                f"Random cells placed: {placed} (labeled components: {n_rand})\n"
+                f"GT total area: {total_gt_area} px\n"
+                f"Random total area: {int(random_mask.sum())} px\n"
+                f"Full-size stamps: {n_full_area}\n"
                 f"Stratified by atlas region: {'Yes' if stratified else 'No'}\n"
-                f"Random seed: {seed}\n\n"
+                f"{zone_txt}"
+                f"Random seed: {seed}\n"
+                f"{warn}\n"
                 f"Each random cell is the same shape/size as one true cell "
-                f"(translated to a new XY).\n"
+                f"(1:1 pair), placed at a new XY"
+                f"{' inside the same atlas region' if stratified else ''}.\n"
                 f"Display: red = ground truth, cyan = random.\n\n"
                 f"Save the random mask to disk?",
             )
@@ -4766,10 +4888,10 @@ class PDFViewer:
                 self._save_random_cell_mask_file()
 
             logger.info(
-                f"Random cell mask (matched pairs): gt={n_gt} placed={placed} "
-                f"gt_area={total_gt_area} rand_area={int(random_mask.sum())} "
-                f"full={n_full_area} clipped={n_clipped} "
-                f"stratified={stratified} seed={seed}"
+                f"Random cell mask (region matched pairs): gt={n_gt} placed={placed} "
+                f"components={n_rand} gt_area={total_gt_area} "
+                f"rand_area={int(random_mask.sum())} failed={n_failed} "
+                f"stratified={stratified} zones={per_zone_counts} seed={seed}"
             )
         except Exception as e:
             logger.error(f"generate_random_cell_mask failed: {e}", exc_info=True)
@@ -10373,6 +10495,7 @@ class PDFViewer:
         self.cell_mask_locked = False
         self.cell_mask_source_path = None
         self.random_cell_mask = None
+        self.random_cell_labels = None
         self.random_cell_mask_meta = None
         self.perineuronal_mask = None
         self.perineuronal_labels = None
