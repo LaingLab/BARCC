@@ -2,14 +2,19 @@
 
 A GUI tool for analyzing immunofluorescence images with atlas region mapping and automated cell counting.
 
-**v8.07.000 Highlights** (current)
-- **Save Flattened Image now fully flattens the mask**: TIFF base + yellow filled painted region areas (from the zone `mask_images`, so regions are area-filled not just boundaries) + black paint boundaries (`paint_layer`) + red masked cells (from last Count, properly alpha-blended). Previously only included paint + base image.
-- Uses `alpha_composite` for clean layering. Default filename is `{original}_flattened.tif` (with correct initial directory).
-- Works for both the menu command and internal autosave (Next Image etc.).
-- Overlay code hardened with size guards, 2D handling, and try/except so partial failures don't crash (base is always saved).
-- Version: **8.07.000**.
+**v8.08.000 Highlights** (current)
+- **Allen Mouse Atlas** + semi-auto stitch (Reflect/move/rotate), Fit/Crop, hemisphere labels **`_r` / `_l`**.
+- **`.catlas`** save/load: full labeled atlas + paint schematic for multi-channel reuse; placement scale fix.
+- **Next Channel…** keeps atlas/structures; **Clear Atlas**; paint-on-atlas registers for Count Cells.
+- **Axons and Nets**: region intensity with BG percentile + counterstain normalization; Pre/Post correction columns.
+- **Save/Load Cell Mask** across channels; **random null** cell masks (region-stratified); **perineuronal** shells (150% area) + intensity exports (by structure + per-cell, true and random).
+- Version: **8.08.000**.
 
-See [release-notes-v8.07.000.md](release-notes-v8.07.000.md) for full details.
+See [release-notes-v8.08.000.md](release-notes-v8.08.000.md) for full details.
+
+**v8.07.000 Highlights** (previous)
+- **Save Flattened Image** fully flattens zone fills + paint + red cell mask.
+- Version: **8.07.000**. See [release-notes-v8.07.000.md](release-notes-v8.07.000.md).
 
 **v8.06.000 Highlights** (previous)
 - **Show Zone Labels & Counts** (Cell menu): Opens a table window with zone names and cell counts for the current TIFF (session counts, saved .xlsx/.csv, or defined zones). Total footer, auto-refresh after counting, syncs with file browser.
