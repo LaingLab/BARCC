@@ -293,18 +293,19 @@ class BARCCUserManual(FPDF):
 
         toc_items = [
             ("1. Introduction", 3),
-            ("2. Installation & Requirements", 4),
-            ("3. Getting Started", 5),
-            ("4. User Interface Overview", 6),
-            ("5. File Menu", 7),
-            ("6. Working with Atlas Sections", 8),
-            ("7. Paint Tools for Regions of Interest", 11),
-            ("8. Mask Settings & Cell Detection", 12),
-            ("9. Manual Cell Editing", 15),
-            ("10. Counting Cells & Exporting Results", 16),
-            ("11. Saving & Export Options", 17),
-            ("12. Keyboard Shortcuts", 18),
-            ("13. Troubleshooting", 19),
+            ("What's New (8.08, 8.07, ...)", 4),
+            ("2. Installation & Requirements", 8),
+            ("3. Getting Started", 9),
+            ("4. User Interface Overview", 10),
+            ("5. File Menu & Multi-Channel Workflow", 11),
+            ("6. Working with Atlas Sections", 12),
+            ("7. Paint Tools for Regions of Interest", 16),
+            ("8. Cell Detection, Masks & Editing", 17),
+            ("9. Axons and Nets (Intensity & PNN)", 20),
+            ("10. Counting Cells & Exporting Results", 22),
+            ("11. Saving & Export Options", 23),
+            ("12. Keyboard Shortcuts", 24),
+            ("13. Troubleshooting", 25),
         ]
 
         self.set_font("Helvetica", "", 11)
@@ -350,23 +351,97 @@ def build_manual():
 
     pdf.chapter_title("Key Capabilities", 1)
     pdf.bullet_list([
-        "Import and display high-resolution TIFF images and multi-page PDF atlas files",
-        "Interactive atlas alignment (translation, rotation, scaling)",
-        "Freehand painting tools to define custom regions of interest",
-        "Advanced, configurable cell detection with multiple thresholding methods",
-        "Manual addition and removal of cells for quality control",
-        "Automated cell counting within defined regions with Excel export",
-        "Saving of annotated images and analysis sessions"
+        "Import TIFF images and multi-page PDF atlas files; browse folders with progress tracking",
+        "Allen Mouse Reference Atlas plates with semi-auto stitch (Reflect / move / rotate hemispheres)",
+        "Interactive atlas alignment: Fit to Image, crop, move, rotate, scale; per-region edit tools",
+        "Portable .catlas schematics: save labeled atlas + paint once, apply across channels",
+        "Next Channel workflow keeps atlas and regions while switching fluorescence channels",
+        "Freehand paint regions that register for counting (including on atlas coordinates)",
+        "Configurable cell detection; manual add/remove/split; save/load cell masks across channels",
+        "Random null cell distributions (optionally stratified by atlas region)",
+        "Axons and Nets: regional intensity with background subtraction and counterstain normalization",
+        "Perineuronal (PNN) shells (150% cell area) and intensity export (true + random)",
+        "Automated regional cell counting with Excel export under an output/ folder",
     ])
 
     pdf.note_box(
-        "BARCC is particularly valuable for neuroscience studies involving c-Fos, NeuN, or other "
-        "cell-type specific markers where regional quantification relative to brain anatomy is required."
+        "BARCC is particularly valuable for neuroscience studies involving c-Fos, NeuN, axon/PNN "
+        "markers, or other signals where regional quantification relative to brain anatomy is required. "
+        "Multi-channel workflows (e.g. label on DAPI, quantify on other channels) are first-class."
     )
 
     # ------------------------------------------------------------------
-    # 2. INSTALLATION
+    # What's New — 8.08.000 (current)
     # ------------------------------------------------------------------
+    pdf.chapter_title("What's New in Version 8.08.000", 0)
+
+    pdf.body(
+        "BARCC 8.08.000 is a major multi-channel atlas and analysis release: Allen atlas integration, "
+        "portable .catlas files, cross-channel cell masks, axon/PNN intensity with corrections, "
+        "random null distributions, and perineuronal shell measurement."
+    )
+
+    pdf.chapter_title("Allen Mouse Atlas & hemispheres", 1)
+    pdf.bullet_list([
+        "Atlas > Import Allen Atlas: plate browser with Nissl reference strip and borders-only movable overlay.",
+        "Semi-auto stitch editor: Reflect right-to-left, move/rotate halves, then Load into BARCC.",
+        "Fit Atlas to Image, crop/move/scale/rotate with model-space placement (stable under zoom).",
+        "After Reflect / bilateral stitch, structure names use _r and _l suffixes (e.g. V2M_r / V2M_l) so left and right are distinct in Atlas Manager and Count Cells.",
+        "Download Full Allen Atlas option for offline/cache use.",
+    ])
+
+    pdf.chapter_title(".catlas schematic (multi-channel atlas)", 1)
+    pdf.bullet_list([
+        "Atlas / File > Save Atlas Schematic and Load Atlas Schematic save a lossless .catlas package: zone mask, structure drawings, painted regions, Atlas Manager names, and placement (img_x/img_y).",
+        "Label on counterstain (e.g. DAPI), save .catlas, load onto other channels of the same section.",
+        "When background size changes between save and load, layers and offsets scale together (avoids drift).",
+        "Legacy .atlas files still open; new saves use the .catlas extension.",
+    ])
+
+    pdf.chapter_title("Next Channel & Clear Atlas", 1)
+    pdf.bullet_list([
+        "File / File Browser / Atlas Manager > Next Channel loads a new TIFF while keeping atlas drawings, zones, names, paint, and placement.",
+        "Normal Import TIFF / Next Image fully clears atlas (no ghost double overlays).",
+        "Clear Atlas removes overlay and labeled regions but keeps the TIFF.",
+    ])
+
+    pdf.chapter_title("Paint on atlas & menus", 1)
+    pdf.bullet_list([
+        "Painted regions use atlas coordinates when an atlas is loaded; named paint merges into the zone mask for Count Cells without wiping Allen structures.",
+        "Mask menu renamed Cell: detection tools plus Counting submenu (Count Cells, Show Zone Labels & Counts).",
+        "Axons and Nets menu for intensity, counterstain normalization, and perineuronal tools.",
+    ])
+
+    pdf.chapter_title("Intensity, cell masks, random null, PNN", 1)
+    pdf.bullet_list([
+        "Measure Region Intensities with optional Xth-percentile background subtraction and counterstain normalization (file from Counterstain Normalization Measurement).",
+        "Exports include Pre_Correction and Post_Correction mean/median columns; Excel under output/.",
+        "Save / Load Cell Mask (.barccmask + PNG) across channels; loaded mask locks Count Cells (no re-detect until Show Mask).",
+        "Generate Random Cell Mask: same count as ground truth, random XY; stratified by atlas region when a .catlas/atlas is loaded (red = true, cyan = random).",
+        "Draw Perineuronal Masks: shell from cell edge out to a disk of 150% cell area; also for random cells if present.",
+        "Measure Perineuronal Intensity: by-structure mean/SEM and median/SEM (true and random); per-cell tables with area + PNN intensity.",
+    ])
+
+    pdf.body(
+        "See release-notes-v8.08.000.md in the repository root for the full changelog. "
+        "Count Cells still counts only the ground-truth cell mask (not the random null mask)."
+    )
+
+    # ------------------------------------------------------------------
+    # What's New — 8.07.000
+    # ------------------------------------------------------------------
+    pdf.chapter_title("What's New in Version 8.07.000", 0)
+
+    pdf.body(
+        "BARCC 8.07.000 improved Save Flattened Image so exports match what you see after painting and counting."
+    )
+
+    pdf.bullet_list([
+        "Flattened export now composites TIFF base + yellow zone fills + black paint boundaries + red cell outline rings (when available).",
+        "Default name {tiff}_flattened.tif under the image output folder when possible.",
+        "Hardened overlay steps so partial failures still save a usable base image.",
+    ])
+
     # ------------------------------------------------------------------
     # What's New — 8.06.000
     # ------------------------------------------------------------------
@@ -681,13 +756,14 @@ def build_manual():
     )
 
     pdf.bullet_list([
-        "Import a TIFF image (File > Import TIFF)",
-        "Import an atlas section PDF (Atlas > Import Atlas)",
-        "Align the atlas over your image using Move, Rotate, and Resize tools",
-        "Define regions using either Paint tools or by clicking atlas regions",
-        "Configure and preview cell detection parameters (Mask > Show Mask Settings)",
-        "Run cell counting and review results",
-        "Export data to Excel and save annotated images"
+        "Import a TIFF (File > Import TIFF or File Browser)",
+        "Import an atlas (Atlas > PDF or Allen Atlas + stitch; optionally save .catlas)",
+        "Align with Fit Atlas to Image, Move, Rotate, Scale, Crop",
+        "Define regions via atlas click, Paint, or Load Atlas Schematic",
+        "Optional multi-channel: Next Channel (keep atlas) or load .catlas / cell mask",
+        "Configure detection (Cell > Show Mask Settings); edit/save cell masks as needed",
+        "Count Cells and/or Axons and Nets intensity / PNN measurement",
+        "Results auto-save under the image output/ folder",
     ])
 
     # ------------------------------------------------------------------
@@ -717,30 +793,45 @@ def build_manual():
 
     pdf.chapter_title("Menus", 1)
     pdf.body(
-        "File, Edit, Atlas, Paint, Mask, and Cell menus provide access to all features. "
-        "Many operations (especially in Mask Settings) open auxiliary dialogs for parameter adjustment."
+        "File, Edit, Atlas, Paint, Cell, Axons and Nets, View, and related menus provide access to all features. "
+        "The former Mask menu is now Cell (detection tools plus a Counting submenu). "
+        "Many operations open auxiliary dialogs for parameter adjustment."
     )
 
     # ------------------------------------------------------------------
     # 5. FILE MENU
     # ------------------------------------------------------------------
-    pdf.chapter_title("5. File Menu", 0)
+    pdf.chapter_title("5. File Menu & Multi-Channel Workflow", 0)
 
     pdf.chapter_title("Import TIFF", 1)
     pdf.body(
         "Loads the primary experimental image. Supported formats include single and multi-page TIFFs. "
-        "After import, the image is automatically scaled to fit the window while preserving aspect ratio."
+        "After import, the image is automatically scaled to fit the window while preserving aspect ratio. "
+        "Importing a new TIFF clears atlas and zone state (use Next Channel if you want to keep the atlas)."
     )
 
-    pdf.chapter_title("Import Atlas", 1)
+    pdf.chapter_title("Next Channel (keep atlas)", 1)
+    pdf.body(
+        "File > Next Channel, the File Browser button \"Next Channel (keep atlas)\", or the Atlas Manager "
+        "ribbon button opens a file dialog for another TIFF (e.g. the next fluorescence channel). "
+        "Atlas drawings, zone masks, Atlas Manager names, painted regions, and placement offsets are preserved. "
+        "Cell detection masks are cleared — reload a saved cell mask if you need the same detections. "
+        "Autosave of counts/paint for the channel you leave is attempted when possible."
+    )
+
+    pdf.chapter_title("Save / Load Atlas Schematic (.catlas)", 1)
+    pdf.body(
+        "File or Atlas > Save Atlas Schematic writes a portable .catlas file under the image's output/ folder "
+        "by default. Load Atlas Schematic applies that schematic onto the currently open TIFF without "
+        "re-importing the Allen plate. Ideal workflow: label on DAPI, save .catlas, Next Channel to axon/PNN "
+        "channels, Load Atlas Schematic if needed (or keep atlas via Next Channel)."
+    )
+
+    pdf.chapter_title("Import Atlas (PDF) — under Atlas menu", 1)
     pdf.body(
         "Opens a PDF file containing brain atlas plates. BARCC uses PyMuPDF to render individual pages "
-        "at high quality. You can navigate between pages of multi-plate PDFs."
-    )
-    pdf.body(
-        "Note: Import Atlas (and related global/per-region atlas tools) now lives under the top-level "
-        "Atlas menu rather than the File menu, for better grouping with Crop, Move, Rotate, Scale, "
-        "and the new region selection/editing commands."
+        "at high quality. You can navigate between pages of multi-plate PDFs. "
+        "Allen Mouse Atlas import and stitch live under Atlas as well (see chapter 6)."
     )
 
     pdf.chapter_title("Split Tiff", 1)
@@ -778,12 +869,17 @@ def build_manual():
 
     pdf.chapter_title("Save Flattened Image", 1)
     pdf.body(
-        "Exports a composite image containing both the original TIFF and the currently aligned atlas "
-        "as a single JPEG. This is useful for figure preparation and record keeping."
+        "Exports a composite of the TIFF, yellow zone fills, paint boundaries, and (when available) "
+        "red cell outline rings as a TIFF (typically {name}_flattened.tif under output/). "
+        "Useful for figure preparation and session records. Also used by autosave on image switch."
     )
 
-    pdf.chapter_title("Save Paint", 1)
-    pdf.body("Saves freehand painted regions to a reusable file format for later sessions.")
+    pdf.chapter_title("Previous / Next Image & Next Uncounted", 1)
+    pdf.body(
+        "Navigate the File Browser list (Ctrl+Left / Ctrl+Right / Ctrl+Shift+Right). These load a new "
+        "section and clear atlas/zones unless you use Next Channel. Progress checkmarks reflect counted "
+        "artifacts in output/."
+    )
 
     # ------------------------------------------------------------------
     # 6. ATLAS HANDLING
@@ -792,9 +888,28 @@ def build_manual():
 
     pdf.body(
         "Accurate alignment of the atlas to your experimental image is critical for meaningful "
-        "regional analysis. BARCC provides several interactive tools for this purpose, now centered "
-        "around the Atlas Manager ribbon for both global and per-region fine control."
+        "regional analysis. BARCC supports PDF atlas plates and Allen Mouse CCF plates, with tools "
+        "centered on the Atlas Manager ribbon for global and per-region control."
     )
+
+    pdf.chapter_title("Import Allen Atlas & stitch editor", 1)
+    pdf.body(
+        "Atlas > Import Allen Atlas opens a plate browser (coronal/sagittal). Preview Nissl + structure "
+        "outlines, then either Load as drawn or Open stitch editor. The stitch editor Reflects the "
+        "right-hemisphere Allen drawing to the left, then lets you move/rotate left, right, or both "
+        "before Load into BARCC. Atlas > Download Full Allen Atlas pre-caches plates for offline use."
+    )
+    pdf.body(
+        "After bilateral Reflect/stitch, structure names include hemisphere tags: acronym_r and acronym_l "
+        "(e.g. V2M_r / V2M_l). Left and right get separate zone IDs for selection and counting."
+    )
+
+    pdf.chapter_title("Fit Atlas to Image, Crop, Clear Atlas", 1)
+    pdf.bullet_list([
+        "Fit Atlas to Image: resizes the atlas (and mask/borders) to the TIFF size and aligns top-left corners.",
+        "Crop: draw a rectangle (aspect can lock to the TIFF); incomplete edge structures can be pruned.",
+        "Clear Atlas: removes drawings and Atlas Manager regions while keeping the loaded TIFF.",
+    ])
 
     pdf.chapter_title("The Atlas Manager Ribbon", 1)
     pdf.body(
@@ -960,30 +1075,31 @@ def build_manual():
 
     pdf.chapter_title("Labeling Painted Regions", 1)
     pdf.body(
-        "While in Paint mode (before clicking Stop Paint), you can right-click on any painted stroke "
-        "to name it. BARCC treats each continuous drawing action (mouse button down through release) "
-        "as a single \"structural boundary.\" All connected line segments belonging to that stroke "
-        "are grouped together."
-    )
-    pdf.body(
-        "When you right-click a stroke:"
+        "While in Paint mode, right-click any painted stroke to name it. BARCC treats each continuous "
+        "drawing action (mouse down through release) as one structural boundary. Naming converts the "
+        "group into a zone immediately for Atlas Manager and Count Cells. Stop Paint and Count Cells "
+        "also auto-name remaining strokes as \"Painted Region N\"."
     )
     pdf.bullet_list([
-        "The entire connected group is highlighted in yellow for visual feedback.",
-        "A dialog appears allowing you to enter or edit a name for the region.",
-        "Named painted regions are converted into proper analysis zones when you click Stop Paint.",
-        "These named regions participate in cell counting exactly like atlas regions and will appear in your results with the names you assigned."
+        "The connected group highlights in yellow when selected for naming.",
+        "With an atlas loaded, paint uses atlas model coordinates and merges into the existing zone mask without overwriting other structure IDs.",
+        "Named painted regions participate in cell counting and intensity export like atlas regions.",
     ])
     pdf.note_box(
-        "You can only label painted regions while the Paint mode is active (i.e., before you click "
-        "\"Stop Paint\"). Once you stop painting, the strokes are committed to the persistent paint layer "
-        "and the live canvas items used for naming are cleaned up."
+        "Prefer closed loops so interiors fill correctly (flood fill + binary_fill_holes). "
+        "After naming, the region appears in the Atlas Manager list."
     )
 
     # ------------------------------------------------------------------
-    # 8. MASK SETTINGS (DETAILED)
+    # 8. MASK SETTINGS (DETAILED) — now Cell menu
     # ------------------------------------------------------------------
-    pdf.chapter_title("8. Mask Settings & Cell Detection", 0)
+    pdf.chapter_title("8. Cell Detection, Masks & Editing", 0)
+
+    pdf.body(
+        "Cell detection tools live under the Cell menu (formerly Mask). "
+        "Show Mask Settings opens the parameter dialog. Show Mask runs detection (or displays a loaded mask). "
+        "Add / Remove / Split Cell and Finish Mask Edit support manual QC."
+    )
 
     pdf.body(
         "This is the most powerful and configurable part of BARCC. The Mask Settings dialog "
@@ -1243,26 +1359,80 @@ def build_manual():
     )
 
     # ------------------------------------------------------------------
-    # 9. MANUAL CELL EDITING
+    # Manual cell editing (Cell menu)
     # ------------------------------------------------------------------
-    pdf.chapter_title("9. Manual Cell Editing", 0)
+    pdf.chapter_title("Manual Cell Editing", 1)
 
     pdf.body(
-        "No automated detector is perfect. BARCC provides direct manual editing tools so you can "
-        "correct errors before counting."
+        "No automated detector is perfect. Cell > Add Cell / Remove Cell / Split Cell / Finish Mask Edit "
+        "let you correct errors before counting. Brush Settings opens automatically for add/remove. "
+        "Manual edits combine with the automatic mask: (auto | add) & ~remove."
     )
 
-    pdf.chapter_title("Add / Remove Cells", 1)
+    pdf.chapter_title("Save / Load Cell Mask (cross-channel)", 1)
+    pdf.body(
+        "Cell > Save Cell Mask stores the current detection (including manual edits) as a portable "
+        ".barccmask package (and a companion PNG) under output/. Cell > Load Cell Mask applies that "
+        "mask to the current TIFF (resized if needed). While locked, Count Cells uses the loaded mask "
+        "without re-running detection. Cell > Show Mask (with recalculation) unlocks and re-detects."
+    )
+    pdf.note_box(
+        "Typical multi-channel flow: detect/edit cells on one channel, Save Cell Mask, Next Channel, "
+        "Load Cell Mask, then Count Cells on the new channel with the same detections."
+    )
+
+    pdf.chapter_title("Random null cell mask", 1)
+    pdf.body(
+        "Cell > Generate Random Cell Mask creates a null distribution with the same number of cells as "
+        "the ground-truth mask, at random XY locations (cell sizes shuffled). If an atlas/.catlas is "
+        "loaded, counts are stratified by region: each structure keeps the same cell count as GT, "
+        "placed randomly inside that structure. Display: red = ground truth, cyan = random. "
+        "Count Cells does not count the random mask — only the true cell mask."
+    )
+
+    # ------------------------------------------------------------------
+    # 9. AXONS AND NETS
+    # ------------------------------------------------------------------
+    pdf.chapter_title("9. Axons and Nets (Intensity & PNN)", 0)
+
+    pdf.body(
+        "The Axons and Nets menu supports regional intensity measurement, counterstain normalization, "
+        "and perineuronal (PNN) shell analysis on the loaded TIFF inside Atlas Manager regions."
+    )
+
+    pdf.chapter_title("Measure Region Intensities", 1)
+    pdf.body(
+        "Measures mean/median (and other stats) of image intensity inside each zone. A dialog asks whether to:"
+    )
     pdf.bullet_list([
-        "Add Cell - Click or paint to mark additional cells that the detector missed.",
-        "Remove Cell - Erase false positives (dust, autofluorescence, etc.).",
-        "Brush Size - When you activate Add Cell or Remove Cell, the Brush Settings dialog now opens automatically so you can immediately adjust dot size."
+        "Background subtraction: subtract the Xth-percentile intensity within each region (typical X = 5-20).",
+        "Counterstain normalization: divide by Normalization_Factor from a file produced by Counterstain Normalization Measurement on the same atlas.",
     ])
-
     pdf.body(
-        "Edits are applied to a separate overlay mask and can be toggled on and off for comparison. "
-        "All manual edits are included in the final cell count."
+        "Exports under output/ as {name}_intensities.xlsx with Pre_Correction_Mean/Median and "
+        "Post_Correction_Mean/Median (and detail columns). Corrected mean = (mean - BG) / factor when both options are on."
     )
+
+    pdf.chapter_title("Counterstain Normalization Measurement", 1)
+    pdf.body(
+        "Run this on the counterstain channel (e.g. DAPI) with the same .catlas/atlas. "
+        "Saves {name}_counterstain_norm.xlsx where Normalization_Factor is the regional mean intensity "
+        "(used later as a divisor for axon/PNN channels)."
+    )
+
+    pdf.chapter_title("Draw / Measure Perineuronal Masks", 1)
+    pdf.body(
+        "Draw Perineuronal Masks builds a shell around each cell from the outer boundary of the cell "
+        "mask out to a disk whose area is 150% of the cell area (shell = outer disk minus cell bodies). "
+        "If a random cell mask exists, random PNN shells are drawn as well."
+    )
+    pdf.bullet_list([
+        "Display: magenta = true PNN shells; yellow = random PNN shells (cells remain red/cyan).",
+        "Measure Perineuronal Intensity exports:",
+        "  - {name}_pnn_by_structure.xlsx — per structure: True/Random Mean, SEM_Mean, Median, SEM_Median",
+        "  - {name}_pnn_cells_true.xlsx — per true cell: Cell_Area + Perineuronal_Intensity",
+        "  - {name}_pnn_cells_random.xlsx — same for random cells (if present)",
+    ])
 
     # ------------------------------------------------------------------
     # 10. COUNTING & RESULTS
@@ -1321,10 +1491,14 @@ def build_manual():
     pdf.chapter_title("11. Saving & Export Options", 0)
 
     pdf.bullet_list([
-        "Flattened Image (JPEG) - Final figure-ready composite of image + atlas + annotations",
-        "Paint files - Reusable region definitions",
-        "Automatic Excel export on Count Cells (with full Detection Parameters metadata sheet)",
-        "Automatic _masked.tif export (original image + final cell mask overlay)"
+        "Flattened TIFF - image + zone fills + paint + cell rings (when available)",
+        "Paint / .barccpaint - reusable paint + region bundles",
+        ".catlas - full atlas schematic for multi-channel reuse",
+        ".barccmask / cellmask PNG - portable cell detection masks",
+        "Count Cells: {name}.xlsx (Cell Counts + Detection Parameters), _masked.tif, centroids CSV under output/",
+        "Intensities: _intensities.xlsx, _counterstain_norm.xlsx",
+        "PNN: _pnn_by_structure.xlsx, _pnn_cells_true.xlsx, _pnn_cells_random.xlsx",
+        "Random cell mask: _random_cellmask.png (+ JSON meta)",
     ])
 
     # ------------------------------------------------------------------
@@ -1334,10 +1508,15 @@ def build_manual():
 
     headers = ["Shortcut", "Action"]
     rows = [
-        ["Ctrl + Z", "Undo last action (move, rotate, paint, highlight, etc.)"],
+        ["Ctrl + Z", "Undo last action (paint, atlas edit, etc.)"],
         ["Ctrl + S", "Save flattened image"],
+        ["Ctrl + Left", "Previous image in File Browser"],
+        ["Ctrl + Right", "Next image in File Browser"],
+        ["Ctrl + Shift + Right", "Next uncounted image"],
+        ["Enter", "Commit painted border refit after edge drag"],
+        ["s (paint mode)", "Toggle pen drag vs segment mode"],
     ]
-    pdf.add_table(headers, rows, col_widths=[50, 130])
+    pdf.add_table(headers, rows, col_widths=[55, 125])
 
     # ------------------------------------------------------------------
     # 13. TROUBLESHOOTING
@@ -1346,17 +1525,22 @@ def build_manual():
 
     pdf.chapter_title("Common Issues", 1)
 
-    pdf.body("- Cells not detected: Try lowering Peak Min Intensity or switching to Adaptive threshold.")
-    pdf.body("- Too many false positives: Increase Min Cell Size and Circularity Threshold.")
-    pdf.body("- Atlas looks blurry: Re-render at higher zoom or adjust brightness settings.")
-    pdf.body("- Performance is slow: Close other applications; very large images benefit from 16 GB+ RAM.")
-    pdf.body("- Count Cells crashes or hangs: Ensure you are on v8.06.000+ (fixes Windows TIFF deflate crash and full-resolution load issues). Re-import the TIFF if it was opened before the window finished drawing.")
-    pdf.body("- Show Zone Labels & Counts appears empty: Define regions and run Count Cells first, or ensure a matching .xlsx/.csv exists beside the TIFF.")
+    pdf.body("- Cells not detected: Try lowering Peak Min Intensity or switching detection method / Smart Suggest.")
+    pdf.body("- Too many false positives: Increase min size/sigma or use Remove Cell.")
+    pdf.body("- Atlas drifts on zoom: Use current build (model-space img_x/img_y); re-Fit if needed.")
+    pdf.body("- .catlas loads shifted: Prefer same-resolution channels; rebuild schematic after Fit; 8.08 scales layers with background size.")
+    pdf.body("- Left/right structures not distinguished: Re-Reflect/stitch so names get _r/_l; too many structures may exceed uint8 bilateral split.")
+    pdf.body("- Count Cells re-detects after Load Cell Mask: Ensure mask stayed locked; avoid Show Mask recalculate until you want a new mask.")
+    pdf.body("- Random cells not in counts: By design — only the ground-truth cell mask is counted.")
+    pdf.body("- Excel not written: pip install openpyxl; check the image folder output/ is writable.")
+    pdf.body("- Count Cells crashes: Use v8.06+ (TIFF deflate fix); open TIFF after the window is laid out.")
+    pdf.body("- Performance is slow: Close other apps; large frames use viewer downscale — 16 GB+ RAM helps.")
 
     pdf.chapter_title("Getting Help", 1)
     pdf.body(
         "For bugs or feature requests, please open an issue on the GitHub repository:\n"
-        "https://github.com/LaingLab/BARCC"
+        "https://github.com/LaingLab/BARCC\n\n"
+        "Release notes for each version live in the repository root (e.g. release-notes-v8.08.000.md)."
     )
 
     # Final page
