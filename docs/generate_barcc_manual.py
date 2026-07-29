@@ -405,8 +405,8 @@ def build_manual():
         "Configurable cell detection; manual add/remove/split; save/load cell masks across channels",
         "Random null cell distributions (optionally stratified by atlas region)",
         "Axons and Nets: regional intensity with background subtraction and counterstain normalization",
-        "Perineuronal (PNN) shells (150% cell area) and intensity export (true + random)",
-        "Automated regional cell counting with Excel export under an output/ folder",
+        "Perineuronal (PNN) shells (2x cell area) and intensity export (true + random)",
+        "Automated regional cell counting with Excel export under output/<feature>/ subfolders",
     ])
 
     pdf.note_box(
@@ -460,11 +460,12 @@ def build_manual():
     pdf.chapter_title("Intensity, cell masks, random null, PNN", 1)
     pdf.bullet_list([
         "Measure Region Intensities with optional Xth-percentile background subtraction and counterstain normalization (file from Counterstain Normalization Measurement).",
-        "Exports include Pre_Correction and Post_Correction mean/median columns; Excel under output/.",
+        "Exports include Pre_Correction and Post_Correction mean/median columns; Excel under output/intensities/.",
         "Save / Load Cell Mask (.barccmask + PNG) across channels; loaded mask locks Count Cells (no re-detect until Show Mask).",
         "Generate Random Cell Mask: same count as ground truth, random XY; stratified by atlas region when a .catlas/atlas is loaded (red = true, cyan = random).",
-        "Draw Perineuronal Masks: shell from cell edge out to a disk of 150% cell area; also for random cells if present.",
+        "Draw Perineuronal Masks: shell from cell edge out to a disk of 2x cell area; also for random cells if present.",
         "Measure Perineuronal Intensity: by-structure mean/SEM and median/SEM (true and random); per-cell tables with area + PNN intensity.",
+        "Output folder organized by feature: output/counts/, intensities/, pnn/, atlas/, cell_masks/, paint/, flattened/ (legacy flat files still detected).",
     ])
 
     pdf.body(
@@ -483,7 +484,7 @@ def build_manual():
 
     pdf.bullet_list([
         "Flattened export now composites TIFF base + yellow zone fills + black paint boundaries + red cell outline rings (when available).",
-        "Default name {tiff}_flattened.tif under the image output folder when possible.",
+        "Default name {tiff}_flattened.tif under output/flattened/ when possible.",
         "Hardened overlay steps so partial failures still save a usable base image.",
     ])
 
@@ -808,7 +809,7 @@ def build_manual():
         "Optional multi-channel: Next Channel (keep atlas) or load .catlas / cell mask",
         "Configure detection (Cell > Show Mask Settings); edit/save cell masks as needed",
         "Count Cells and/or Axons and Nets intensity / PNN measurement",
-        "Results auto-save under the image output/ folder",
+        "Results auto-save under the image output/<feature>/ folders (counts, intensities, pnn, …)",
     ])
 
     # ------------------------------------------------------------------
@@ -866,8 +867,8 @@ def build_manual():
 
     pdf.chapter_title("Save / Load Atlas Schematic (.catlas)", 1)
     pdf.body(
-        "File or Atlas > Save Atlas Schematic writes a portable .catlas file under the image's output/ folder "
-        "by default. Load Atlas Schematic applies that schematic onto the currently open TIFF without "
+        "File or Atlas > Save Atlas Schematic writes a portable .catlas file under the image's "
+        "output/atlas/ folder by default. Load Atlas Schematic applies that schematic onto the currently open TIFF without "
         "re-importing the Allen plate. Ideal workflow: label on DAPI, save .catlas, Next Channel to axon/PNN "
         "channels, Load Atlas Schematic if needed (or keep atlas via Next Channel)."
     )
@@ -915,7 +916,7 @@ def build_manual():
     pdf.chapter_title("Save Flattened Image", 1)
     pdf.body(
         "Exports a composite of the TIFF, yellow zone fills, paint boundaries, and (when available) "
-        "red cell outline rings as a TIFF (typically {name}_flattened.tif under output/). "
+        "red cell outline rings as a TIFF (typically {name}_flattened.tif under output/flattened/). "
         "Useful for figure preparation and session records. Also used by autosave on image switch."
     )
 
@@ -923,7 +924,7 @@ def build_manual():
     pdf.body(
         "Navigate the File Browser list (Ctrl+Left / Ctrl+Right / Ctrl+Shift+Right). These load a new "
         "section and clear atlas/zones unless you use Next Channel. Progress checkmarks reflect counted "
-        "artifacts in output/."
+        "artifacts under output/counts/ (legacy flat files in output/ are still detected)."
     )
 
     # ------------------------------------------------------------------
@@ -1417,7 +1418,7 @@ def build_manual():
     pdf.chapter_title("Save / Load Cell Mask (cross-channel)", 1)
     pdf.body(
         "Cell > Save Cell Mask stores the current detection (including manual edits) as a portable "
-        ".barccmask package (and a companion PNG) under output/. Cell > Load Cell Mask applies that "
+        ".barccmask package (and a companion PNG) under output/cell_masks/. Cell > Load Cell Mask applies that "
         "mask to the current TIFF (resized if needed). While locked, Count Cells uses the loaded mask "
         "without re-running detection. Cell > Show Mask (with recalculation) unlocks and re-detects."
     )
@@ -1454,7 +1455,7 @@ def build_manual():
         "Counterstain normalization: divide by Normalization_Factor from a file produced by Counterstain Normalization Measurement on the same atlas.",
     ])
     pdf.body(
-        "Exports under output/ as {name}_intensities.xlsx with Pre_Correction_Mean/Median and "
+        "Exports under output/intensities/ as {name}_intensities.xlsx with Pre_Correction_Mean/Median and "
         "Post_Correction_Mean/Median (and detail columns). Corrected mean = (mean - BG) / factor when both options are on."
     )
 
@@ -1519,14 +1520,14 @@ def build_manual():
     pdf.chapter_title("Step 6 — Draw perineuronal masks", 2)
     pdf.body(
         "Axons and Nets > Draw Perineuronal Masks builds shells from each cell boundary out to a disk "
-        "of 150% cell area (shell = outer disk minus cell bodies). If random cells exist, random "
+        "of 2x cell area (shell = outer disk minus cell bodies). If random cells exist, random "
         "perineuronal shells are drawn too. Display: magenta = true PNN; yellow = random PNN."
     )
 
     pdf.chapter_title("Step 7 — Measure perineuronal intensities", 2)
     pdf.body(
         "Axons and Nets > Measure Perineuronal Intensity measures mean intensity in each shell and "
-        "writes spreadsheets under output/:"
+        "writes spreadsheets under output/pnn/:"
     )
     pdf.bullet_list([
         "{name}_pnn_by_structure.xlsx — one row per atlas structure: True/Random Mean, SEM_Mean, Median, SEM_Median",
@@ -1544,7 +1545,7 @@ def build_manual():
     )
 
     pdf.note_box(
-        "Shell geometry: for cell area A, the outer disk has area 1.5 x A; the perineuronal mask is "
+        "Shell geometry: for cell area A, the outer disk has area 2 x A; the perineuronal mask is "
         "the ring between the cell body and that outer boundary. Re-draw PNN shells after regenerating "
         "random cells."
     )
@@ -1605,15 +1606,19 @@ def build_manual():
     # ------------------------------------------------------------------
     pdf.chapter_title("11. Saving & Export Options", 0)
 
+    pdf.body(
+        "Exports are organized under the image folder's output/ directory by feature. "
+        "The File Browser still finds legacy files that were saved flat in output/ or beside the TIFF."
+    )
+
     pdf.bullet_list([
-        "Flattened TIFF - image + zone fills + paint + cell rings (when available)",
-        "Paint / .barccpaint - reusable paint + region bundles",
-        ".catlas - full atlas schematic for multi-channel reuse",
-        ".barccmask / cellmask PNG - portable cell detection masks",
-        "Count Cells: {name}.xlsx (Cell Counts + Detection Parameters), _masked.tif, centroids CSV under output/",
-        "Intensities: _intensities.xlsx, _counterstain_norm.xlsx",
-        "PNN: _pnn_by_structure.xlsx, _pnn_cells_true.xlsx, _pnn_cells_random.xlsx",
-        "Random cell mask: _random_cellmask.png (+ JSON meta)",
+        "output/counts/ — Count Cells: {name}.xlsx (Cell Counts + Detection Parameters), _masked.tif, centroids CSV, metadata",
+        "output/intensities/ — _intensities.xlsx, _counterstain_norm.xlsx",
+        "output/pnn/ — _pnn_by_structure.xlsx, _pnn_cells_true.xlsx, _pnn_cells_random.xlsx",
+        "output/atlas/ — .catlas schematics for multi-channel reuse",
+        "output/cell_masks/ — .barccmask / cellmask PNG; random cell masks (_random_cellmask.png + JSON)",
+        "output/paint/ — paint layers and .barccpaint region bundles",
+        "output/flattened/ — flattened composites (TIFF + zones + paint + cell rings)",
     ])
 
     # ------------------------------------------------------------------
@@ -1647,7 +1652,7 @@ def build_manual():
     pdf.body("- Left/right structures not distinguished: Re-Reflect/stitch so names get _r/_l; too many structures may exceed uint8 bilateral split.")
     pdf.body("- Count Cells re-detects after Load Cell Mask: Ensure mask stayed locked; avoid Show Mask recalculate until you want a new mask.")
     pdf.body("- Random cells not in counts: By design — only the ground-truth cell mask is counted.")
-    pdf.body("- Excel not written: pip install openpyxl; check the image folder output/ is writable.")
+    pdf.body("- Excel not written: pip install openpyxl; check the image folder output/<feature>/ is writable.")
     pdf.body("- Count Cells crashes: Use v8.06+ (TIFF deflate fix); open TIFF after the window is laid out.")
     pdf.body("- Performance is slow: Close other apps; large frames use viewer downscale — 16 GB+ RAM helps.")
 

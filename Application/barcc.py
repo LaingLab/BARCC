@@ -45,6 +45,26 @@ import webbrowser
 import zipfile
 from io import BytesIO
 
+# Windows taskbar branding: must run *before* the first Tk() window is created.
+# Without an explicit AppUserModelID, Windows groups BARCC under the host process
+# (python.exe / Jupyter) and shows that host's icon instead of barcc_icon.ico.
+_BARCC_APP_USER_MODEL_ID = "LaingLab.BARCC.RegionalIFAnalyzer"
+
+
+def _configure_windows_app_identity():
+    """Tell Windows this process is BARCC, not Python/Jupyter (taskbar icon + grouping)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            _BARCC_APP_USER_MODEL_ID
+        )
+    except Exception:
+        pass
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,       # For normal operations and major steps
@@ -413,6 +433,8 @@ def split_stacked_tiff(file_path):
 class PDFViewer:
     def __init__(self):
         logger.info("Initializing PDFViewer")
+        # AppUserModelID before Tk so the taskbar does not inherit Jupyter/python branding
+        _configure_windows_app_identity()
         self.root = tk.Tk()
         self.master = self.root
         self.master.title('Regional IF Analyzer')
@@ -422,17 +444,15 @@ class PDFViewer:
         self.master.rowconfigure(1, weight=0)
         self.master.columnconfigure(0, weight=1)
 
-        
-
-        # Create simple antibody icon
-        icon_img = Image.new('RGBA', (32, 32), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(icon_img)
-        draw.line((16, 0, 16, 15), fill='white', width=2)  # stem from top
-        draw.line((16, 15, 8, 31), fill='white', width=2)  # left arm to bottom
-        draw.line((16, 15, 24, 31), fill='white', width=2)  # right arm to bottom
-        draw.ellipse((12, 0, 20, 8), fill='lime', outline='green')
-        icon = ImageTk.PhotoImage(icon_img)
-        self.master.iconphoto(True, icon)
+        # App logo (antibody + fluorophore) for title bar and Windows taskbar
+        self._set_app_icon()
+        # Re-apply after the HWND exists / is mapped (first paint is when taskbar picks icon)
+        try:
+            self.master.after_idle(self._set_app_icon)
+            self.master.after(200, self._set_app_icon)
+            self.master.after(800, self._set_app_icon)
+        except Exception:
+            pass
 
         # Subsystems
         self.pdf_handler = PDFHandler()
@@ -478,7 +498,14 @@ class PDFViewer:
         # Crop / edit variables
         self.crop_mode = False
         self.crop_mode_var = tk.BooleanVar(value=False)
-        self.crop_rect = None
+        self.crop_rect = None          # primary outline canvas id (legacy name)
+        self.crop_ui_ids = []          # all crop overlay canvas ids
+        self.crop_box = None           # (left, top, right, bottom) canvas coords when set
+        self.crop_pending = False      # selection drawn; waiting for move / apply
+        self._crop_interaction = None  # None | 'draw' | 'move'
+        self._crop_draw_anchor = None  # (x, y) canvas start of rubber-band
+        self._crop_move_origin = None  # (x, y) canvas pointer at move start
+        self._crop_box_at_move_start = None
         self.start_x = None
         self.start_y = None
 
@@ -589,14 +616,14 @@ class PDFViewer:
         self.random_cell_mask = None
         self.random_cell_labels = None  # int32 label map (1..N matched pairs)
         self.random_cell_mask_meta = None  # dict: n_cells, stratified, seed, etc.
-        # Perineuronal (PNN) shells: outer disk area = 1.5 × cell area, minus cell body
+        # Perineuronal (PNN) shells: outer disk area = 2× cell area, minus cell body
         self.perineuronal_mask = None           # bool union (GT cells)
         self.perineuronal_labels = None         # int32 label map (GT cell id)
         self.perineuronal_cells = None          # list of cell records
         self.random_perineuronal_mask = None
         self.random_perineuronal_labels = None
         self.random_perineuronal_cells = None
-        self.perineuronal_area_factor = 1.5
+        self.perineuronal_area_factor = 2.0
 
         # Brightness
         self.brightness = 0.0
@@ -630,6 +657,7 @@ class PDFViewer:
         self.master.bind('<Control-s>', self.save_flattened_image)
         self.master.bind('<Return>', self._commit_painted_border_refit)
         self.master.bind('<KP_Enter>', self._commit_painted_border_refit)
+        self.master.bind('<Escape>', self._on_escape_key)
         # File browser navigation (Phase A)
         self.master.bind('<Control-Left>', self._nav_previous_image_event)
         self.master.bind('<Control-Right>', self._nav_next_image_event)
@@ -638,6 +666,153 @@ class PDFViewer:
         # Bind click event for highlighting
         self.output.bind("<Button-1>", self.highlight_region)
 
+    def _set_app_icon(self):
+        """Set the Regional IF Analyzer logo on the window and Windows taskbar.
+
+        Uses Application/assets/barcc_icon.ico (taskbar) plus multi-size PNG
+        PhotoImages via iconphoto. Keeps strong references so Tk does not GC the
+        icon (a common reason the taskbar falls back to the default Tk feather).
+
+        On Windows, also sets AppUserModelID and WM_SETICON on the top-level HWND
+        so the taskbar does not keep the Jupyter/python host icon.
+        """
+        self._app_icons = []  # strong refs for PhotoImage
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+            assets = os.path.join(base, "assets")
+            ico_path = os.path.abspath(os.path.join(assets, "barcc_icon.ico"))
+            png_path = os.path.abspath(os.path.join(assets, "barcc_icon.png"))
+
+            # Re-assert process identity (safe if already set; helps late launches)
+            _configure_windows_app_identity()
+
+            # Windows: .ico is the most reliable for the taskbar / Alt-Tab
+            if os.path.isfile(ico_path):
+                try:
+                    # default= applies to this and future Toplevels
+                    self.master.iconbitmap(default=ico_path)
+                except Exception:
+                    try:
+                        self.master.iconbitmap(ico_path)
+                    except Exception as e:
+                        logger.debug(f"iconbitmap failed: {e}")
+                # Force taskbar / Alt-Tab icon via Win32 (Tk alone often leaves host icon)
+                self._apply_windows_taskbar_icon(ico_path)
+
+            # Cross-platform / title-bar: multi-resolution PhotoImages
+            icon_photos = []
+            if os.path.isfile(png_path):
+                try:
+                    pil = Image.open(png_path).convert("RGBA")
+                    for sz in (16, 24, 32, 48, 64):
+                        resized = pil.resize((sz, sz), Image.LANCZOS)
+                        icon_photos.append(ImageTk.PhotoImage(resized))
+                except Exception as e:
+                    logger.debug(f"icon PNG load failed: {e}")
+
+            if not icon_photos:
+                # Fallback: draw antibody + fluorophore in-memory (same motif)
+                icon_img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(icon_img)
+                draw.ellipse((2, 2, 61, 61), fill=(18, 28, 48, 255))
+                draw.line((32, 20, 32, 36), fill=(240, 248, 255, 255), width=4)
+                draw.line((32, 36, 16, 56), fill=(240, 248, 255, 255), width=4)
+                draw.line((32, 36, 48, 56), fill=(240, 248, 255, 255), width=4)
+                draw.ellipse((22, 6, 42, 26), fill=(57, 255, 20, 255), outline=(20, 160, 40, 255))
+                for sz in (16, 32, 48):
+                    icon_photos.append(
+                        ImageTk.PhotoImage(icon_img.resize((sz, sz), Image.LANCZOS))
+                    )
+
+            if icon_photos:
+                self._app_icons = icon_photos
+                try:
+                    self.master.iconphoto(True, *icon_photos)
+                except TypeError:
+                    # Older Tk: single image only
+                    self.master.iconphoto(True, icon_photos[0])
+                except Exception as e:
+                    logger.debug(f"iconphoto failed: {e}")
+        except Exception as e:
+            logger.warning(f"Could not set application icon: {e}")
+
+    def _apply_windows_taskbar_icon(self, ico_path):
+        """Load barcc_icon.ico onto the real top-level HWND (Windows taskbar / Alt-Tab)."""
+        if sys.platform != "win32" or not ico_path or not os.path.isfile(ico_path):
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            # Ensure window handle exists
+            try:
+                self.master.update_idletasks()
+            except Exception:
+                pass
+
+            hwnd = int(self.master.winfo_id())
+            # Tk often reports a child frame; climb to the top-level window
+            GA_ROOT = 2
+            try:
+                root = user32.GetAncestor(hwnd, GA_ROOT)
+                if root:
+                    hwnd = int(root)
+            except Exception:
+                try:
+                    parent = user32.GetParent(hwnd)
+                    if parent:
+                        hwnd = int(parent)
+                except Exception:
+                    pass
+
+            IMAGE_ICON = 1
+            LR_LOADFROMFILE = 0x0010
+            LR_DEFAULTSIZE = 0x0040
+            WM_SETICON = 0x0080
+            ICON_SMALL = 0
+            ICON_BIG = 1
+
+            # LoadImageW needs a unicode path
+            ico_w = os.path.abspath(ico_path)
+
+            LoadImageW = user32.LoadImageW
+            LoadImageW.argtypes = [
+                wintypes.HINSTANCE,
+                wintypes.LPCWSTR,
+                wintypes.UINT,
+                ctypes.c_int,
+                ctypes.c_int,
+                wintypes.UINT,
+            ]
+            LoadImageW.restype = wintypes.HANDLE
+
+            hicon_big = LoadImageW(
+                None, ico_w, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
+            )
+            hicon_small = LoadImageW(None, ico_w, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+            if not hicon_big and not hicon_small:
+                # Fallback: system metrics sizes
+                try:
+                    cx = user32.GetSystemMetrics(11)  # SM_CXICON
+                    cy = user32.GetSystemMetrics(12)  # SM_CYICON
+                    hicon_big = LoadImageW(
+                        None, ico_w, IMAGE_ICON, cx, cy, LR_LOADFROMFILE
+                    )
+                except Exception:
+                    pass
+            if not hicon_big and not hicon_small:
+                return
+
+            SendMessageW = user32.SendMessageW
+            if hicon_small:
+                SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
+            if hicon_big:
+                SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big)
+            # Prevent GC of HICONs while the app runs
+            self._win_hicons = [h for h in (hicon_small, hicon_big) if h]
+        except Exception as e:
+            logger.debug(f"WM_SETICON taskbar icon failed: {e}")
 
     def quit(self, _):
         self.root.destroy()
@@ -705,22 +880,20 @@ class PDFViewer:
         atlasmenu.add_command(label="Deselect Region", command=self.deselect_region)
         atlasmenu.add_command(label="Rotate Selected Region", command=self.show_rotate_selected_dialog)
         atlasmenu.add_command(label="Scale Selected Region", command=self.show_scale_selected_dialog)
-        
-        # Create Paint menu dropdown
-        paintmenu = tk.Menu(self.menu)
-        self.menu.add_cascade(label="Paint", menu=paintmenu)
-            # All paint functions (start, stop, pen, eraser, brushsize)
+
+        # Paint tools as a section under Atlas (no top-level Paint menu)
+        atlasmenu.add_separator()
+        paintmenu = tk.Menu(atlasmenu, tearoff=0)
+        atlasmenu.add_cascade(label="Paint", menu=paintmenu)
         paintmenu.add_command(label="Start Paint", command=self.start_paint)
         paintmenu.add_command(label="Stop Paint", command=self.stop_paint)
         paintmenu.add_command(label="Pen", command=self.use_pen)
         paintmenu.add_command(label="Eraser", command=self.use_eraser)
-        # Spawn new windows with widgets
         paintmenu.add_command(label="Brushsize", command=self.show_brush_settings)
-
         paintmenu.add_separator()
         paintmenu.add_command(label="Load Paint", command=self.load_paint)
         paintmenu.add_command(label="Save Paint Layer", command=self.save_paint_layer)
-        
+
         # Cell menu (formerly Mask) — mask edit tools + counting subcategory
         cellmenu = tk.Menu(self.menu)
         self.menu.add_cascade(label="Cell", menu=cellmenu)
@@ -1225,13 +1398,13 @@ class PDFViewer:
             return None
 
     def save_paint_layer(self):
-        """Auto-save the current paint layer into <image_folder>/output/.
+        """Auto-save the current paint layer into <image_folder>/output/paint/.
 
         After saving, the File Browser list is refreshed so artifacts appear under the TIFF.
         """
         base_name = self.tiff_filename or "untitled"
 
-        # Prefer image dir / browser folder → always write under its output/ subfolder
+        # Prefer image dir / browser folder → always write under its output/paint/ subfolder
         base_dir = None
         if self.tiff_dir and os.path.isdir(self.tiff_dir):
             base_dir = self.tiff_dir
@@ -1239,7 +1412,7 @@ class PDFViewer:
             base_dir = self.current_tiff_directory
 
         if base_dir:
-            target_dir = self._get_output_directory(base_dir)
+            target_dir = self._get_output_directory(base_dir, feature="paint")
             if not target_dir:
                 messagebox.showerror("Save Error", "Could not create the output folder for paint save.")
                 return
@@ -1308,16 +1481,8 @@ class PDFViewer:
             counter += 1
 
     def open_paint(self):
-        """Load a paint layer (.png). Defaults to <folder>/output/ when present."""
-        initial_dir = None
-        base = None
-        if self.tiff_dir and os.path.isdir(self.tiff_dir):
-            base = self.tiff_dir
-        elif self.current_tiff_directory and os.path.isdir(self.current_tiff_directory):
-            base = self.current_tiff_directory
-        if base:
-            out = os.path.join(base, "output")
-            initial_dir = out if os.path.isdir(out) else base
+        """Load a paint layer (.png). Defaults to <folder>/output/paint/ when present."""
+        initial_dir = self._preferred_open_dir(feature="paint")
 
         logger.info("Opening file dialog for paint selection")
         self.save_state()
@@ -1405,7 +1570,7 @@ class PDFViewer:
 
     def load_paint(self):
         """Load a paint layer from the current working directory shown in the left File Browser.
-        This is the recommended entry point from the Paint menu.
+        This is the recommended entry point from Atlas > Paint.
         """
         self.open_paint()
 
@@ -2026,7 +2191,7 @@ class PDFViewer:
         elif self.current_tiff_directory and os.path.isdir(self.current_tiff_directory):
             base_dir = self.current_tiff_directory
         if base_dir:
-            out = self._get_output_directory(base_dir)
+            out = self._get_output_directory(base_dir, feature="atlas")
             initial_dir = out if out else base_dir
 
         save_path = fd.asksaveasfilename(
@@ -2074,15 +2239,7 @@ class PDFViewer:
         Preserves the currently loaded TIFF background so you can apply a
         DAPI-labeled schematic to other fluorescence channels.
         """
-        initial_dir = None
-        base = None
-        if self.tiff_dir and os.path.isdir(self.tiff_dir):
-            base = self.tiff_dir
-        elif self.current_tiff_directory and os.path.isdir(self.current_tiff_directory):
-            base = self.current_tiff_directory
-        if base:
-            out = os.path.join(base, "output")
-            initial_dir = out if os.path.isdir(out) else base
+        initial_dir = self._preferred_open_dir(feature="atlas")
 
         path = fd.askopenfilename(
             title="Load Cropped Atlas (.catlas)",
@@ -4071,8 +4228,8 @@ class PDFViewer:
         """Save the current cell detection mask for reuse on another channel.
 
         Writes a portable ``.barccmask`` package (combined + optional layers) and a
-        plain ``_cellmask.png`` under ``output/``. Load on another channel of the
-        same section size to skip re-detection for Count Cells.
+        plain ``_cellmask.png`` under ``output/cell_masks/``. Load on another channel
+        of the same section size to skip re-detection for Count Cells.
         """
         try:
             combined, auto, add_pil, rem_pil, size_wh = self._ensure_cell_mask_for_save()
@@ -4100,7 +4257,7 @@ class PDFViewer:
             if not base_name:
                 base_name = "cells"
 
-            out_dir = self._get_output_directory(tiff_dir) if tiff_dir else None
+            out_dir = self._get_output_directory(tiff_dir, feature="cell_masks") if tiff_dir else None
             initial_dir = out_dir or tiff_dir
             # Prefer a channel-neutral name so the same file is natural across ch0/ch1
             stem = base_name
@@ -4219,11 +4376,7 @@ class PDFViewer:
                 )
                 return
 
-            initial_dir = None
-            base = self.tiff_dir or self.current_tiff_directory
-            if base:
-                out = os.path.join(base, "output")
-                initial_dir = out if os.path.isdir(out) else base
+            initial_dir = self._preferred_open_dir(feature="cell_masks")
 
             path = fd.askopenfilename(
                 title="Load Cell Mask",
@@ -4960,13 +5113,13 @@ class PDFViewer:
         messagebox.showinfo("Random Cell Mask", "Random cell mask cleared.")
 
     # ------------------------------------------------------------------
-    # Perineuronal (PNN) shells — ring between cell boundary and 150% area
+    # Perineuronal (PNN) shells — ring between cell boundary and 2× cell area
     # ------------------------------------------------------------------
 
-    def _build_perineuronal_shells(self, cell_bool, area_factor=1.5):
+    def _build_perineuronal_shells(self, cell_bool, area_factor=2.0):
         """Build perineuronal shells for each labeled cell.
 
-        Outer disk area = ``area_factor × cell_area`` (default 1.5 = 150%).
+        Outer disk area = ``area_factor × cell_area`` (default 2.0 = 200%).
         Shell = outer disk minus the cell body (and other cell bodies).
 
         Returns
@@ -5034,7 +5187,7 @@ class PDFViewer:
     def draw_perineuronal_masks(self):
         """Create perineuronal shells for GT cells (and random cells if present).
 
-        Shell = disk with area 150% of the cell, minus the cell body mask.
+        Shell = disk with area 200% of the cell (2×), minus the cell body mask.
         """
         try:
             if self.original_background is None and self.background_image is None:
@@ -5046,7 +5199,7 @@ class PDFViewer:
 
             bg = self.original_background or self.background_image
             tw, th = bg.size
-            factor = float(getattr(self, "perineuronal_area_factor", 1.5) or 1.5)
+            factor = float(getattr(self, "perineuronal_area_factor", 2.0) or 2.0)
 
             gt = self._get_ground_truth_cell_mask()
             if gt is None or not np.any(gt):
@@ -5272,7 +5425,7 @@ class PDFViewer:
     def measure_perineuronal_intensity(self):
         """Measure intensity in perineuronal shells; export structure + per-cell tables.
 
-        Spreadsheets written under ``output/``:
+        Spreadsheets written under ``output/pnn/``:
           - ``{base}_pnn_by_structure.xlsx`` — one row per atlas structure with
             mean/SEM and median/SEM for true (and random if present) PNN intensity
           - ``{base}_pnn_cells_true.xlsx`` — one row per true cell (area + PNN intensity)
@@ -5295,7 +5448,7 @@ class PDFViewer:
                 if not messagebox.askyesno(
                     "Perineuronal Intensity",
                     "Perineuronal masks have not been drawn yet.\n\n"
-                    "Draw them now (150% cell area shells) and measure?",
+                    "Draw them now (2× cell area shells) and measure?",
                 ):
                     return
                 self.draw_perineuronal_masks()
@@ -5433,7 +5586,9 @@ class PDFViewer:
             df_true = pd.DataFrame(true_rows) if true_rows else pd.DataFrame()
             df_rand = pd.DataFrame(rand_rows) if rand_rows else pd.DataFrame()
 
-            base_name, tiff_dir, out_dir = self._intensity_output_basename_and_dir()
+            base_name, tiff_dir, out_dir = self._intensity_output_basename_and_dir(
+                feature="pnn"
+            )
             saved = []
 
             def _write_df(df, path_xlsx, sheet, csv_fallback):
@@ -5552,14 +5707,14 @@ class PDFViewer:
             )
 
     def _save_random_cell_mask_file(self):
-        """Write random null mask to output/ as PNG + optional barccmask-style sidecar."""
+        """Write random null mask to output/cell_masks/ as PNG + JSON sidecar."""
         rand = getattr(self, "random_cell_mask", None)
         if rand is None or not np.any(rand):
             messagebox.showwarning("Save Random Mask", "No random cell mask to save.")
             return
         base_name = self.tiff_filename or "cells"
         tiff_dir = self.tiff_dir or self.current_tiff_directory
-        out_dir = self._get_output_directory(tiff_dir) if tiff_dir else None
+        out_dir = self._get_output_directory(tiff_dir, feature="cell_masks") if tiff_dir else None
         if not out_dir:
             path = fd.asksaveasfilename(
                 title="Save Random Cell Mask",
@@ -8202,6 +8357,9 @@ class PDFViewer:
             self.region_move_mode.set(False)
             self.crop_mode = False
             self.crop_mode_var.set(False)
+            self.crop_pending = False
+            self.crop_box = None
+            self._crop_interaction = None
             self.edit_mode = False
             self.edit_mode_var.set(False)
 
@@ -8421,6 +8579,15 @@ class PDFViewer:
                 self._draw_edge_highlight(self.active_edge)
             else:
                 self._draw_edge_highlight()
+
+        # Re-draw crop selection outline if user is still adjusting it
+        if getattr(self, "crop_mode", False) and getattr(self, "crop_pending", False) and getattr(
+            self, "crop_box", None
+        ):
+            try:
+                self._draw_crop_outline()
+            except Exception:
+                pass
 
 
     def img_white_to_transparent(self, img):
@@ -9682,8 +9849,28 @@ class PDFViewer:
             return ""
         return os.path.normcase(os.path.abspath(path))
 
-    def _get_output_directory(self, base_dir=None):
-        """Return <image_dir>/output, creating it if needed. None if base is invalid."""
+    # Feature subfolders under <image_dir>/output/
+    OUTPUT_FEATURES = (
+        "counts",       # Count Cells: xlsx, masked.tif, centroids, metadata
+        "intensities",  # region intensity + counterstain norm
+        "pnn",          # perineuronal by-structure + per-cell tables
+        "atlas",        # .catlas schematics
+        "cell_masks",   # .barccmask, cellmask png, random cell masks
+        "paint",        # paint layers / .barccpaint
+        "flattened",    # flattened composites
+    )
+
+    def _get_output_directory(self, base_dir=None, feature=None, create=True):
+        """Return <image_dir>/output[/<feature>], optionally creating it.
+
+        Feature organizes exports by analysis type, e.g.:
+          output/counts/, output/intensities/, output/pnn/, output/atlas/,
+          output/cell_masks/, output/paint/, output/flattened/
+
+        ``feature=None`` returns the root ``output/`` folder.
+        Set ``create=False`` for open/browse dialogs so empty feature folders
+        are not created merely by loading.
+        """
         base = base_dir or self.tiff_dir or self.current_tiff_directory
         if not base:
             return None
@@ -9691,23 +9878,81 @@ class PDFViewer:
             if not os.path.isdir(base):
                 return None
             out = os.path.join(base, "output")
-            os.makedirs(out, exist_ok=True)
+            if feature:
+                # Normalize / sanitize feature name
+                feat = str(feature).strip().strip("/\\").replace("..", "")
+                if feat:
+                    out = os.path.join(out, feat)
+            if create:
+                os.makedirs(out, exist_ok=True)
+            elif not os.path.isdir(out):
+                return None
             return out
         except Exception as e:
-            logger.warning(f"Could not create output directory under {base}: {e}")
+            logger.warning(f"Could not create/resolve output directory under {base}: {e}")
             return None
 
+    def _preferred_open_dir(self, feature=None):
+        """Best initialdir for open dialogs: output/<feature>/ if present, else output/, else image folder."""
+        base = None
+        if self.tiff_dir and os.path.isdir(self.tiff_dir):
+            base = self.tiff_dir
+        elif self.current_tiff_directory and os.path.isdir(self.current_tiff_directory):
+            base = self.current_tiff_directory
+        if not base:
+            return None
+        if feature:
+            feat = self._get_output_directory(base, feature=feature, create=False)
+            if feat and os.path.isdir(feat):
+                return feat
+        root = self._get_output_directory(base, feature=None, create=False)
+        if root and os.path.isdir(root):
+            return root
+        return base
+
     def _artifact_search_dirs(self, tiff_dir):
-        """Directories to search for BARCC exports: output/ first, then image folder (legacy)."""
+        """Directories to search for BARCC exports.
+
+        Order: each output/<feature>/, then flat output/ (legacy), then image folder.
+        """
         dirs = []
         if not tiff_dir:
             return dirs
         out = os.path.join(tiff_dir, "output")
         if os.path.isdir(out):
+            for feat in self.OUTPUT_FEATURES:
+                feat_dir = os.path.join(out, feat)
+                if os.path.isdir(feat_dir):
+                    dirs.append(feat_dir)
+            # Any other subfolders under output/ (future features)
+            try:
+                for name in sorted(os.listdir(out)):
+                    p = os.path.join(out, name)
+                    if os.path.isdir(p) and p not in dirs:
+                        dirs.append(p)
+            except Exception:
+                pass
+            # Legacy flat files still in output/
             dirs.append(out)
         if os.path.isdir(tiff_dir):
             dirs.append(tiff_dir)
         return dirs
+
+    def _artifact_rel_prefix(self, search_dir, tiff_dir):
+        """Display prefix for File Browser children, e.g. output/counts/."""
+        try:
+            rel = os.path.relpath(search_dir, tiff_dir)
+            if rel in (".", ""):
+                return ""
+            return rel.replace("\\", "/") + "/"
+        except Exception:
+            base = os.path.basename(search_dir).lower()
+            if base == "output":
+                return "output/"
+            parent = os.path.basename(os.path.dirname(search_dir)).lower()
+            if parent == "output":
+                return f"output/{base}/"
+            return ""
 
     def _counted_result_candidates(self, base_name):
         """All known count export filenames for a TIFF stem (Count Cells + autosave)."""
@@ -9727,11 +9972,12 @@ class PDFViewer:
     def _get_image_work_status(self, tiff_path, dir_files=None):
         """Return multi-state work status for a source TIFF.
 
-        Looks in <folder>/output/ first, then the image folder (legacy sidecars).
+        Looks in <folder>/output/<feature>/ first, then flat output/, then the
+        image folder (legacy sidecars).
         Status labels (priority): Done (counted+masked) > Count > Paint > —
 
         counted_files / paint_files / masked_files entries are display labels
-        (e.g. "output/name.xlsx") for the File Browser tree children.
+        (e.g. "output/counts/name.xlsx") for the File Browser tree children.
         """
         empty = {
             "counted": False,
@@ -9762,7 +10008,7 @@ class PDFViewer:
         seen = set()  # avoid listing the same basename twice (output + legacy)
 
         for search_dir in self._artifact_search_dirs(directory):
-            rel_prefix = "output/" if os.path.basename(search_dir).lower() == "output" else ""
+            rel_prefix = self._artifact_rel_prefix(search_dir, directory)
             try:
                 listing = os.listdir(search_dir)
             except Exception:
@@ -9814,16 +10060,28 @@ class PDFViewer:
                 f"{base_name}_intensities_parameters.csv",
                 f"{base_name}_counterstain_norm.xlsx",
                 f"{base_name}_counterstain_norm.csv",
+                f"{base_name}_pnn_by_structure.xlsx",
+                f"{base_name}_pnn_by_structure.csv",
+                f"{base_name}_pnn_cells_true.xlsx",
+                f"{base_name}_pnn_cells_true.csv",
+                f"{base_name}_pnn_cells_random.xlsx",
+                f"{base_name}_pnn_cells_random.csv",
             ):
                 real = files_lower_map.get(cand.lower())
                 if real and real.lower() not in seen:
                     intensity_files.append(rel_prefix + real)
                     seen.add(real.lower())
 
-            # Cell masks (per-channel name and stem without _chN)
+            # Cell masks + atlas schematics (per-channel name and stem without _chN)
             mask_candidates = [
                 f"{base_name}_cellmask.barccmask",
                 f"{base_name}_cellmask.png",
+                f"{base_name}_random_cellmask.png",
+                f"{base_name}_random_cellmask.json",
+                f"{base_name}_atlas.catlas",
+                f"{base_name}_atlas.atlas",
+                f"{base_name}.catlas",
+                f"{base_name}.atlas",
             ]
             stem = base_name
             for suffix in (
@@ -9838,6 +10096,12 @@ class PDFViewer:
                     [
                         f"{stem}_cellmask.barccmask",
                         f"{stem}_cellmask.png",
+                        f"{stem}_random_cellmask.png",
+                        f"{stem}_random_cellmask.json",
+                        f"{stem}_atlas.catlas",
+                        f"{stem}_atlas.atlas",
+                        f"{stem}.catlas",
+                        f"{stem}.atlas",
                     ]
                 )
             for cand in mask_candidates:
@@ -10054,15 +10318,21 @@ class PDFViewer:
                     # Load the background if it's not the current or to ensure
                     if not self.tiff_filename or self.tiff_filename not in os.path.basename(parent_tiff_path):
                         self._load_tiff_file(parent_tiff_path)
-                    # Resolve paint path (supports "output/foo.barccpaint" labels)
+                    # Resolve paint path (supports "output/paint/foo.barccpaint" labels)
                     paint_name = child_name.replace("\\", "/")
                     parent_dir = os.path.dirname(parent_tiff_path)
+                    basename = os.path.basename(paint_name)
                     if paint_name.lower().startswith("output/"):
                         paint_full_path = os.path.join(parent_dir, paint_name.replace("/", os.sep))
                     else:
-                        out_candidate = os.path.join(parent_dir, "output", os.path.basename(paint_name))
-                        beside = os.path.join(parent_dir, os.path.basename(paint_name))
-                        paint_full_path = out_candidate if os.path.exists(out_candidate) else beside
+                        paint_full_path = None
+                        for search_dir in self._artifact_search_dirs(parent_dir):
+                            cand = os.path.join(search_dir, basename)
+                            if os.path.exists(cand):
+                                paint_full_path = cand
+                                break
+                        if not paint_full_path:
+                            paint_full_path = os.path.join(parent_dir, basename)
                     if paint_full_path.lower().endswith('.barccpaint'):
                         self._load_barccpaint_bundle(paint_full_path)
                     else:
@@ -10658,63 +10928,88 @@ class PDFViewer:
             logger.error(f"Failed to load TIFF {tiff_path}: {e}")
             return False
 
-    def save_flattened_image(self, event=None):
-        logger.info("Attempting to save flattened image")
-        # Support TIFF + paint + count workflows even without page_images entry
-        base_img = getattr(self, 'original_background', None) or getattr(self, 'background_image', None)
-        if base_img is None or not hasattr(base_img, 'size') or base_img.size[0] <= 0 or base_img.size[1] <= 0:
-            logger.warning("Save flattened image failed: No valid background image")
-            messagebox.showerror("Error", "Please load a valid TIFF image first.")
-            return
+    def _compose_flattened_image(self):
+        """Build RGB composite: TIFF + zone fills + atlas + paint + cell rings.
+
+        Zone fills use ``_zone_mask_registered_to_background`` so atlas-sized masks
+        are placed at ``img_x``/``img_y`` (same as on-screen and Count Cells). Stretching
+        a model-space mask to full TIFF size misaligned yellow fills vs atlas borders.
+        """
+        base_img = getattr(self, "original_background", None) or getattr(
+            self, "background_image", None
+        )
+        if (
+            base_img is None
+            or not hasattr(base_img, "size")
+            or base_img.size[0] <= 0
+            or base_img.size[1] <= 0
+        ):
+            return None
 
         bg_w, bg_h = base_img.size
+        composite = base_img.convert("RGBA")
 
-        # Start with base TIFF as RGBA
-        composite = base_img.convert('RGBA')
-
-        # Use integer offsets (img_x/y can become float after zoom)
-        paste_x = int(self.img_x) if self.img_x is not None else 0
-        paste_y = int(self.img_y) if self.img_y is not None else 0
+        # Integer model-space offsets (same units as atlas / page_images placement)
+        paste_x = int(round(float(self.img_x))) if self.img_x is not None else 0
+        paste_y = int(round(float(self.img_y))) if self.img_y is not None else 0
 
         try:
-            # Explicit zone mask fill (yellow for painted regions) so filled areas are visible in flat.
-            # (The page_images tint may only tint stroke pixels in paint-on-TIFF flows, not fill the region.)
-            if self.current_page in getattr(self, 'mask_images', {}) and self.mask_images.get(self.current_page) is not None:
+            # Explicit zone fill so regions are visible (Allen is often borders-only on screen).
+            # Must register to background space — never stretch atlas masks to full image size.
+            page = self.current_page
+            if page in getattr(self, "mask_images", {}) and self.mask_images.get(page) is not None:
                 try:
-                    m = np.array(self.mask_images[self.current_page])
-                    if m.shape[:2] != (bg_h, bg_w):
-                        m_pil = Image.fromarray(m.astype(np.uint8), mode='L').resize((bg_w, bg_h), Image.NEAREST)
-                        m = np.array(m_pil)
+                    m, _mw, _mh = self._zone_mask_registered_to_background(
+                        self.mask_images[page], bg_h, bg_w
+                    )
                     zone_tint = np.zeros((bg_h, bg_w, 4), dtype=np.uint8)
                     for zid in np.unique(m):
-                        if zid == 0:
+                        if int(zid) == 0:
                             continue
-                        reg = (m == zid)
+                        reg = m == zid
                         zone_tint[reg, :3] = [255, 255, 0]  # yellow
-                        zone_tint[reg, 3] = 55  # visible fill in flattened
+                        zone_tint[reg, 3] = 55
                     if np.any(zone_tint[..., 3] > 0):
-                        zone_img = Image.fromarray(zone_tint, 'RGBA')
+                        zone_img = Image.fromarray(zone_tint, "RGBA")
                         composite = Image.alpha_composite(composite, zone_img)
                 except Exception as e:
                     logger.debug(f"Could not apply zone mask fill: {e}")
 
-            # Overlay zone tints / atlas content if present (yellow/orange painted or atlas regions)
-            if self.current_page in getattr(self, 'page_images', {}):
-                at_img = self.page_images[self.current_page]
-                if at_img.mode != 'RGBA':
-                    at_img = at_img.convert('RGBA')
-                composite.paste(at_img, (paste_x, paste_y), at_img)
+            # Atlas drawings / page overlay at model-space placement
+            if page in getattr(self, "page_images", {}):
+                at_img = self.page_images[page]
+                if at_img is not None:
+                    if at_img.mode != "RGBA":
+                        at_img = at_img.convert("RGBA")
+                    # Atlas is model-sized; paste at offset. If it already matches the
+                    # full background (paint-as-atlas / fit-to-image), paste at 0,0 when
+                    # sizes match — still correct when paste_x/y are 0 after Fit.
+                    aw, ah = at_img.size
+                    if abs(aw - bg_w) < 5 and abs(ah - bg_h) < 5 and abs(paste_x) < 2 and abs(paste_y) < 2:
+                        if (aw, ah) != (bg_w, bg_h):
+                            at_img = at_img.resize((bg_w, bg_h), Image.NEAREST)
+                        composite.paste(at_img, (0, 0), at_img)
+                    else:
+                        composite.paste(at_img, (paste_x, paste_y), at_img)
 
-            # Overlay painted regions (black boundaries from paint tool)
-            if getattr(self, 'paint_layer', None) is not None:
+            # Paint layer is baked into background pixel space (origin 0,0)
+            if getattr(self, "paint_layer", None) is not None:
                 pl = self.paint_layer
-                if pl.mode != 'RGBA':
-                    pl = pl.convert('RGBA')
-                # Paint is registered to background pixel space (usually at 0,0 after bundle load)
-                composite.paste(pl, (0, 0), pl)
+                if pl.mode != "RGBA":
+                    pl = pl.convert("RGBA")
+                if pl.size != (bg_w, bg_h):
+                    # Prefer top-left paste of native paint; only resize when nearly full-frame
+                    pw, ph = pl.size
+                    if abs(pw - bg_w) < 5 and abs(ph - bg_h) < 5:
+                        pl = pl.resize((bg_w, bg_h), Image.NEAREST)
+                        composite.paste(pl, (0, 0), pl)
+                    else:
+                        composite.paste(pl, (0, 0), pl)
+                else:
+                    composite.paste(pl, (0, 0), pl)
 
-            # Overlay detected cells as open red donut rings (boundary only)
-            if getattr(self, 'last_cell_mask', None) is not None:
+            # Cell detections as open red donut rings
+            if getattr(self, "last_cell_mask", None) is not None:
                 try:
                     cell_mask = np.asarray(self.last_cell_mask).squeeze()
                     if cell_mask.ndim != 2:
@@ -10722,112 +11017,72 @@ class PDFViewer:
                             cell_mask = cell_mask.reshape(cell_mask.shape[0], -1)
                         else:
                             cell_mask = np.zeros((bg_h, bg_w), dtype=bool)
-                    cell_mask = (cell_mask > 0)
+                    cell_mask = cell_mask > 0
                     ring_overlay = self._cell_detection_ring_overlay(
-                        cell_mask, size=(bg_w, bg_h), color=(255, 0, 0), alpha=200, thickness=2
+                        cell_mask,
+                        size=(bg_w, bg_h),
+                        color=(255, 0, 0),
+                        alpha=200,
+                        thickness=2,
                     )
                     composite = Image.alpha_composite(composite, ring_overlay)
                 except Exception as e:
                     logger.debug(f"Could not overlay cell mask rings: {e}")
         except Exception as e:
-            logger.debug(f"Could not apply overlays in flattened save (saving base only): {e}")
+            logger.debug(f"Could not apply overlays in flattened compose (base only): {e}")
 
-        final = composite.convert('RGB')
+        return composite.convert("RGB")
+
+    def save_flattened_image(self, event=None):
+        logger.info("Attempting to save flattened image")
+        final = self._compose_flattened_image()
+        if final is None:
+            logger.warning("Save flattened image failed: No valid background image")
+            messagebox.showerror("Error", "Please load a valid TIFF image first.")
+            return
 
         # Default filename: original image name + _flattened + .tif
         default_name = "flattened.tif"
-        if getattr(self, 'tiff_filename', None):
+        if getattr(self, "tiff_filename", None):
             default_name = f"{self.tiff_filename}_flattened.tif"
 
-        # Default into <image_dir>/output/ when available
-        base_for_out = getattr(self, 'tiff_dir', None) or getattr(self, 'current_tiff_directory', None)
-        out_dir = self._get_output_directory(base_for_out) if base_for_out else None
+        # Default into <image_dir>/output/flattened/ when available
+        base_for_out = getattr(self, "tiff_dir", None) or getattr(
+            self, "current_tiff_directory", None
+        )
+        out_dir = (
+            self._get_output_directory(base_for_out, feature="flattened")
+            if base_for_out
+            else None
+        )
         initialdir = out_dir or base_for_out or "."
         save_path = fd.asksaveasfilename(
             title="Save Flattened Image",
             initialdir=initialdir,
             initialfile=default_name,
             defaultextension=".tif",
-            filetypes=[("TIFF files", "*.tif *.tiff"), ("JPEG files", "*.jpg"), ("All files", "*.*")]
+            filetypes=[
+                ("TIFF files", "*.tif *.tiff"),
+                ("JPEG files", "*.jpg"),
+                ("All files", "*.*"),
+            ],
         )
         if save_path:
             try:
                 # Do not pass compression='tiff_deflate' — it can segfault on some Windows Pillow + libtiff builds.
-                # Just use default save for .tif (like the internal _masked.tif logic).
-                final.save(save_path)  # plain save to avoid segfaults on some Windows + Pillow + libtiff combos
-                messagebox.showinfo("Image Saved", f"Flattened image (TIFF + painted regions + masked cells) saved to: {save_path}")
+                final.save(save_path)
+                messagebox.showinfo(
+                    "Image Saved",
+                    f"Flattened image (TIFF + regions + atlas + cells) saved to:\n{save_path}",
+                )
             except Exception as e:
                 logger.error(f"Failed to save flattened: {e}")
                 messagebox.showerror("Save Error", f"Could not save the image:\n{e}")
 
     def autosave_flattened_image(self, filename):
-        base_img = getattr(self, 'original_background', None) or getattr(self, 'background_image', None)
-        if base_img is None or not hasattr(base_img, 'size') or base_img.size[0] <= 0 or base_img.size[1] <= 0:
+        final = self._compose_flattened_image()
+        if final is None:
             return
-
-        bg_w, bg_h = base_img.size
-
-        # Start with base
-        composite = base_img.convert('RGBA')
-
-        paste_x = int(self.img_x) if self.img_x is not None else 0
-        paste_y = int(self.img_y) if self.img_y is not None else 0
-
-        try:
-            # Explicit zone mask fill (yellow for painted regions) so filled areas are visible in flat.
-            if self.current_page in getattr(self, 'mask_images', {}) and self.mask_images.get(self.current_page) is not None:
-                try:
-                    m = np.array(self.mask_images[self.current_page])
-                    if m.shape[:2] != (bg_h, bg_w):
-                        m_pil = Image.fromarray(m.astype(np.uint8), mode='L').resize((bg_w, bg_h), Image.NEAREST)
-                        m = np.array(m_pil)
-                    zone_tint = np.zeros((bg_h, bg_w, 4), dtype=np.uint8)
-                    for zid in np.unique(m):
-                        if zid == 0:
-                            continue
-                        reg = (m == zid)
-                        zone_tint[reg, :3] = [255, 255, 0]
-                        zone_tint[reg, 3] = 55
-                    if np.any(zone_tint[..., 3] > 0):
-                        zone_img = Image.fromarray(zone_tint, 'RGBA')
-                        composite = Image.alpha_composite(composite, zone_img)
-                except Exception:
-                    pass
-
-            # Overlay page/atlas tints if present
-            if self.current_page in getattr(self, 'page_images', {}):
-                at_img = self.page_images[self.current_page]
-                if at_img.mode != 'RGBA':
-                    at_img = at_img.convert('RGBA')
-                composite.paste(at_img, (paste_x, paste_y), at_img)
-
-            # Overlay painted regions
-            if getattr(self, 'paint_layer', None) is not None:
-                pl = self.paint_layer
-                if pl.mode != 'RGBA':
-                    pl = pl.convert('RGBA')
-                composite.paste(pl, (0, 0), pl)
-
-            # Overlay detected cells as open red donut rings (boundary only)
-            if getattr(self, 'last_cell_mask', None) is not None:
-                try:
-                    cell_mask = np.asarray(self.last_cell_mask).squeeze()
-                    if cell_mask.ndim != 2:
-                        if cell_mask.size > 0:
-                            cell_mask = cell_mask.reshape(cell_mask.shape[0], -1)
-                        else:
-                            cell_mask = np.zeros((bg_h, bg_w), dtype=bool)
-                    cell_mask = (cell_mask > 0)
-                    ring_overlay = self._cell_detection_ring_overlay(
-                        cell_mask, size=(bg_w, bg_h), color=(255, 0, 0), alpha=200, thickness=2
-                    )
-                    composite = Image.alpha_composite(composite, ring_overlay)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        final = composite.convert('RGB')
         try:
             # Do not pass compression='tiff_deflate' — it can segfault on some Windows Pillow + libtiff builds.
             final.save(filename)
@@ -10841,24 +11096,207 @@ class PDFViewer:
         if self.crop_mode:
             self.region_move_mode.set(False)
             self.border_mode_var.set(False)
-            if getattr(self, 'edit_mode', False):
+            if getattr(self, "edit_mode", False):
                 self.edit_mode = False
                 self.edit_mode_var.set(False)
                 self.output.bind("<Button-1>", self.highlight_region)
                 self.output.unbind("<B1-Motion>")
                 self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
             self.region_translate_active = False
+            self.crop_pending = False
+            self.crop_box = None
+            self._crop_interaction = None
+            self._clear_crop_ui()
             self.output.bind("<Button-1>", self.crop_start)
             self.output.bind("<B1-Motion>", self.crop_drag)
             self.output.bind("<ButtonRelease-1>", self.crop_end)
+            self.output.bind("<Double-Button-1>", self._crop_double_click_apply)
+            self.output.config(cursor="crosshair")
+            self._set_crop_status(
+                "Crop: drag to outline · drag box to move · Enter/double-click to apply · Esc to clear"
+            )
         else:
             self.output.bind("<Button-1>", self.highlight_region)
             self.output.unbind("<B1-Motion>")
             self.output.unbind("<ButtonRelease-1>")
+            try:
+                self.output.unbind("<Double-Button-1>")
+            except Exception:
+                pass
             self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
-            if self.crop_rect:
-                self.output.delete(self.crop_rect)
-                self.crop_rect = None
+            self.output.config(cursor="")
+            self.crop_pending = False
+            self.crop_box = None
+            self._crop_interaction = None
+            self._clear_crop_ui()
+            self._set_crop_status(None)
+
+    def _set_crop_status(self, text):
+        """Show crop instructions in the window title while crop mode is active."""
+        base = "Regional IF Analyzer"
+        try:
+            if getattr(self, "current_state", None) == "paint":
+                # paint indicator owns the title
+                return
+            if text:
+                self.master.title(f"{base} — {text}")
+            else:
+                cur = self.master.title() or base
+                if "Crop:" in cur:
+                    self.master.title(base)
+        except Exception:
+            pass
+
+    def _clear_crop_ui(self):
+        """Remove crop outline / shade overlays from the canvas."""
+        ids = list(getattr(self, "crop_ui_ids", None) or [])
+        if self.crop_rect is not None and self.crop_rect not in ids:
+            ids.append(self.crop_rect)
+        for iid in ids:
+            try:
+                self.output.delete(iid)
+            except Exception:
+                pass
+        try:
+            self.output.delete("crop_ui")
+        except Exception:
+            pass
+        self.crop_ui_ids = []
+        self.crop_rect = None
+
+    def _normalize_crop_box(self, x1, y1, x2, y2):
+        left, right = (x1, x2) if x1 <= x2 else (x2, x1)
+        top, bottom = (y1, y2) if y1 <= y2 else (y2, y1)
+        return float(left), float(top), float(right), float(bottom)
+
+    def _point_in_crop_box(self, x, y, margin=0.0):
+        if not self.crop_box:
+            return False
+        left, top, right, bottom = self.crop_box
+        return (left - margin) <= x <= (right + margin) and (top - margin) <= y <= (
+            bottom + margin
+        )
+
+    def _draw_crop_outline(self):
+        """Draw a clear crop frame: dim outside, dual outline, move hint."""
+        self._clear_crop_ui()
+        if not self.crop_box:
+            return
+        left, top, right, bottom = self.crop_box
+        if right - left < 1 or bottom - top < 1:
+            return
+
+        # Canvas extent for outside dimming
+        try:
+            bb = self.output.bbox("all")
+        except Exception:
+            bb = None
+        if bb:
+            cx0, cy0, cx1, cy1 = bb
+        else:
+            cx0, cy0 = 0, 0
+            cx1 = max(int(self.output.winfo_width()), int(right) + 50)
+            cy1 = max(int(self.output.winfo_height()), int(bottom) + 50)
+        # Expand a bit so shade covers empty margins
+        pad = 4000
+        cx0, cy0 = min(cx0, left) - pad, min(cy0, top) - pad
+        cx1, cy1 = max(cx1, right) + pad, max(cy1, bottom) + pad
+
+        ids = []
+        # Four shade panels outside the crop window (stipple ≈ semi-transparent)
+        shade_kw = dict(fill="#000000", stipple="gray50", outline="", tags="crop_ui")
+        # Top
+        if top > cy0:
+            ids.append(
+                self.output.create_rectangle(cx0, cy0, cx1, top, **shade_kw)
+            )
+        # Bottom
+        if bottom < cy1:
+            ids.append(
+                self.output.create_rectangle(cx0, bottom, cx1, cy1, **shade_kw)
+            )
+        # Left (between top/bottom of crop)
+        if left > cx0:
+            ids.append(
+                self.output.create_rectangle(cx0, top, left, bottom, **shade_kw)
+            )
+        # Right
+        if right < cx1:
+            ids.append(
+                self.output.create_rectangle(right, top, cx1, bottom, **shade_kw)
+            )
+
+        # High-contrast outline: white underlay + solid red crop frame
+        ids.append(
+            self.output.create_rectangle(
+                left,
+                top,
+                right,
+                bottom,
+                outline="#ffffff",
+                width=5,
+                tags="crop_ui",
+            )
+        )
+        self.crop_rect = self.output.create_rectangle(
+            left,
+            top,
+            right,
+            bottom,
+            outline="#ff1a1a",
+            width=3,
+            dash=(),
+            tags="crop_ui",
+        )
+        ids.append(self.crop_rect)
+
+        # Corner ticks for a clear “window” look
+        tick = max(8.0, min(24.0, 0.08 * min(right - left, bottom - top)))
+        tick_kw = dict(fill="#ff1a1a", width=3, tags="crop_ui")
+        for x, y, dx, dy in (
+            (left, top, tick, 0),
+            (left, top, 0, tick),
+            (right, top, -tick, 0),
+            (right, top, 0, tick),
+            (left, bottom, tick, 0),
+            (left, bottom, 0, -tick),
+            (right, bottom, -tick, 0),
+            (right, bottom, 0, -tick),
+        ):
+            ids.append(self.output.create_line(x, y, x + dx, y + dy, **tick_kw))
+
+        # Instruction label just above the box
+        label = "Crop window — drag to move · Enter to apply · Esc clear · click outside to re-draw"
+        if self.crop_pending:
+            # Shadow first, then light text on top
+            ids.append(
+                self.output.create_text(
+                    (left + right) / 2.0 + 1,
+                    top - 13,
+                    text=label,
+                    fill="#000000",
+                    font=("Helvetica", 10, "bold"),
+                    anchor="s",
+                    tags="crop_ui",
+                )
+            )
+            ids.append(
+                self.output.create_text(
+                    (left + right) / 2.0,
+                    top - 14,
+                    text=label,
+                    fill="#ffdddd",
+                    font=("Helvetica", 10, "bold"),
+                    anchor="s",
+                    tags="crop_ui",
+                )
+            )
+
+        self.crop_ui_ids = ids
+        try:
+            self.output.tag_raise("crop_ui")
+        except Exception:
+            pass
 
     def _brain_image_aspect_ratio(self):
         """Width/height of the loaded brain-slice TIFF (for locked crop aspect).
@@ -10917,44 +11355,131 @@ class PDFViewer:
         return end_x, end_y
 
     def crop_start(self, event):
-        self.start_x = self.output.canvasx(event.x)
-        self.start_y = self.output.canvasy(event.y)
-        if self.crop_rect:
-            self.output.delete(self.crop_rect)
-        self.crop_rect = self.output.create_rectangle(
-            self.start_x, self.start_y, self.start_x, self.start_y,
-            outline='red', dash=(4, 4),
-        )
+        cx = self.output.canvasx(event.x)
+        cy = self.output.canvasy(event.y)
+        self.start_x = cx
+        self.start_y = cy
+
+        # Pending selection: drag inside to move; click outside to re-draw
+        if self.crop_pending and self.crop_box and self._point_in_crop_box(cx, cy):
+            self._crop_interaction = "move"
+            self._crop_move_origin = (cx, cy)
+            self._crop_box_at_move_start = tuple(self.crop_box)
+            self.output.config(cursor="fleur")
+            return
+
+        # Start a new rubber-band draw
+        self._crop_interaction = "draw"
+        self.crop_pending = False
+        self._crop_draw_anchor = (cx, cy)
+        self.crop_box = (cx, cy, cx, cy)
+        self.output.config(cursor="crosshair")
+        self._draw_crop_outline()
 
     def crop_drag(self, event):
-        cur_x = self.output.canvasx(event.x)
-        cur_y = self.output.canvasy(event.y)
-        end_x, end_y = self._lock_crop_corner_to_image_aspect(
-            self.start_x, self.start_y, cur_x, cur_y
-        )
-        self.output.coords(self.crop_rect, self.start_x, self.start_y, end_x, end_y)
+        cx = self.output.canvasx(event.x)
+        cy = self.output.canvasy(event.y)
+        mode = getattr(self, "_crop_interaction", None)
+
+        if mode == "move" and self._crop_box_at_move_start and self._crop_move_origin:
+            ox, oy = self._crop_move_origin
+            dx = cx - ox
+            dy = cy - oy
+            l0, t0, r0, b0 = self._crop_box_at_move_start
+            self.crop_box = (l0 + dx, t0 + dy, r0 + dx, b0 + dy)
+            self._draw_crop_outline()
+            return
+
+        if mode == "draw" and self._crop_draw_anchor is not None:
+            ax, ay = self._crop_draw_anchor
+            end_x, end_y = self._lock_crop_corner_to_image_aspect(ax, ay, cx, cy)
+            self.crop_box = self._normalize_crop_box(ax, ay, end_x, end_y)
+            self.start_x, self.start_y = ax, ay
+            self._draw_crop_outline()
 
     def crop_end(self, event):
-        cur_x = self.output.canvasx(event.x)
-        cur_y = self.output.canvasy(event.y)
-        end_x, end_y = self._lock_crop_corner_to_image_aspect(
-            self.start_x, self.start_y, cur_x, cur_y
+        """Finish draw or move — keep outlined selection pending (do not crop yet)."""
+        cx = self.output.canvasx(event.x)
+        cy = self.output.canvasy(event.y)
+        mode = getattr(self, "_crop_interaction", None)
+        self._crop_interaction = None
+        self.output.config(cursor="crosshair" if self.crop_mode else "")
+
+        if mode == "move":
+            # Box already updated during drag; stay pending
+            if self.crop_box:
+                self.crop_pending = True
+                self._draw_crop_outline()
+                self._set_crop_status(
+                    "Crop: drag box to move · Enter/double-click to apply · Esc to clear · click outside to re-draw"
+                )
+            self._crop_move_origin = None
+            self._crop_box_at_move_start = None
+            return
+
+        if mode != "draw" or self._crop_draw_anchor is None:
+            return
+
+        ax, ay = self._crop_draw_anchor
+        end_x, end_y = self._lock_crop_corner_to_image_aspect(ax, ay, cx, cy)
+        left, top, right, bottom = self._normalize_crop_box(ax, ay, end_x, end_y)
+        self._crop_draw_anchor = None
+
+        # Too small → clear (click without drag)
+        if (right - left) < 8 or (bottom - top) < 8:
+            self.crop_pending = False
+            self.crop_box = None
+            self._clear_crop_ui()
+            self._set_crop_status(
+                "Crop: drag to outline · drag box to move · Enter/double-click to apply · Esc to clear"
+            )
+            return
+
+        self.crop_box = (left, top, right, bottom)
+        self.crop_pending = True
+        self._draw_crop_outline()
+        self._set_crop_status(
+            "Crop: drag box to move · Enter/double-click to apply · Esc to clear · click outside to re-draw"
         )
+
+    def _crop_double_click_apply(self, event=None):
+        if self.crop_mode and self.crop_pending and self.crop_box:
+            self._apply_pending_crop()
+            return "break"
+
+    def _on_escape_key(self, event=None):
+        """Escape clears a pending crop selection; otherwise no-op."""
+        if getattr(self, "crop_mode", False) and (
+            getattr(self, "crop_pending", False) or self.crop_box
+        ):
+            self.crop_pending = False
+            self.crop_box = None
+            self._crop_interaction = None
+            self._clear_crop_ui()
+            self._set_crop_status(
+                "Crop: drag to outline · drag box to move · Enter/double-click to apply · Esc to clear"
+            )
+            return "break"
+        return None
+
+    def _apply_pending_crop(self):
+        """Apply the pending canvas crop box to atlas rasters (same as former crop_end)."""
+        if not self.crop_box:
+            return
+        left_c, top_c, right_c, bottom_c = self.crop_box
         page = self.current_page
 
         # Convert canvas-space crop rectangle → atlas *native* (model) coordinates.
-        # Atlas rasters live in model space; canvas includes view_scale + img_x/img_y.
-        mx1, my1 = self._canvas_to_atlas(self.start_x, self.start_y)
-        mx2, my2 = self._canvas_to_atlas(end_x, end_y)
+        mx1, my1 = self._canvas_to_atlas(left_c, top_c)
+        mx2, my2 = self._canvas_to_atlas(right_c, bottom_c)
         mleft = min(mx1, mx2)
         mtop = min(my1, my2)
         mright = max(mx1, mx2)
         mbottom = max(my1, my2)
 
-        # Canvas TL of the selection — used to re-place the cropped layer so it
-        # does not jump after crop.
-        cleft = min(self.start_x, end_x)
-        ctop = min(self.start_y, end_y)
+        # Canvas TL of the selection — used to re-place the cropped layer
+        cleft = min(left_c, right_c)
+        ctop = min(top_c, bottom_c)
 
         # Reference size from the clean base (or current page image)
         if page in self.base_page_images and self.base_page_images[page] is not None:
@@ -10962,6 +11487,9 @@ class PDFViewer:
         else:
             img0 = self.load_page_image()
             if img0 is None:
+                self.crop_pending = False
+                self.crop_box = None
+                self._clear_crop_ui()
                 self.show_page()
                 self.toggle_crop_mode()
                 return
@@ -10977,9 +11505,11 @@ class PDFViewer:
         right = max(left, min(right, ref_w))
         bottom = max(top, min(bottom, ref_h))
         if right - left < 2 or bottom - top < 2:
-            # Degenerate rect (click with no drag, or outside atlas)
-            self.show_page()
-            self.toggle_crop_mode()
+            messagebox.showinfo(
+                "Crop",
+                "Crop window is empty or outside the atlas.\n"
+                "Drag a selection over the atlas, move it if needed, then press Enter.",
+            )
             return
 
         box = (left, top, right, bottom)
@@ -10991,7 +11521,6 @@ class PDFViewer:
         def _crop_rgba(im):
             if im is None:
                 return None
-            # Match reference size if a layer drifted
             if im.size != (ref_w, ref_h):
                 im = im.resize((ref_w, ref_h), Image.NEAREST)
             out = im.crop(box)
@@ -11016,8 +11545,7 @@ class PDFViewer:
                 mimg = mimg.resize((ref_w, ref_h), Image.NEAREST)
             self.mask_images[page] = mimg.crop(box)
 
-        # Critical for Allen: pure border layer was previously left full-size, then
-        # _rebuild_page_overlays resized it into the crop → looked like a whole-atlas scale.
+        # Critical for Allen: pure border layer must crop with the atlas
         pure = getattr(self, "allen_borders_pure", None)
         if pure is not None and getattr(self, "atlas_filetype", None) == "allen":
             if pure.size != (ref_w, ref_h):
@@ -11026,14 +11554,12 @@ class PDFViewer:
             if self.allen_borders_pure.mode != "RGBA":
                 self.allen_borders_pure = self.allen_borders_pure.convert("RGBA")
 
-        # Keep self.img in sync if present
         if getattr(self, "img", None) is not None and page in self.base_page_images:
             try:
                 self.img = self.base_page_images[page].copy()
             except Exception:
                 pass
 
-        # Drop tiny/orphan zones and any border ink that does not outline a remaining structure
         self._cleanup_loose_borders_after_crop(page)
 
         # Rebase placement in *model* space so (0,0) of the crop sits where the
@@ -11041,6 +11567,11 @@ class PDFViewer:
         vs = self.view_scale if self.view_scale else 1.0
         self.img_x = float(cleft) / vs
         self.img_y = float(ctop) / vs
+
+        # Clear pending crop UI before show_page
+        self.crop_pending = False
+        self.crop_box = None
+        self._clear_crop_ui()
 
         clear_preprocess_cache()
         self._rebuild_page_overlays(page)
@@ -11059,8 +11590,11 @@ class PDFViewer:
         self.region_move_mode.set(False)
 
         self.show_page()
-        self.toggle_crop_mode()
-        if getattr(self, 'count_button', None) is not None and not getattr(self, 'count_button_packed', False):
+        if self.crop_mode:
+            self.toggle_crop_mode()
+        if getattr(self, "count_button", None) is not None and not getattr(
+            self, "count_button_packed", False
+        ):
             try:
                 self.count_button.pack(side=tk.LEFT, padx=10, pady=10)
                 self.count_button_packed = True
@@ -11370,13 +11904,20 @@ class PDFViewer:
             if getattr(self, 'crop_mode', False):
                 self.crop_mode = False
                 self.crop_mode_var.set(False)
+                self.crop_pending = False
+                self.crop_box = None
+                self._crop_interaction = None
+                self._clear_crop_ui()
+                self._set_crop_status(None)
+                try:
+                    self.output.unbind("<Double-Button-1>")
+                except Exception:
+                    pass
                 self.output.bind("<Button-1>", self.highlight_region)
                 self.output.unbind("<B1-Motion>")
                 self.output.unbind("<ButtonRelease-1>")
                 self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
-                if self.crop_rect:
-                    self.output.delete(self.crop_rect)
-                    self.crop_rect = None
+                self.output.config(cursor="")
             self.region_translate_active = False
             self.output.bind("<Button-1>", self.drag_start)
             self.output.bind("<B1-Motion>", self.drag_move)
@@ -12100,6 +12641,7 @@ class PDFViewer:
         global_frame.pack(fill='x', padx=4, pady=2)
         ttk.Label(global_frame, text="Global:").pack(side=tk.LEFT)
         ttk.Checkbutton(global_frame, text="Crop", variable=self.crop_mode_var, command=self.toggle_crop_mode, width=7).pack(side=tk.LEFT, padx=1)
+        ttk.Button(global_frame, text="Apply Crop", command=self._apply_pending_crop, width=10).pack(side=tk.LEFT, padx=1)
         ttk.Checkbutton(global_frame, text="Move", variable=self.edit_mode_var, command=self.toggle_edit_mode, width=7).pack(side=tk.LEFT, padx=1)
         ttk.Button(global_frame, text="Clear Atlas", command=self.clear_atlas, width=11).pack(side=tk.LEFT, padx=6)
         ttk.Button(global_frame, text="Next Channel…", command=self.next_channel, width=13).pack(side=tk.LEFT, padx=2)
@@ -12206,13 +12748,19 @@ class PDFViewer:
             if getattr(self, 'crop_mode', False):
                 self.crop_mode = False
                 self.crop_mode_var.set(False)
+                self.crop_pending = False
+                self.crop_box = None
+                self._crop_interaction = None
+                self._clear_crop_ui()
+                self._set_crop_status(None)
+                try:
+                    self.output.unbind("<Double-Button-1>")
+                except Exception:
+                    pass
                 self.output.bind("<Button-1>", self.highlight_region)
                 self.output.unbind("<B1-Motion>")
                 self.output.unbind("<ButtonRelease-1>")
                 self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
-                if self.crop_rect:
-                    self.output.delete(self.crop_rect)
-                    self.crop_rect = None
             self.region_translate_active = False
             self.region_translate_original_mask = None
             self.region_translate_zid = None
@@ -12241,13 +12789,19 @@ class PDFViewer:
             if getattr(self, 'crop_mode', False):
                 self.crop_mode = False
                 self.crop_mode_var.set(False)
+                self.crop_pending = False
+                self.crop_box = None
+                self._crop_interaction = None
+                self._clear_crop_ui()
+                self._set_crop_status(None)
+                try:
+                    self.output.unbind("<Double-Button-1>")
+                except Exception:
+                    pass
                 self.output.bind("<Button-1>", self.highlight_region)
                 self.output.unbind("<B1-Motion>")
                 self.output.unbind("<ButtonRelease-1>")
                 self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
-                if self.crop_rect:
-                    self.output.delete(self.crop_rect)
-                    self.crop_rect = None
             # also ensure region translate not conflicting
             self.region_translate_active = False
             self.region_translate_original_mask = None
@@ -13186,11 +13740,16 @@ class PDFViewer:
         self.output.config(cursor="")
 
     def _commit_painted_border_refit(self, event=None):
-        """Called on Enter/Return after border drag on a painted region.
-        Commits the current mask shape (yellow expansion) by refitting the black drawn
-        boundary (updating painted_zone_outlines from the live mask contour and
-        rebuilding the paint_layer). This is the explicit 'save' step for the expanded shape.
+        """Enter/Return: apply pending crop if active, else commit painted border refit.
+
+        For crop: applies the outlined crop window after the user has drawn/moved it.
+        For paint: commits the current mask shape (yellow expansion) by refitting the
+        black drawn boundary (updating painted_zone_outlines from the live mask contour).
         """
+        if getattr(self, "crop_mode", False) and getattr(self, "crop_pending", False):
+            self._apply_pending_crop()
+            return "break"
+
         zid = getattr(self, 'selected_zone_id', None)
         if not zid or zid not in getattr(self, 'painted_zone_outlines', {}):
             return
@@ -13913,12 +14472,8 @@ class PDFViewer:
             cur = path_var.get().strip()
             if cur and os.path.isfile(cur):
                 initial = os.path.dirname(cur)
-            elif self.tiff_dir and os.path.isdir(self.tiff_dir):
-                out = os.path.join(self.tiff_dir, "output")
-                initial = out if os.path.isdir(out) else self.tiff_dir
-            elif self.current_tiff_directory and os.path.isdir(self.current_tiff_directory):
-                out = os.path.join(self.current_tiff_directory, "output")
-                initial = out if os.path.isdir(out) else self.current_tiff_directory
+            else:
+                initial = self._preferred_open_dir(feature="intensities")
             p = fd.askopenfilename(
                 title="Select counterstain normalization file",
                 initialdir=initial,
@@ -14132,7 +14687,7 @@ class PDFViewer:
     def _export_region_intensity_workbook(
         self, df, meta, out_dir, base_name, *, kind="intensities"
     ):
-        """Write intensity results like Count Cells: multi-sheet .xlsx under output/.
+        """Write intensity results as multi-sheet .xlsx under output/intensities/.
 
         kind:
           - ``intensities`` → ``{base}_intensities.xlsx`` sheet Region Intensities
@@ -14219,8 +14774,12 @@ class PDFViewer:
             logger.error(f"Intensity CSV fallback failed: {e}", exc_info=True)
             return None, None
 
-    def _intensity_output_basename_and_dir(self):
-        """Resolve (base_name, tiff_dir, out_dir) for intensity exports."""
+    def _intensity_output_basename_and_dir(self, feature="intensities"):
+        """Resolve (base_name, tiff_dir, out_dir) for intensity / PNN exports.
+
+        ``feature`` selects the output subfolder (default ``intensities``;
+        use ``pnn`` for perineuronal tables).
+        """
         base_name = self.tiff_filename
         tiff_dir = self.tiff_dir or self.current_tiff_directory
         if not base_name and getattr(self, "current_tiff_path", None):
@@ -14229,7 +14788,7 @@ class PDFViewer:
                 tiff_dir = os.path.dirname(self.current_tiff_path)
         if not base_name:
             base_name = "regions"
-        out_dir = self._get_output_directory(tiff_dir) if tiff_dir else None
+        out_dir = self._get_output_directory(tiff_dir, feature=feature) if tiff_dir else None
         return base_name, tiff_dir, out_dir
 
     def measure_counterstain_normalization(self):
@@ -14368,7 +14927,7 @@ class PDFViewer:
 
         Prompts for optional background subtraction (Xth percentile within each
         region) and counterstain normalization (file from Counterstain
-        Normalization Measurement). Writes multi-sheet Excel under output/.
+        Normalization Measurement). Writes multi-sheet Excel under output/intensities/.
         """
         try:
             # Confirm atlas/image exist before showing options dialog
@@ -14448,7 +15007,7 @@ class PDFViewer:
                         "Measure Complete",
                         f"Measured {n_rows} region(s), but no output folder was available "
                         "and save was cancelled.\n\nOpen a TIFF from the File Browser so "
-                        "results can be written to <folder>/output/.",
+                        "results can be written to <folder>/output/intensities/.",
                     )
                     if self.show_zone_intensity_labels_var.get():
                         self._open_zone_intensity_window()
@@ -14573,7 +15132,7 @@ class PDFViewer:
     def _load_saved_counts_df(self):
         """Load zone counts from a saved CSV/XLSX for the current TIFF, if present.
 
-        Prefers <image_dir>/output/, then legacy files beside the TIFF.
+        Prefers <image_dir>/output/counts/ (and other feature dirs), then legacy files beside the TIFF.
         """
         if not self.tiff_dir or not self.tiff_filename:
             return None
@@ -15143,8 +15702,9 @@ class PDFViewer:
 
             base_name = self.tiff_filename
             tiff_dir = self.tiff_dir
-            # All Count Cells exports go under <image_dir>/output/
-            out_dir = self._get_output_directory(tiff_dir) if tiff_dir else None
+            # Count Cells exports go under <image_dir>/output/counts/
+            out_dir = self._get_output_directory(tiff_dir, feature="counts") if tiff_dir else None
+            paint_out = self._get_output_directory(tiff_dir, feature="paint") if tiff_dir else None
 
             saved_paths = []  # for summary dialog
             masked_path = None
@@ -15222,11 +15782,11 @@ class PDFViewer:
                 except Exception as e:
                     logger.error(f"Failed to save cell centroids CSV: {e}")
 
-            # Always auto-save paint layer into output/ when counting (if any paint/zones exist)
-            if out_dir and base_name:
+            # Always auto-save paint layer into output/paint/ when counting
+            if paint_out and base_name:
                 try:
                     paint_path = self._save_paint_layer_to_dir(
-                        out_dir, base_name, unique=False, show_messages=False
+                        paint_out, base_name, unique=False, show_messages=False
                     )
                     if paint_path:
                         saved_paths.append(f"Paint: {paint_path}")
@@ -15253,7 +15813,13 @@ class PDFViewer:
                     logger.error(f"Failed to save mask metadata on count: {e}")
 
             if out_dir and saved_paths:
-                summary = "Results saved to output folder:\n" + out_dir + "\n\n" + "\n".join(saved_paths)
+                summary = (
+                    "Results saved by feature under output/:\n"
+                    f"  counts → {out_dir}\n"
+                )
+                if paint_out:
+                    summary += f"  paint  → {paint_out}\n"
+                summary += "\n" + "\n".join(saved_paths)
                 messagebox.showinfo("Results Saved", summary)
             elif not tiff_dir or not base_name:
                 logger.warning("Skipping auto-save of count results (missing tiff_dir or base_name)")
@@ -15427,25 +15993,27 @@ class PDFViewer:
         return -1
 
     def _autosave_before_image_switch(self):
-        """Autosave flattened + counts (if any) into <image_dir>/output/ before leaving."""
+        """Autosave flattened + counts + paint into feature output subfolders before leaving."""
         did_autosave = False
         if not (getattr(self, "original_background", None) or getattr(self, "background_image", None)):
             return did_autosave
         try:
-            out_dir = self._get_output_directory(self.tiff_dir) if self.tiff_dir else None
-            if self.tiff_dir and self.tiff_filename and out_dir:
-                image_path = os.path.join(out_dir, f"{self.tiff_filename}_flattened.tif")
+            flat_dir = self._get_output_directory(self.tiff_dir, feature="flattened") if self.tiff_dir else None
+            counts_dir = self._get_output_directory(self.tiff_dir, feature="counts") if self.tiff_dir else None
+            paint_dir = self._get_output_directory(self.tiff_dir, feature="paint") if self.tiff_dir else None
+            if self.tiff_dir and self.tiff_filename and flat_dir:
+                image_path = os.path.join(flat_dir, f"{self.tiff_filename}_flattened.tif")
                 self.autosave_flattened_image(image_path)
                 did_autosave = True
-            if self.last_df is not None and self.tiff_dir and self.tiff_filename and out_dir:
-                csv_path = os.path.join(out_dir, f"{self.tiff_filename}_counts.csv")
+            if self.last_df is not None and self.tiff_dir and self.tiff_filename and counts_dir:
+                csv_path = os.path.join(counts_dir, f"{self.tiff_filename}_counts.csv")
                 self.last_df.to_csv(csv_path, index=False)
                 did_autosave = True
-            # Also refresh paint export into output/ if paint exists
-            if out_dir and self.tiff_filename:
+            # Also refresh paint export into output/paint/ if paint exists
+            if paint_dir and self.tiff_filename:
                 try:
                     self._save_paint_layer_to_dir(
-                        out_dir, self.tiff_filename, unique=False, show_messages=False
+                        paint_dir, self.tiff_filename, unique=False, show_messages=False
                     )
                 except Exception:
                     pass
@@ -16178,4 +16746,5 @@ def clear_preprocess_cache():
     logger.debug("Cleared preprocessing cache")
 
 if __name__ == "__main__":
+    _configure_windows_app_identity()
     PDFViewer()

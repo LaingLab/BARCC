@@ -7,7 +7,7 @@ A GUI tool for analyzing immunofluorescence images with atlas region mapping and
 - **`.catlas`** save/load: full labeled atlas + paint schematic for multi-channel reuse; placement scale fix.
 - **Next Channel…** keeps atlas/structures; **Clear Atlas**; paint-on-atlas registers for Count Cells.
 - **Axons and Nets**: region intensity with BG percentile + counterstain normalization; Pre/Post correction columns.
-- **Save/Load Cell Mask** across channels; **random null** cell masks (region-stratified); **perineuronal** shells (150% area) + intensity exports (by structure + per-cell, true and random).
+- **Save/Load Cell Mask** across channels; **random null** cell masks (region-stratified); **perineuronal** shells (2x cell area) + intensity exports (by structure + per-cell, true and random).
 - Version: **8.08.000**.
 
 See [release-notes-v8.08.000.md](release-notes-v8.08.000.md) for full details.

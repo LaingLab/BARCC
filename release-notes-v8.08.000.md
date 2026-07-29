@@ -45,7 +45,7 @@ Major multi-channel atlas, intensity, and cell-mask release. Allen Mouse Atlas i
 - Display: **red** = GT, **cyan** = random. Optional seed + save.
 
 ### Perineuronal (PNN) shells
-- **Draw Perineuronal Masks**: shell between cell boundary and outer disk of **150% cell area**.
+- **Draw Perineuronal Masks**: shell between cell boundary and outer disk of **2× cell area**.
 - Also draws shells for random cells when present (magenta = true PNN, yellow = random PNN).
 - **Measure Perineuronal Intensity…** exports:
   - `{name}_pnn_by_structure.xlsx` — per structure: True/Random Mean, SEM_Mean, Median, SEM_Median.
