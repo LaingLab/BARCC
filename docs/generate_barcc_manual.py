@@ -25,6 +25,9 @@ MANUAL_SUBTITLE = "User Manual"
 VERSION = "8.08.000"
 OUTPUT_FILENAME = "BARCC_User_Manual.pdf"
 OUTPUT_DIR = ".."  # Place PDF in repository root
+# Figures for workflows (relative to this script's directory)
+_DOCS_DIR = os.path.dirname(os.path.abspath(__file__))
+MANUAL_IMAGES_DIR = os.path.join(_DOCS_DIR, "manual_images")
 
 
 # Professional color scheme
@@ -278,6 +281,48 @@ class BARCCUserManual(FPDF):
         self.multi_cell(166, 5.5, self._safe_text(text))
         y_end = self.get_y()
         self.rect(25, y_start, 166, y_end - y_start, "D")
+        self.ln(4)
+
+    def add_figure(self, filename: str, caption: str = "", max_width: float = 160, max_height: float = 200):
+        """Embed a PNG/JPG from manual_images/, scaled to fit (sizes in mm)."""
+        path = filename
+        if not os.path.isabs(path):
+            path = os.path.join(MANUAL_IMAGES_DIR, filename)
+        if not os.path.isfile(path):
+            self.set_font("Helvetica", "I", 9)
+            self.set_text_color(*GRAY_TEXT)
+            self.multi_cell(0, 5, self._safe_text(f"[Figure missing: {filename}]"))
+            self.set_text_color(*DARK_TEXT)
+            self.ln(2)
+            return
+
+        try:
+            from PIL import Image as PILImage
+            with PILImage.open(path) as im:
+                iw, ih = im.size
+        except Exception:
+            iw, ih = 1400, 1000
+
+        aspect = float(ih) / float(iw) if iw else 1.0
+        w_mm = float(max_width)
+        h_mm = w_mm * aspect
+        if h_mm > max_height:
+            h_mm = float(max_height)
+            w_mm = h_mm / aspect if aspect else max_width
+
+        # New page if figure would overflow
+        if self.get_y() + h_mm + 20 > self.h - 22:
+            self.add_page()
+
+        x = (self.w - w_mm) / 2.0
+        self.image(path, x=x, w=w_mm, h=h_mm)
+        self.ln(2)
+        if caption:
+            self.set_font("Helvetica", "I", 9)
+            self.set_text_color(*GRAY_TEXT)
+            self.multi_cell(0, 4.5, self._safe_text(f"Figure. {caption}"), align="C")
+            self.set_text_color(*DARK_TEXT)
+            self.set_font("Helvetica", "", 10.5)
         self.ln(4)
 
     # ------------------------------------------------------------------
@@ -1420,19 +1465,89 @@ def build_manual():
         "(used later as a divisor for axon/PNN channels)."
     )
 
-    pdf.chapter_title("Draw / Measure Perineuronal Masks", 1)
+    pdf.chapter_title("Perineuronal (PNN) multi-channel workflow", 1)
     pdf.body(
-        "Draw Perineuronal Masks builds a shell around each cell from the outer boundary of the cell "
-        "mask out to a disk whose area is 150% of the cell area (shell = outer disk minus cell bodies). "
-        "If a random cell mask exists, random PNN shells are drawn as well."
+        "The recommended pipeline labels anatomy on the counterstain, detects cells on a cell channel, "
+        "then measures perineuronal intensity on the quantification channel. Use the Axons and Nets and "
+        "Cell menus as follows."
+    )
+
+    pdf.add_figure(
+        "pnn_workflow_banner.png",
+        "Seven-step PNN workflow at a glance (counterstain labeling through intensity export).",
+        max_width=168,
+        max_height=55,
+    )
+
+    pdf.chapter_title("Step-by-step PNN procedure", 1)
+
+    pdf.chapter_title("Step 1 — Regions on counterstain; save .catlas", 2)
+    pdf.body(
+        "Open the counterstain image (e.g. DAPI / channel 0). Draw or import atlas regions "
+        "(Allen plate, PDF atlas, or paint). Align with Fit / Move / Crop as needed. "
+        "Save Atlas Schematic as a .catlas (cropped atlas) file under output/."
+    )
+
+    pdf.chapter_title("Step 2 — Cell channel + import .catlas", 2)
+    pdf.body(
+        "Open the image channel that contains the cells of interest (or use Next Channel while "
+        "keeping the atlas). If the atlas is not already present, Load Atlas Schematic (.catlas) "
+        "onto this channel so regions match the counterstain labeling."
+    )
+
+    pdf.chapter_title("Step 3 — Identify cells; save Cell Mask", 2)
+    pdf.body(
+        "On the cell channel, run Cell > Show Mask / Show Mask Settings. Tune detection parameters, "
+        "and use Add/Remove/Split Cell for QC. When satisfied, Cell > Save Cell Mask "
+        "(.barccmask / PNG) so the same detections can be reused on other channels."
+    )
+
+    pdf.chapter_title("Step 4 — PNN quantification channel; import .catlas + Cell Mask", 2)
+    pdf.body(
+        "Open the channel used for perineuronal-space intensity. Import the same .catlas (if needed) "
+        "and Cell > Load Cell Mask so regions and cell locations match the prior steps. "
+        "The loaded cell mask is locked for Count Cells / PNN until you re-detect with Show Mask."
+    )
+
+    pdf.chapter_title("Step 5 — Random cell masks (control distribution)", 2)
+    pdf.body(
+        "Cell > Generate Random Cell Mask creates a matched-pair null: each random cell has the same "
+        "size/shape as one true cell, at a new XY. With a .catlas loaded, placement is stratified by "
+        "region. Display: red = true cells, cyan = random. (Count Cells still uses only the true mask.)"
+    )
+
+    pdf.chapter_title("Step 6 — Draw perineuronal masks", 2)
+    pdf.body(
+        "Axons and Nets > Draw Perineuronal Masks builds shells from each cell boundary out to a disk "
+        "of 150% cell area (shell = outer disk minus cell bodies). If random cells exist, random "
+        "perineuronal shells are drawn too. Display: magenta = true PNN; yellow = random PNN."
+    )
+
+    pdf.chapter_title("Step 7 — Measure perineuronal intensities", 2)
+    pdf.body(
+        "Axons and Nets > Measure Perineuronal Intensity measures mean intensity in each shell and "
+        "writes spreadsheets under output/:"
     )
     pdf.bullet_list([
-        "Display: magenta = true PNN shells; yellow = random PNN shells (cells remain red/cyan).",
-        "Measure Perineuronal Intensity exports:",
-        "  - {name}_pnn_by_structure.xlsx — per structure: True/Random Mean, SEM_Mean, Median, SEM_Median",
-        "  - {name}_pnn_cells_true.xlsx — per true cell: Cell_Area + Perineuronal_Intensity",
-        "  - {name}_pnn_cells_random.xlsx — same for random cells (if present)",
+        "{name}_pnn_by_structure.xlsx — one row per atlas structure: True/Random Mean, SEM_Mean, Median, SEM_Median",
+        "{name}_pnn_cells_true.xlsx — one row per true cell: Cell_Area + Perineuronal_Intensity",
+        "{name}_pnn_cells_random.xlsx — same for random cells (when random PNN masks exist)",
     ])
+
+    pdf.add_figure(
+        "pnn_workflow_overview.png",
+        "Detailed PNN workflow: (1) regions + .catlas on counterstain; (2) cell channel + .catlas; "
+        "(3) tune and save Cell Mask; (4) PNN channel + .catlas + Cell Mask; (5) random control cells; "
+        "(6) draw perineuronal shells; (7) measure and export intensities.",
+        max_width=155,
+        max_height=200,
+    )
+
+    pdf.note_box(
+        "Shell geometry: for cell area A, the outer disk has area 1.5 x A; the perineuronal mask is "
+        "the ring between the cell body and that outer boundary. Re-draw PNN shells after regenerating "
+        "random cells."
+    )
 
     # ------------------------------------------------------------------
     # 10. COUNTING & RESULTS
