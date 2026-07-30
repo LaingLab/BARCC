@@ -2,15 +2,18 @@
 
 A GUI tool for analyzing immunofluorescence images with atlas region mapping and automated cell counting.
 
-**v8.08.000 Highlights** (current)
-- **Allen Mouse Atlas** + semi-auto stitch (Reflect/move/rotate), Fit/Crop, hemisphere labels **`_r` / `_l`**.
-- **`.catlas`** save/load: full labeled atlas + paint schematic for multi-channel reuse; placement scale fix.
-- **Next Channel…** keeps atlas/structures; **Clear Atlas**; paint-on-atlas registers for Count Cells.
-- **Axons and Nets**: region intensity with BG percentile + counterstain normalization; Pre/Post correction columns.
-- **Save/Load Cell Mask** across channels; **random null** cell masks (region-stratified); **perineuronal** shells (2x cell area) + intensity exports (by structure + per-cell, true and random).
-- Version: **8.08.000**.
+**v8.09.000 Highlights** (current)
+- **Adaptive detection** (Blob/DoG overlay): tile thresholds, dual-pass, density packing.
+- **Peak quality filters**: local SNR, bg-relative, isotropy, circularity, tissue-edge reject.
+- **Area Tune**: 10 per-cell diameter lines → min/max blob area (0.7×–1.5× mean); preserved over Measure Tune.
+- **Measure Tune TP/FP/FN/TN**: label the current mask; precision (FP/TN) or recall (TP/FN) passes; feeds Smart Suggest.
+- **Smarter Smart Suggest**: regional bright/dark diagnosis, joint Adaptive+SNR recipes, trajectory memory.
+- Mask Settings: inactive method panels dimmed + locked; remove-cell brush yellow; add/remove keep detection rings visible.
+- Version: **8.09.000**. See [release-notes-v8.09.000.md](release-notes-v8.09.000.md).
 
-See [release-notes-v8.08.000.md](release-notes-v8.08.000.md) for full details.
+**v8.08.000 Highlights** (previous)
+- **Allen Mouse Atlas** + semi-auto stitch, `.catlas`, Next Channel, Axons/Nets intensity, random null + PNN shells.
+- Version: **8.08.000**. See [release-notes-v8.08.000.md](release-notes-v8.08.000.md).
 
 **v8.07.000 Highlights** (previous)
 - **Save Flattened Image** fully flattens zone fills + paint + red cell mask.
@@ -158,14 +161,37 @@ Without them, BARCC falls back to a plain `.csv`.
 
 ## Running the Program
 
-1. Navigate to the program directory:
+**Recommended runtime: Python 3.14** (conda env `barcc314`).
+
+### Windows (recommended)
+
+1. Use the launcher (targets Python 3.14 first):
+   - Double-click `Application/Launch_BARCC.bat`, or
+   - Double-click `Application/BARCC.lnk` (if present)
+
+2. Or from Anaconda Prompt:
 ```bash
+conda activate barcc314
 cd Application
+python barcc.py
 ```
 
-2. Run the program:
+### Create / refresh the Python 3.14 environment
+
 ```bash
-python Application/barcc.py
+conda env create -f environment.yml
+# or: conda create -n barcc314 python=3.14 pip -y
+conda activate barcc314
+pip install -r requirements.txt
+```
+
+The older `barcc` conda env (Python 3.12) remains available as a fallback if `barcc314` is missing.
+
+### Generic
+
+```bash
+cd Application
+python barcc.py
 ```
 
 ## Basic Usage

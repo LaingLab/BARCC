@@ -1140,8 +1140,8 @@ def commit_stitch_session(session: AllenStitchSession) -> AllenPlateData:
     final_m = rm.copy()
 
     if has_left and (lm > 0).any():
-        # Remap left-layer IDs to distinct _l names — independent of x position
-        # because the user may have moved halves away from mid_x.
+        # Prefer layer-aware remap: right layer → _r IDs, left layer → _l IDs
+        # (independent of x, since user may have moved halves).
         used = sorted({int(z) for z in np.unique(rm) if int(z) > 0} |
                       {int(z) for z in np.unique(lm) if int(z) > 0})
         n = len(used)
@@ -1166,12 +1166,23 @@ def commit_stitch_session(session: AllenStitchSession) -> AllenPlateData:
                 f"with _r/_l names"
             )
         else:
-            # Too many zones for uint8 split — union with shared IDs
-            left_pix = (lm > 0) & (final_m == 0)
+            # Union shared IDs, then geometric hemisphere split (partial if needed)
+            left_pix = lm > 0
             final_m[left_pix] = lm[left_pix]
             logger.warning(
-                f"Stitch commit: cannot bilateral-split {n} zones (2n>255); shared IDs"
+                f"Stitch commit: layer remap {n}×2 > 255; geometric bilateral split"
             )
+            final_m, zone_names, zone_meta, _ = ensure_bilateral_hemisphere_zones(
+                final_m,
+                zone_names,
+                zone_meta,
+                mid_x=int(getattr(session, "mid_x", 0) or final_m.shape[1] // 2),
+            )
+    elif (final_m > 0).any():
+        # Unilateral or already-composited: still split any IDs that span midline
+        final_m, zone_names, zone_meta, _ = ensure_bilateral_hemisphere_zones(
+            final_m, zone_names, zone_meta, mid_x=None
+        )
 
     # Borders: alpha composite left then right
     bl_img = Image.fromarray(lb, "RGBA")
@@ -1889,6 +1900,227 @@ def _bilateral_name_maps(
     return new_names, new_meta
 
 
+def _content_midline_x(mask_arr: np.ndarray) -> int:
+    """Midline X from horizontal span of non-zero mask content."""
+    content = mask_arr > 0
+    if not np.any(content):
+        return int(mask_arr.shape[1] // 2)
+    xs = np.where(content.any(axis=0))[0]
+    if xs.size == 0:
+        return int(mask_arr.shape[1] // 2)
+    return int((int(xs.min()) + int(xs.max())) // 2)
+
+
+def ensure_bilateral_hemisphere_zones(
+    mask_arr: np.ndarray,
+    zone_names: Optional[Dict[int, str]] = None,
+    zone_meta: Optional[Dict[int, dict]] = None,
+    mid_x: Optional[int] = None,
+    min_side_frac: float = 0.02,
+    min_side_px: int = 10,
+) -> Tuple[np.ndarray, Dict[int, str], Dict[int, dict], bool]:
+    """Split zone IDs that span both hemispheres into independent ``_r`` / ``_l`` zones.
+
+    Allen drawings often use one structure ID for both sides after Reflect/mirror.
+    Atlas Manager then shows a single entry that lights up both hemispheres. This
+    assigns distinct uint8 IDs and names (e.g. ``V2M_r``, ``V2M_l``).
+
+    Zones that only appear on one side keep a single ID tagged ``_r`` or ``_l``.
+
+    Returns ``(mask, zone_names, zone_meta, did_change)``.
+    """
+    zone_names = {int(k): v for k, v in (zone_names or {}).items()}
+    zone_meta = {int(k): dict(v) for k, v in (zone_meta or {}).items()}
+    m = np.asarray(mask_arr)
+    if m.ndim != 2:
+        return mask_arr, zone_names, zone_meta, False
+
+    h, w = m.shape[:2]
+    if mid_x is None:
+        mid_x = _content_midline_x(m)
+    mid_x = int(np.clip(int(mid_x), 0, w))
+
+    used = sorted(int(z) for z in np.unique(m) if int(z) > 0)
+    if not used:
+        return m.astype(np.uint8, copy=False), zone_names, zone_meta, False
+
+    # Classify each zone: spans both sides vs unilateral
+    span_both: List[int] = []
+    left_only: List[int] = []
+    right_only: List[int] = []
+    for z in used:
+        zm = m == z
+        n_l = int(np.sum(zm[:, :mid_x]))
+        n_r = int(np.sum(zm[:, mid_x:]))
+        total = n_l + n_r
+        if total <= 0:
+            continue
+        thr = max(int(min_side_px), int(float(min_side_frac) * total))
+        if n_l >= thr and n_r >= thr:
+            span_both.append(z)
+        elif n_l > n_r:
+            left_only.append(z)
+        else:
+            right_only.append(z)
+
+    # Already independent if nothing spans both sides AND names already have hemi tags
+    def _tagged(name: str) -> bool:
+        s = str(name or "").lower()
+        return (
+            s.endswith("_l")
+            or s.endswith("_r")
+            or "_l:" in s
+            or "_r:" in s
+            or " (l)" in s
+            or " (r)" in s
+        )
+
+    names_ok = all(_tagged(zone_names.get(z, "")) for z in used) if used else True
+    if not span_both and names_ok:
+        return m.astype(np.uint8, copy=False), zone_names, zone_meta, False
+
+    # How many IDs do we need?
+    n_need = 2 * len(span_both) + len(left_only) + len(right_only)
+    # Prefer splitting larger bilateral structures if we must drop some splits
+    if n_need > 255:
+        # Sort spanning by area descending — keep splitting the largest first
+        areas = []
+        for z in span_both:
+            areas.append((int(np.sum(m == z)), z))
+        areas.sort(reverse=True)
+        budget = 255 - (len(left_only) + len(right_only))
+        max_split = max(0, budget // 2)
+        keep_split = [z for _, z in areas[:max_split]]
+        drop_split = [z for _, z in areas[max_split:]]
+        # Dropped spanning zones stay as a single ID (still ambiguous) — warn
+        if drop_split:
+            logger.warning(
+                f"Bilateral split: only {max_split}/{len(span_both)} spanning "
+                f"structures fit in uint8 (255 IDs); {len(drop_split)} keep shared IDs"
+            )
+        # Unilateral may need to drop if still over — rare
+        span_both = keep_split
+        n_need = 2 * len(span_both) + len(left_only) + len(right_only)
+        while n_need > 255 and right_only:
+            right_only.pop()
+            n_need = 2 * len(span_both) + len(left_only) + len(right_only)
+        while n_need > 255 and left_only:
+            left_only.pop()
+            n_need = 2 * len(span_both) + len(left_only) + len(right_only)
+
+    # Assign dense new IDs: all right-side IDs first (1..), then left-side IDs
+    span_set = set(span_both)
+    left_set = set(left_only)
+    right_set = set(right_only)
+    next_id = 1
+    old_to_right: Dict[int, int] = {}
+    old_to_left: Dict[int, int] = {}
+
+    for z in sorted(span_set | right_set):
+        old_to_right[z] = next_id
+        next_id += 1
+    for z in sorted(span_set | left_set):
+        old_to_left[z] = next_id
+        next_id += 1
+
+    # Column index grid for hemisphere masks
+    cols = np.arange(w, dtype=np.int32)[None, :]
+    is_right = cols >= mid_x
+    is_left = cols < mid_x
+
+    out = np.zeros((h, w), dtype=np.uint8)
+    for z, rid in old_to_right.items():
+        if z in span_set:
+            out[(m == z) & is_right] = np.uint8(rid)
+        else:
+            out[m == z] = np.uint8(rid)
+    for z, lid in old_to_left.items():
+        if z in span_set:
+            out[(m == z) & is_left] = np.uint8(lid)
+        else:
+            out[m == z] = np.uint8(lid)
+
+    # Orphans (structures we couldn't fully re-id under the 255 budget)
+    orphan = (m > 0) & (out == 0)
+    unilateral_map: Dict[int, Tuple[int, str]] = {}
+    if np.any(orphan):
+        leftover = sorted({int(z) for z in np.unique(m[orphan]) if int(z) > 0})
+        used_ids = set(int(x) for x in np.unique(out) if int(x) > 0)
+        free = [i for i in range(1, 256) if i not in used_ids]
+        for z in leftover:
+            if not free:
+                logger.warning(f"Bilateral split: no free ID for orphan zone {z}")
+                break
+            nid = free.pop(0)
+            out[(m == z) & orphan] = np.uint8(nid)
+            zm = m == z
+            hemi = "l" if int(zm[:, :mid_x].sum()) > int(zm[:, mid_x:].sum()) else "r"
+            unilateral_map[z] = (nid, hemi)
+
+    for z in right_set:
+        if z in old_to_right:
+            unilateral_map[z] = (old_to_right[z], "r")
+    for z in left_set:
+        if z in old_to_left:
+            unilateral_map[z] = (old_to_left[z], "l")
+
+    # Names / meta
+    new_names: Dict[int, str] = {}
+    new_meta: Dict[int, dict] = {}
+    for z in span_set:
+        rid = old_to_right.get(z)
+        lid = old_to_left.get(z)
+        base = zone_names.get(z, f"Zone{z}")
+        meta = dict(zone_meta.get(z, {}))
+        if rid is not None:
+            new_names[rid] = _format_hemisphere_zone_name(base, meta, "r")
+            mr = dict(meta)
+            mr["hemisphere"] = "r"
+            mr["display"] = new_names[rid]
+            mr["paired_hemisphere_id"] = lid
+            mr["source_zone_id"] = z
+            new_meta[rid] = mr
+        if lid is not None:
+            new_names[lid] = _format_hemisphere_zone_name(base, meta, "l")
+            ml = dict(meta)
+            ml["hemisphere"] = "l"
+            ml["display"] = new_names[lid]
+            ml["paired_hemisphere_id"] = rid
+            ml["source_zone_id"] = z
+            ml["mirror_of_local_id"] = rid
+            new_meta[lid] = ml
+
+    for z, (nid, hemi) in unilateral_map.items():
+        if z in span_set:
+            continue
+        base = zone_names.get(z, f"Zone{z}")
+        meta = dict(zone_meta.get(z, {}))
+        new_names[nid] = _format_hemisphere_zone_name(base, meta, hemi)
+        mm = dict(meta)
+        mm["hemisphere"] = hemi
+        mm["display"] = new_names[nid]
+        mm["source_zone_id"] = z
+        new_meta[nid] = mm
+
+    for zid in np.unique(out):
+        zid = int(zid)
+        if zid > 0 and zid not in new_names:
+            new_names[zid] = f"Zone{zid}"
+            new_meta[zid] = {"display": new_names[zid]}
+
+    did = (
+        len(span_set) > 0
+        or any(not _tagged(zone_names.get(z, "")) for z in used)
+        or set(int(k) for k in new_names.keys()) != set(used)
+    )
+    logger.info(
+        f"Bilateral hemisphere split: mid_x={mid_x} spanning={len(span_set)} "
+        f"left_only={len(left_set)} right_only={len(right_set)} "
+        f"zones {len(used)} → {len(new_names)} (changed={did})"
+    )
+    return out, new_names, new_meta, bool(did)
+
+
 def _assign_bilateral_zone_ids(
     mask_arr: np.ndarray,
     zone_names: Dict[int, str],
@@ -1897,41 +2129,12 @@ def _assign_bilateral_zone_ids(
 ) -> Tuple[np.ndarray, Dict[int, str], Dict[int, dict]]:
     """Give left-hemisphere pixels distinct zone IDs so sides can be selected separately.
 
-    Densely remaps: right → IDs 1..N, left → N+1..2N (uint8 max 255 ⇒ N≤127).
-    Names get ``_r`` / ``_l`` suffixes (e.g. ``V2M_r``, ``V2M_l``).
-    If too many structures for 2N≤255, keeps shared IDs (no hemi split).
+    Wrapper around :func:`ensure_bilateral_hemisphere_zones` (uint8, ``_r``/``_l`` names).
     """
-    used = sorted(int(z) for z in np.unique(mask_arr) if int(z) > 0)
-    if not used:
-        return mask_arr, zone_names, zone_meta
-
-    n = len(used)
-    if 2 * n > 255:
-        logger.warning(
-            f"Too many structures for bilateral split ({n}×2 > 255); keeping shared IDs"
-        )
-        return mask_arr, zone_names, zone_meta
-
-    # Dense remap: right 1..n, left n+1..2n
-    old_to_right = {old: i + 1 for i, old in enumerate(used)}
-    old_to_left = {old: i + 1 + n for i, old in enumerate(used)}
-
-    mid_x = int(np.clip(mid_x, 0, mask_arr.shape[1]))
-    lut_r = np.zeros(256, dtype=np.uint8)
-    lut_l = np.zeros(256, dtype=np.uint8)
-    for old in used:
-        if 0 <= old <= 255:
-            lut_r[old] = np.uint8(old_to_right[old])
-            lut_l[old] = np.uint8(old_to_left[old])
-
-    out = np.zeros_like(mask_arr)
-    out[:, mid_x:] = lut_r[mask_arr[:, mid_x:]]
-    out[:, :mid_x] = lut_l[mask_arr[:, :mid_x]]
-
-    new_names, new_meta = _bilateral_name_maps(
-        used, zone_names, zone_meta, old_to_right, old_to_left
+    out, names, meta, _ = ensure_bilateral_hemisphere_zones(
+        mask_arr, zone_names, zone_meta, mid_x=mid_x
     )
-    return out, new_names, new_meta
+    return out, names, meta
 
 
 def _crop_to_content(mask_arr: np.ndarray, outline_rgba: Image.Image, pad: int = 8):
