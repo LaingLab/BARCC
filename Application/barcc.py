@@ -38,6 +38,7 @@ import logging
 import yaml
 import sys
 import json
+import hashlib
 from datetime import datetime
 import platform
 import subprocess
@@ -136,6 +137,10 @@ PARAM_HELP = {
     "blob_num_sigma": (
         "Number of scales between min and max sigma (LoG only). More = finer size sampling, slower."
     ),
+    "blob_log_scale": (
+        "1 = space LoG sigmas geometrically (more samples at small cell sizes). "
+        "0 = linear spacing. Geometric is the right default for nuclei that span a wide size range."
+    ),
     "blob_threshold": (
         "Absolute blob sensitivity. Lower finds dimmer cells (more detections); higher is stricter. "
         "Try 0.02–0.08 for dim fluorescence."
@@ -154,16 +159,62 @@ PARAM_HELP = {
         "Maximum estimated cell area. Raise if large real cells are filtered out."
     ),
     "blob_min_circularity": (
-        "Minimum local shape circularity (0 = off). Measures the thresholded patch around each peak. "
-        "Raise (0.3–0.6) to reject elongated tissue-edge blobs; lower if real cells are irregular."
+        "Minimum local shape circularity (0 = off, 1 = a perfect circle). "
+        "Typical cells score ~0.6–0.9. Raise (0.55–0.75) to reject peanuts / merged doublets "
+        "and keep round nuclei. Values above 1 (e.g. 2) are treated as 0.80 (very round). "
+        "This is not the Watershed circularity box."
     ),
     "blob_min_isotropy": (
         "Minimum radial symmetry of intensity around the peak (0 = off, 1 = perfect). "
         "Rejects edge-of-tissue and fiber detections that are bright on one side only. Try 0.4–0.55."
     ),
+    "blob_tissue_margin": (
+        "Optional: reject peaks within this many pixels *inside* the OUTER slice border "
+        "(bright edge-line FPs). Must be an integer ≥ 0 (0 = off). "
+        "When edge lines appear, try 6–12 (15–25 for thick glow). Uses a bulk tissue "
+        "envelope — not dark holes inside the section."
+    ),
+    "blob_max_elongation": (
+        "Max major/minor axis ratio of the local bright blob (1 = circle). "
+        "Rejects thin linear ridges (bright folds, fibers, the cut-edge line). "
+        "Default 3.0; 0 = off. Lower is stricter. Nuclei are typically 1–2."
+    ),
+    "blob_ridge_reject": (
+        "1 = reject peaks that sit on bright ridges (section folds, vessels, knife lines) "
+        "using the Hessian. This is what removes the white midline artifact. 0 = off."
+    ),
+    "blob_ridge_thresh": (
+        "Ridge strength cutoff (0–1). 0 = off. Lower drops more line-like marks "
+        "(folds, knife lines); raise if round cells on a fold are lost. Typical 0.35–0.55."
+    ),
+    "blob_cavity_rim": (
+        "Kill zone around AIR BUBBLES (compact bites in the section edge). "
+        "Does not clear PVN/SCN next to the 3rd ventricle — those only lose peaks "
+        "actually in the ventricle lumen. 0 = off. Raise (16–32) if bubble-rim FPs remain."
+    ),
+    "blob_chain_reject": (
+        "Strength of 1-D line/ring suppression (ventricle wall, bubble rim, fold). "
+        "0 = off, 1 = default, 2–3 = stronger (more elongated strings dropped). "
+        "Packed 2-D clusters (PVN/SCN) are still kept."
+    ),
+    "blob_cluster_recover": (
+        "1 = two-tier placement: bright nuclei seed a cluster and dim neighbors are kept. "
+        "Isolated peaks in sparse tissue (e.g. AHA) are kept if they look like cells; "
+        "crowded speckle without a bright seed is dropped. 0 = keep every quality-ok peak."
+    ),
+    "blob_seed_snr": (
+        "Cluster recover: SNR needed to seed a DENSE patch (default 1.15). "
+        "Sparse isolated cells use a milder bar automatically. Lower if packed clusters "
+        "are still missing members."
+    ),
+    "blob_recover_factor": (
+        "Cluster recover: a non-seed peak is kept if it is within (factor × typical radius) "
+        "of a seed. ~3.5–4.5 fills a Fos cluster without sweeping distant speckle."
+    ),
     "blob_reject_tissue_edge": (
         "1 = reject peaks whose outer ring is partly outside the tissue (near-black). "
-        "Cuts false positives along the tissue border. 0 = allow border peaks."
+        "Cuts false positives along the tissue border. Use with blob_tissue_margin for "
+        "bright edge lines. 0 = allow border peaks."
     ),
     "blob_edge_dark_frac": (
         "With tissue-edge reject: max fraction of the outer ring that may be near-black. "
@@ -178,8 +229,9 @@ PARAM_HELP = {
         "Larger draws bigger cell masks around each peak (default ~1.8)."
     ),
     "blob_free_space": (
-        "Fraction of the disk that must be free before placing a cell (0.05–0.95). "
-        "Lower packs denser cells; higher rejects crowded peaks."
+        "Spacing between packed cells (0.05–0.95). Higher = more space between centers "
+        "(0.6–0.75 typical if cells look too tight). Lower = denser packing (0.15–0.3). "
+        "This is the main packing knob; Adaptive packing only eases it slightly."
     ),
     "blob_min_peak_intensity": (
         "Require normalized image intensity at the peak ≥ this (0–1). 0 = off. "
@@ -217,6 +269,32 @@ PARAM_HELP = {
     "adaptive_dual_pass": (
         "Adaptive mode: 1 = run sensitive + strict passes and fuse (best for mixed "
         "high/low background); 0 = single adaptive pass only."
+    ),
+    "dual_settings_mode": (
+        "Show a second Blob Detection panel (Config B) to the right of Config A. "
+        "Assign labeled regions to A or B in Atlas Manager by selecting a region and "
+        "pressing A or B. Show Mask / Count Cells then use Config A in A-regions and "
+        "Config B in B-regions on the same slice (packed vs sparse, high vs low background). "
+        "Off = one global detector (default)."
+    ),
+    "blob_labeled_regions_only": (
+        "Show Mask / Count Cells: apply detections only inside painted or atlas regions. "
+        "Each labeled region is processed with its own local threshold (lcl vs lcr). "
+        "Unlabeled tissue is not masked. Separate from Smart Suggest's checkbox. "
+        "Not the Dual Settings Mode switch — that is the Dual Settings Mode checkbox."
+    ),
+    "smart_suggest_labeled_only": (
+        "Smart Suggest: estimate parameters using only painted/atlas pixels. "
+        "Unlabeled tissue is ignored when choosing settings. Does not restrict Show Mask. "
+        "With Dual Settings Mode on, this also reveals Smart Suggest A and Smart Suggest B "
+        "so each assigned region group gets its own recipe."
+    ),
+    "adaptive_region_mode": (
+        "0 = classic square tiles over the whole image. 1 = detect only inside painted "
+        "regions and atlas structures, each with its own threshold/SNR (so lcl vs lcr "
+        "are independent). Unlabeled tissue is not labeled — that is what stops "
+        "dark-field grain outside your ROIs. Requires Adaptive on and paint/atlas zones. "
+        "Then Show Mask."
     ),
     "adaptive_base_method": (
         "Legacy field: base detector for adaptive mode. Runtime now follows the "
@@ -361,15 +439,16 @@ class CellDetectionConfig:
     watershed_compactness: float = 0.0
 
     # --- Blob Detection (blob_log / blob_dog) parameters ---
-    blob_min_sigma: float = 1.5      # lower default → catch smaller/tighter spots
+    blob_min_sigma: float = 2.0      # below ~2 catches grain/speckle on 20x IF
     blob_max_sigma: float = 12.0     # higher → larger cells
     blob_num_sigma: int = 15         # more scales between min/max
+    blob_log_scale: int = 1          # 1 = geometric sigma spacing (better small-cell sampling)
     blob_threshold: float = 0.05     # lower → more sensitive (dim cells)
     blob_threshold_rel: float = 0.0  # 0 = off; else relative peak height (0–1)
     blob_overlap: float = 0.5
     blob_min_area: int = 8           # post-filter (radius-estimated disk area)
     blob_max_area: int = 500
-    blob_min_circularity: float = 0.35  # 0 = off; reject elongated / edge-like local shapes
+    blob_min_circularity: float = 0.30  # 0 = off; reject elongated / edge-like local shapes
     blob_radius_scale: float = 1.8   # radius ≈ sigma * scale (disk drawn for mask)
     blob_free_space: float = 0.45    # fraction of disk that must be unclaimed to place
     blob_min_peak_intensity: float = 0.0  # 0 = off; require img[center] ≥ this (0–1)
@@ -377,11 +456,24 @@ class CellDetectionConfig:
     blob_min_local_snr: float = 0.0  # 0 = off; try 2–4 when high-bg false positives
     blob_local_snr_outer: float = 2.0  # outer radius = r * this (annulus for background)
     blob_exclude_border: int = 1     # pixels; 0 keeps border detections
-    # Peak quality (reject tissue edges, high-BG texture, non-round blobs)
-    blob_min_isotropy: float = 0.45  # 0 = off; 1 = perfect radial symmetry (try 0.35–0.6)
+    # Peak quality (reject tissue edges, bright rim lines, high-BG texture, non-round blobs)
+    # Keep shape gates mild by default so Smart Suggest / first-pass still find cells.
+    blob_min_isotropy: float = 0.30  # 0 = off; 1 = perfect radial symmetry (try 0.30–0.50)
+    blob_tissue_margin: int = 0      # px inside OUTER border to clear; 0=off (set 6–15 for edge lines)
+    blob_max_elongation: float = 3.0  # reject folds/fibers; ~1–2 is a nucleus, 0 was off
     blob_reject_tissue_edge: int = 1  # 1 = reject peaks on tissue/outside boundary
-    blob_edge_dark_frac: float = 0.32  # reject if this fraction of outer ring is near-black
-    blob_bg_relative: float = 0.12  # 0 = off; require peak − local_median ≥ this (0–1 norm)
+    blob_edge_dark_frac: float = 0.40  # reject if this fraction of outer ring is near-black
+    blob_bg_relative: float = 0.06  # 0 = off; require peak − local_median ≥ this (0–1 norm)
+    # Bright-line / fold rejection (Hessian ridge). 1 = on.
+    blob_ridge_reject: int = 1
+    blob_ridge_thresh: float = 0.40  # 0–1; lower drops more folds / knife lines
+    # Internal cavity rims (ventricles, aqueduct, air bubbles)
+    blob_cavity_rim: int = 12  # px; 0 = off. Reject edge-like peaks near hole rims
+    blob_chain_reject: float = 1.0  # 0=off, 1=default, 2–3=stronger line/rim suppression
+    # Cluster seed-and-recover: keep confident nuclei, then dim neighbors; drop isolated grain
+    blob_cluster_recover: int = 1
+    blob_seed_snr: float = 0.85      # peak is a seed if local SNR ≥ this (dense); isolates use milder bar
+    blob_recover_factor: float = 3.8  # recover dim peaks within this × mean radius of a seed
 
     # --- Adaptive overlay (used when adaptive_enabled and method is blob/dog) ---
     adaptive_tile_size: int = 256       # tile edge length (px)
@@ -389,6 +481,8 @@ class CellDetectionConfig:
     adaptive_sensitivity: float = 1.0   # <1 more sensitive, >1 stricter (tile thresholds)
     adaptive_packing: float = 0.5       # 0=sparse (strict free space), 1=dense (loose)
     adaptive_dual_pass: int = 1         # 1=on: sensitive+strict fusion; 0=single pass
+    # 0 = square tiles; 1 = painted / atlas zones (unlabeled tissue still tiled)
+    adaptive_region_mode: int = 0
     # Kept for settings import/export; runtime base follows detection_method (blob/dog)
     adaptive_base_method: str = "blob"
 
@@ -433,11 +527,90 @@ class CellMask:
         self.remove_mask = None
 
 
+def _config_declared_type(config_obj, attr_name):
+    """Dataclass field type for attr, ignoring polluted runtime values (e.g. int 3 in a float field)."""
+    try:
+        t = type(config_obj).__dataclass_fields__[attr_name].type
+        if t in (int, float, str, bool):
+            return t
+    except Exception:
+        pass
+    v = getattr(config_obj, attr_name, None)
+    if isinstance(v, bool) or type(v).__name__ in ("bool_",):
+        return bool
+    if isinstance(v, (int, np.integer)) and not isinstance(v, bool):
+        return int
+    if isinstance(v, (float, np.floating)):
+        return float
+    if isinstance(v, str):
+        return str
+    return float
+
+
+def _coerce_config_value(config_obj, attr_name, raw):
+    """Parse a Mask Settings / preset value using the declared field type.
+
+    Accepts ``3`` and ``3.0`` for both int and float fields so Smart Suggest
+    (which may store whole numbers as ints) does not trip the entry setter.
+    """
+    declared = _config_declared_type(config_obj, attr_name)
+    s = str(raw).strip()
+    if declared is bool:
+        if s.lower() in ("1", "true", "yes", "on"):
+            return True
+        if s.lower() in ("0", "false", "no", "off", ""):
+            return False
+        return bool(int(float(s)))
+    if declared is int:
+        f = float(s)
+        if abs(f - round(f)) > 1e-6:
+            raise ValueError("not an integer")
+        return int(round(f))
+    if declared is float:
+        return float(s)
+    if declared is str:
+        return str(raw)
+    try:
+        return float(s)
+    except Exception:
+        return raw
+
+
+def _copy_cell_config_fields(src, dst):
+    """Copy CellDetectionConfig field values src → dst (primitives)."""
+    if src is None or dst is None:
+        return dst
+    for key, value in src.__dict__.items():
+        if hasattr(dst, key):
+            setattr(dst, key, value)
+    return dst
+
+
+def _apply_cell_config_dict(cfg, data):
+    """Apply a dict of settings onto a CellDetectionConfig."""
+    if cfg is None or not data:
+        return cfg
+    for key, value in data.items():
+        if hasattr(cfg, key):
+            try:
+                value = _coerce_config_value(cfg, key, value)
+            except Exception:
+                pass
+            setattr(cfg, key, value)
+    return cfg
+
+
 class ImageProcessor:
     def __init__(self):
         self.cell_config = CellDetectionConfig()
+        self.cell_config_b = CellDetectionConfig()
+        self._cell_config_b_loaded = False
+        self.dual_settings_mode_pref = False
         self.preprocess_config = PreprocessingConfig()
         self.load_config()
+        # (fingerprint, labels) — reuse Show Mask / Count Cells when nothing changed
+        self._detect_cache = None
+        self._circ_erode_fp = None
 
     def load_config(self):
         """Load configuration from file if it exists"""
@@ -445,14 +618,13 @@ class ImageProcessor:
         if os.path.exists(config_path):
             with open(config_path, 'r') as f:
                 try:
-                    config = yaml.safe_load(f)
+                    config = yaml.safe_load(f) or {}
                     if 'cell_detection' in config:
-                        cell_config = config['cell_detection']
-                        
-                        for key, value in cell_config.items():
-                            if hasattr(self.cell_config, key):
-                                setattr(self.cell_config, key, value)
-                               
+                        _apply_cell_config_dict(self.cell_config, config['cell_detection'])
+                    if 'cell_detection_B' in config:
+                        _apply_cell_config_dict(self.cell_config_b, config['cell_detection_B'])
+                        self._cell_config_b_loaded = True
+                    self.dual_settings_mode_pref = bool(config.get('dual_settings_mode', False))
                     if 'preprocessing' in config:
                         for key, value in config['preprocessing'].items():
                             if hasattr(self.preprocess_config, key):
@@ -463,11 +635,10 @@ class ImageProcessor:
     def save_config(self):
         """Save current configuration to file"""
         try:
-            # Convert enum to string before saving
-            cell_config_dict = self.cell_config.__dict__.copy()
-            
             config = {
-                'cell_detection': cell_config_dict,
+                'cell_detection': self.cell_config.__dict__.copy(),
+                'cell_detection_B': self.cell_config_b.__dict__.copy(),
+                'dual_settings_mode': bool(getattr(self, 'dual_settings_mode_pref', False)),
                 'preprocessing': self.preprocess_config.__dict__
             }
             with open("barcc_config.yaml", 'w') as f:
@@ -555,8 +726,15 @@ class ImageProcessor:
 
         return img
 
-    def detect_cells(self, image):
+    def detect_cells(self, image, zone_mask=None, preprocessed=None, clip_outside_zones=True):
         """Detect cells using current configuration.
+
+        zone_mask: optional HxW uint8 painted/atlas zone IDs (image coordinates)
+        for Adaptive Region Mode.
+        preprocessed: skip tophat/denoise when the caller already preprocessed once
+        (Dual Settings Mode runs Config A then Config B on the same slice).
+        clip_outside_zones: if False, zone_mask is still used for per-region windows
+        but unlabeled pixels are not zeroed (needed so Config A can keep unpainted tissue).
 
         Strategies:
           - ``blob`` / ``log``: Laplacian of Gaussian (``blob_log``)
@@ -584,15 +762,122 @@ class ImageProcessor:
             f"Starting cell detection method={method} adaptive={adaptive_on}"
         )
 
-        img = self.preprocess_image(image)
+        cache_key = self._detection_cache_key(
+            image, method, adaptive_on, zone_mask, clip_outside_zones=clip_outside_zones
+        )
+        cached = getattr(self, "_detect_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            logger.info("Cell detection cache hit (same image + settings)")
+            return image, cached[1]
 
-        if method in ("blob", "dog", "log"):
-            if adaptive_on:
-                # Base detector follows the selected radio (blob vs dog)
-                cfg.adaptive_base_method = "dog" if method == "dog" else "blob"
-                return self._detect_cells_adaptive(img)
-            return self._detect_cells_blob(img)
-        return self._detect_cells_watershed(img)
+        self._adaptive_zone_mask = zone_mask
+        try:
+            img = preprocessed if preprocessed is not None else self.preprocess_image(image)
+
+            if method in ("blob", "dog", "log"):
+                # Zone mask (Blob → Labeled regions only) uses per-region windows
+                # even if the Adaptive checkbox is off, so lcl vs lcr get local stats.
+                if adaptive_on or zone_mask is not None:
+                    cfg.adaptive_base_method = "dog" if method == "dog" else "blob"
+                    out_img, labels = self._detect_cells_adaptive(img)
+                else:
+                    out_img, labels = self._detect_cells_blob(img)
+            else:
+                out_img, labels = self._detect_cells_watershed(img)
+            if clip_outside_zones:
+                labels = self._clip_labels_to_zone_mask(labels, zone_mask)
+        finally:
+            self._adaptive_zone_mask = None
+        try:
+            self._detect_cache = (cache_key, np.array(labels, copy=True))
+        except Exception:
+            self._detect_cache = None
+        return out_img, labels
+
+    def _clip_labels_to_zone_mask(self, labels, zone_mask):
+        """Keep detections only inside painted/atlas zones when a zone mask is set."""
+        if zone_mask is None or labels is None:
+            return labels
+        try:
+            zarr = np.asarray(zone_mask)
+            if zarr.ndim > 2:
+                zarr = zarr.squeeze()
+            lab = np.asarray(labels)
+            if lab.ndim > 2:
+                lab = lab.squeeze()
+            if zarr.shape[:2] != lab.shape[:2]:
+                zarr = np.array(
+                    Image.fromarray(zarr.astype(np.uint8), mode="L").resize(
+                        (lab.shape[1], lab.shape[0]), Image.NEAREST
+                    )
+                )
+            if int(np.max(zarr)) <= 0:
+                return labels
+            lab = lab.copy()
+            lab[zarr == 0] = 0
+            return lab
+        except Exception as e:
+            logger.debug(f"zone clip skipped: {e}")
+            return labels
+
+    def _detection_cache_key(self, image, method, adaptive_on, zone_mask=None, clip_outside_zones=True):
+        """Fingerprint of input image + detection/preprocess settings."""
+        cfg_items = tuple(sorted((k, repr(v)) for k, v in self.cell_config.__dict__.items()))
+        pre_items = tuple(sorted((k, repr(v)) for k, v in self.preprocess_config.__dict__.items()))
+        arr = np.asarray(image)
+        if arr.ndim > 2:
+            arr = arr[..., 0] if arr.shape[-1] in (3, 4) else np.squeeze(arr)
+        flat = np.ravel(arr)
+        step = max(1, flat.size // 4096) if flat.size else 1
+        h = hashlib.blake2b(digest_size=16)
+        h.update(np.asarray(arr.shape, dtype=np.int64).tobytes())
+        h.update(str(arr.dtype).encode("ascii"))
+        if flat.size:
+            sample = np.ascontiguousarray(flat[::step])
+            h.update(sample.tobytes())
+            h.update(
+                np.asarray(
+                    [float(np.min(flat)), float(np.max(flat)), float(np.mean(flat))],
+                    dtype=np.float64,
+                ).tobytes()
+            )
+        h.update(repr((method, bool(adaptive_on), bool(clip_outside_zones), cfg_items, pre_items)).encode("utf-8"))
+        if zone_mask is not None:
+            zm = np.asarray(zone_mask)
+            h.update(np.unique(zm).astype(np.int32).tobytes())
+            try:
+                h.update(np.ascontiguousarray(zm[::37, ::37]).astype(np.uint8).tobytes())
+            except Exception:
+                h.update(b"zm")
+        return h.digest()
+
+    def _padded_content_bbox(self, work_n, max_sigma):
+        """Inclusive-exclusive bbox of non-zero content, padded for LoG kernel support.
+
+        Pad is ``ceil(4 * max_sigma) + 2`` (scipy gaussian default truncate=4 plus
+        peak_local_max neighborhood). Interior LoG maxima match a full-frame run.
+        Returns None when the crop would not shrink the array enough to matter.
+        """
+        if work_n is None or work_n.ndim != 2 or work_n.size == 0:
+            return None
+        h, w = work_n.shape
+        if h * w < 512 * 512:
+            return None
+        rows = np.any(work_n > 1e-12, axis=1)
+        cols = np.any(work_n > 1e-12, axis=0)
+        if not np.any(rows) or not np.any(cols):
+            return None
+        ys = np.flatnonzero(rows)
+        xs = np.flatnonzero(cols)
+        pad = int(np.ceil(4.0 * max(1.0, float(max_sigma)))) + 2
+        y0 = max(0, int(ys[0]) - pad)
+        y1 = min(h, int(ys[-1]) + 1 + pad)
+        x0 = max(0, int(xs[0]) - pad)
+        x1 = min(w, int(xs[-1]) + 1 + pad)
+        # Only crop when we drop a meaningful empty margin
+        if (y1 - y0) * (x1 - x0) > 0.85 * h * w:
+            return None
+        return y0, y1, x0, x1
 
     def _as_gray2d_normalized(self, img: np.ndarray):
         """Return (work_n HxW float in ~0–1, original work array)."""
@@ -607,19 +892,20 @@ class ImageProcessor:
         work_n = (work - wmin) / (wmax - wmin) if wmax > wmin else np.zeros_like(work)
         return work_n, work
 
-    def _run_blob_detector(self, work_n, thr, method="blob", thr_rel=0.0):
+    def _run_blob_detector(self, work_n, thr, method="blob", thr_rel=0.0, overlap=None):
         """Run LoG or DoG on a 2D normalized image; return (N,3) y,x,sigma or empty."""
         cfg = self.cell_config
         method = (method or "blob").lower().strip()
         thr = float(thr)
         thr_rel = float(thr_rel or 0.0)
+        ov = float(cfg.blob_overlap if overlap is None else overlap)
         try:
             if method == "dog":
                 dog_kw = dict(
                     min_sigma=float(cfg.blob_min_sigma),
                     max_sigma=float(cfg.blob_max_sigma),
                     threshold=thr,
-                    overlap=float(cfg.blob_overlap),
+                    overlap=ov,
                 )
                 if thr_rel > 0:
                     dog_kw["threshold_rel"] = thr_rel
@@ -633,8 +919,8 @@ class ImageProcessor:
                 max_sigma=float(cfg.blob_max_sigma),
                 num_sigma=int(cfg.blob_num_sigma),
                 threshold=thr,
-                overlap=float(cfg.blob_overlap),
-                log_scale=False,
+                overlap=ov,
+                log_scale=int(getattr(cfg, "blob_log_scale", 1) or 0) != 0,
             )
             if thr_rel > 0:
                 log_kw["threshold_rel"] = thr_rel
@@ -665,10 +951,13 @@ class ImageProcessor:
         if int(core.sum()) < 3 or int(ring.sum()) < 5:
             return 0.0
         mu_in = float(np.mean(patch[core]))
-        mu_out = float(np.mean(patch[ring]))
+        ring_vals = np.asarray(patch[ring], dtype=np.float64).ravel()
+        # Packed nuclei put neighbors in the surround. The lower half of the
+        # ring is the true local background; the mean is biased high.
+        mu_out = float(np.percentile(ring_vals, 40))
         if mu_in <= mu_out:
             return 0.0
-        sd_out = float(np.std(patch[ring]))
+        sd_out = float(np.std(ring_vals))
         noise = max(sd_out, 0.04 * max(mu_out, 0.05), 1e-3)
         return (mu_in - mu_out) / noise
 
@@ -725,7 +1014,7 @@ class ImageProcessor:
     def _peak_local_circularity(self, image2d, yi, xi, radius):
         """Circularity of the connected bright component around the peak (0–1)."""
         h, w = image2d.shape[:2]
-        r = max(3, int(radius * 1.4))
+        r = max(3, int(radius * 1.05))
         y0, y1 = max(0, yi - r), min(h, yi + r + 1)
         x0, x1 = max(0, xi - r), min(w, xi + r + 1)
         patch = np.asarray(image2d[y0:y1, x0:x1], dtype=np.float64)
@@ -741,22 +1030,29 @@ class ImageProcessor:
         if int(core.sum()) < 3 or int(ring.sum()) < 5:
             return 1.0
         thr = 0.5 * (float(np.mean(patch[core])) + float(np.mean(patch[ring])))
-        binary = patch >= thr
-        # Keep only component containing center
+        disk = d2 <= (r * r)
+        binary = (patch >= thr) & disk
+        # Keep only component containing center, clipped to this cell's disk
+        # so a neighboring nucleus is not fused into the shape score.
         lab = measure.label(binary, connectivity=2)
-        cid = lab[cy, cx]
+        cid = int(lab[cy, cx]) if 0 <= cy < lab.shape[0] and 0 <= cx < lab.shape[1] else 0
         if cid == 0:
             return 0.0
         comp = lab == cid
         area = float(comp.sum())
         if area < 4:
             return 0.0
+        expected = float(np.pi * max(r_in, 1) ** 2)
         # Perimeter via erosion
         try:
             from skimage import morphology as _morph
             # skimage≥0.26: binary_erosion deprecated → use erosion
+            fp = getattr(self, "_circ_erode_fp", None)
+            if fp is None:
+                fp = _morph.disk(1)
+                self._circ_erode_fp = fp
             try:
-                eroded = _morph.erosion(comp, footprint=_morph.disk(1))
+                eroded = _morph.erosion(comp, footprint=fp)
             except Exception:
                 eroded = _morph.binary_erosion(comp)
             peri = float(comp.sum() - eroded.sum())
@@ -764,48 +1060,236 @@ class ImageProcessor:
             peri = float(np.sum(comp) - np.sum(comp[1:-1, 1:-1]))
         peri = max(peri, 1.0)
         circ = float(4.0 * np.pi * area / (peri * peri + 1e-8))
-        return float(np.clip(circ, 0.0, 1.5))
+        # Peanut / merged doublet: area much larger than a single nucleus
+        if expected > 0 and area > 1.7 * expected:
+            circ *= 0.65
+        return float(np.clip(circ, 0.0, 1.0))
 
-    def _peak_on_tissue_edge(self, image2d, yi, xi, radius, max_dark_frac=0.32):
-        """True if peak sits on tissue/outside border (bimodal outer ring).
+    def _tissue_dark_threshold(self, image2d):
+        """Intensity floor used to separate near-black exterior from tissue."""
+        floor = float(np.percentile(image2d, 2))
+        return max(0.03, floor + 0.025)
 
-        Pure dark-field interiors have a *uniformly* dark ring — that is NOT a
-        tissue edge. Edges have both near-black (outside) and tissue-gray sectors.
+    def _tissue_distance_map(self, image2d):
+        """Distance (px) to the OUTER bulk-tissue border (0 outside).
+
+        Uses a heavily smoothed intensity envelope so individual bright cells are
+        NOT treated as tissue islands (that previously made margin reject almost
+        everything on dark-field slices). Returns None when there is no bulk
+        tissue envelope — callers must skip the margin gate in that case.
+        """
+        img = np.asarray(image2d, dtype=np.float64)
+        if img.size < 64:
+            return None
+        # Large-scale envelope: section glow / tissue body, not single cells
+        try:
+            from skimage.filters import gaussian as _gauss
+            smooth = _gauss(img, sigma=10.0, preserve_range=True)
+        except Exception:
+            try:
+                smooth = ndi.gaussian_filter(img, sigma=10.0)
+            except Exception:
+                smooth = img
+        p2 = float(np.percentile(smooth, 2))
+        p50 = float(np.percentile(smooth, 50))
+        p90 = float(np.percentile(smooth, 90))
+        # Threshold sits between exterior floor and mid-tissue; stay low enough
+        # to include dim section areas but above pure empty.
+        thr = max(p2 + 0.02, min(0.12, 0.35 * p50 + 0.15 * p90))
+        if p90 < 0.08:
+            # Nearly empty / pure noise FOV — no reliable envelope
+            return None
+        tissue = smooth > thr
+        try:
+            # Fill interior holes so ventricles / dark cavities are not "exterior"
+            tissue = ndi.binary_fill_holes(tissue)
+            try:
+                tissue = morphology.closing(tissue, footprint=morphology.disk(8))
+                tissue = morphology.opening(tissue, footprint=morphology.disk(2))
+            except Exception:
+                tissue = morphology.binary_closing(tissue, footprint=morphology.disk(8))
+                tissue = morphology.binary_opening(tissue, footprint=morphology.disk(2))
+            tissue = ndi.binary_fill_holes(tissue)
+        except Exception:
+            pass
+        tissue_frac = float(np.mean(tissue))
+        # Need a real bulk section: too sparse ⇒ cells ARE the "tissue" and margin
+        # would kill every peak. Too full ⇒ no exterior border to measure.
+        if tissue_frac < 0.12 or tissue_frac > 0.97:
+            return None
+        # Prefer the largest connected component (the main slice body)
+        try:
+            lab = measure.label(tissue, connectivity=2)
+            if lab.max() > 0:
+                counts = np.bincount(lab.ravel())
+                counts[0] = 0
+                main = int(np.argmax(counts))
+                if counts[main] < 0.08 * tissue.size:
+                    return None
+                tissue = lab == main
+        except Exception:
+            pass
+        return distance_transform_edt(tissue)
+
+    def _peak_local_elongation(self, image2d, yi, xi, radius):
+        """Major/minor axis ratio of the bright component around the peak (~1 = round)."""
+        h, w = image2d.shape[:2]
+        r = max(3, int(radius * 1.6))
+        y0, y1 = max(0, yi - r), min(h, yi + r + 1)
+        x0, x1 = max(0, xi - r), min(w, xi + r + 1)
+        patch = np.asarray(image2d[y0:y1, x0:x1], dtype=np.float64)
+        if patch.size < 16:
+            return 1.0
+        cy, cx = yi - y0, xi - x0
+        yy, xx = np.ogrid[0:patch.shape[0], 0:patch.shape[1]]
+        d2 = (yy - cy) ** 2 + (xx - cx) ** 2
+        r_in = max(1, int(radius * 0.6))
+        core = d2 <= r_in * r_in
+        ring = (d2 > r_in * r_in) & (d2 <= (radius * radius * 1.2))
+        if int(core.sum()) < 3 or int(ring.sum()) < 5:
+            return 1.0
+        thr = 0.5 * (float(np.mean(patch[core])) + float(np.mean(patch[ring])))
+        binary = patch >= thr
+        lab = measure.label(binary, connectivity=2)
+        cid = int(lab[cy, cx])
+        if cid == 0:
+            return 1.0
+        try:
+            props = measure.regionprops(lab)
+            prop = next((p for p in props if p.label == cid), None)
+            if prop is None:
+                return 1.0
+            try:
+                minor = float(prop.axis_minor_length)
+                major = float(prop.axis_major_length)
+            except AttributeError:
+                minor = float(prop.minor_axis_length)
+                major = float(prop.major_axis_length)
+            minor = max(minor, 1e-3)
+            return float(major / minor)
+        except Exception:
+            # Fallback: use covariance of component coordinates
+            ys, xs = np.where(lab == cid)
+            if ys.size < 5:
+                return 1.0
+            pts = np.column_stack([ys.astype(np.float64), xs.astype(np.float64)])
+            pts -= pts.mean(axis=0)
+            cov = pts.T @ pts / max(1, pts.shape[0] - 1)
+            try:
+                evals = np.linalg.eigvalsh(cov)
+                evals = np.sort(np.maximum(evals, 1e-8))
+                return float(np.sqrt(evals[-1] / evals[0]))
+            except Exception:
+                return 1.0
+
+    def _peak_on_tissue_edge(self, image2d, yi, xi, radius, max_dark_frac=0.35, intensity_floor=None):
+        """True if peak sits on the OUTER tissue/slice border (one-sided exterior).
+
+        Critical: a bright cell on *uniform* dark field is NOT an edge — its
+        outer ring is dark all around. True borders have a contiguous dark
+        hemisphere (outside) opposite a mid-level tissue hemisphere.
         """
         h, w = image2d.shape[:2]
-        r_in = max(2, int(radius))
-        r_out = max(r_in + 2, int(round(r_in * 2.2)))
+        # Sample farther out than the cell body so we don't confuser the halo
+        r_in = max(3, int(round(radius * 1.4)))
+        r_out = max(r_in + 3, int(round(radius * 2.8)))
         y0, y1 = max(0, yi - r_out), min(h, yi + r_out + 1)
         x0, x1 = max(0, xi - r_out), min(w, xi + r_out + 1)
         yy, xx = np.ogrid[y0:y1, x0:x1]
-        d2 = (yy - yi) ** 2 + (xx - xi) ** 2
+        dy = yy.astype(np.float64) - yi
+        dx = xx.astype(np.float64) - xi
+        d2 = dy * dy + dx * dx
         ring = (d2 > (r_in * r_in)) & (d2 <= (r_out * r_out))
-        patch = image2d[y0:y1, x0:x1]
-        vals = patch[ring]
-        if vals.size < 12:
+        patch = np.asarray(image2d[y0:y1, x0:x1], dtype=np.float64)
+        if int(ring.sum()) < 16:
             return False
-        # Absolute outside floor (true empty) vs local tissue level near the peak
-        floor = float(np.percentile(image2d, 2))
-        dark_thr = max(0.03, floor + 0.025)
-        local_med = self._local_median_at(image2d, yi, xi, max(r_out, 8))
-        # If the whole neighborhood is dark (dark-field interior), not an edge
-        if local_med < 0.12 and float(np.percentile(vals, 75)) < 0.15:
-            return False
-        dark_frac = float(np.mean(vals < dark_thr))
-        # Tissue-side of the ring: clearly brighter than outside
-        tissue_thr = max(dark_thr + 0.05, 0.5 * local_med if local_med > 0.1 else 0.1)
-        tissue_frac = float(np.mean(vals >= tissue_thr))
-        max_dark = float(max_dark_frac)
-        # Border signature: substantial outside AND substantial tissue in same ring
-        if dark_frac >= max_dark and tissue_frac >= 0.20:
-            return True
-        # Strong one-sided edge: high dark fraction + poor isotropy handled elsewhere
-        if dark_frac >= max(0.45, max_dark + 0.1) and tissue_frac >= 0.12:
-            return True
-        return False
 
-    def _peak_quality_ok(self, image2d, yi, xi, radius, min_local_snr=0.0):
-        """Return (ok: bool, snr: float) after shape / edge / relative-BG gates."""
+        if intensity_floor is None:
+            floor = float(np.percentile(image2d, 2))
+        else:
+            floor = float(intensity_floor)
+        # Exterior must be near the global floor, not merely "dimmer than the peak"
+        dark_thr = max(0.025, floor + 0.02)
+        local_med = self._local_median_at(image2d, yi, xi, max(r_out, 10))
+        ring_vals = patch[ring]
+        # Uniform dark-field surround (typical real cells) — never an edge
+        if float(np.percentile(ring_vals, 75)) < max(0.14, dark_thr + 0.04):
+            return False
+        # If almost everything in the ring is dark, the peak is an isolated cell.
+        # Exception: a bright bubble/ventricle rim has a dark interior PLUS a
+        # bright arc — do not treat that as a dark-field nucleus.
+        dark_frac = float(np.mean(ring_vals < dark_thr))
+        bright_frac = float(np.mean(ring_vals > max(0.16, dark_thr + 0.10)))
+        if dark_frac >= 0.72 and bright_frac < 0.12:
+            return False
+
+        # 8-sector one-sided test
+        ang = np.arctan2(dy, dx)
+        sector_means = []
+        for k in range(8):
+            a0 = -np.pi + k * (np.pi / 4.0)
+            a1 = a0 + np.pi / 4.0
+            if k < 7:
+                sec = ring & (ang >= a0) & (ang < a1)
+            else:
+                sec = ring & (ang >= a0) & (ang <= a1)
+            if int(sec.sum()) < 2:
+                sector_means.append(np.nan)
+            else:
+                sector_means.append(float(np.mean(patch[sec])))
+        sm = np.asarray(sector_means, dtype=np.float64)
+        valid = np.isfinite(sm)
+        if int(valid.sum()) < 6:
+            return False
+        sm_f = sm.copy()
+        # treat missing as local median for continuity checks
+        sm_f[~valid] = local_med
+        is_dark = sm_f < dark_thr
+        is_tissue = sm_f >= max(dark_thr + 0.04, 0.45 * max(local_med, 0.12))
+        n_dark = int(np.sum(is_dark))
+        n_tissue = int(np.sum(is_tissue))
+        # Need a real split: some outside, some tissue (not all mid / all dark)
+        max_dark = float(max_dark_frac)
+        min_dark_sectors = max(2, int(round(8 * max_dark * 0.55)))
+        if n_dark < min_dark_sectors or n_tissue < 2:
+            return False
+        # Contiguous dark arc (wrap-around): true borders are one-sided
+        dark_ext = np.concatenate([is_dark, is_dark])
+        best_run = 0
+        run = 0
+        for flag in dark_ext:
+            if flag:
+                run += 1
+                best_run = max(best_run, run)
+            else:
+                run = 0
+        # Cap run at 8 (full circle)
+        best_run = min(best_run, 8)
+        if best_run < min_dark_sectors:
+            return False
+        # Full-circle dark already handled; require not surrounding the peak
+        if best_run >= 7:
+            return False
+        return True
+
+    def _peak_quality_ok(
+        self,
+        image2d,
+        yi,
+        xi,
+        radius,
+        min_local_snr=0.0,
+        tissue_dist=None,
+        intensity_floor=None,
+        bg_rel_scale=1.0,
+        relax_shape=False,
+    ):
+        """Return (ok: bool, snr: float) after shape / edge / relative-BG gates.
+
+        tissue_dist: optional precomputed distance-to-exterior map (from
+        ``_tissue_distance_map``) for the blob_tissue_margin gate.
+        relax_shape: skip strict circularity/isotropy (painted packed nuclei).
+        """
         cfg = self.cell_config
         snr_outer = float(getattr(cfg, "blob_local_snr_outer", 2.0) or 2.0)
         snr = self._local_snr_at(image2d, yi, xi, radius, snr_outer)
@@ -813,38 +1297,445 @@ class ImageProcessor:
             return False, snr
 
         peak_val = float(image2d[yi, xi])
-        bg_rel = float(getattr(cfg, "blob_bg_relative", 0.0) or 0.0)
+        bg_rel = float(getattr(cfg, "blob_bg_relative", 0.0) or 0.0) * float(bg_rel_scale)
         local_med = self._local_median_at(image2d, yi, xi, max(radius * 2, 8))
         if bg_rel > 0:
             if (peak_val - local_med) < bg_rel:
                 return False, snr
 
-        # On high local background, require stronger SNR even if global min_snr is mild
-        if local_med > 0.35:
-            need = max(float(min_local_snr), 1.8 if local_med > 0.5 else 1.4)
-            if snr < need:
-                return False, snr
-            if bg_rel <= 0 and (peak_val - local_med) < 0.08:
-                return False, snr
+        # Extra SNR on bright neuropil only when SNR gating is already in use.
+        # blob_min_local_snr = 0 means off — do not secretly impose 1.4–1.8,
+        # which drops real dim nuclei sitting on moderately bright tissue.
+        # Contrast in that case is blob_bg_relative (default 0.06).
+        # Packed nuclei also raise local_med (neighbors in the median disk) —
+        # that is a cluster, not uniform neuropil. Skip the hike when local
+        # variance is high.
+        if local_med > 0.35 and min_local_snr > 0:
+            loc_r = max(radius * 2, 8)
+            y0s, y1s = max(0, yi - loc_r), min(image2d.shape[0], yi + loc_r + 1)
+            x0s, x1s = max(0, xi - loc_r), min(image2d.shape[1], xi + loc_r + 1)
+            loc_std = float(np.std(image2d[y0s:y1s, x0s:x1s]))
+            packed = loc_std > 0.12 * max(local_med, 0.08)
+            if not packed:
+                need = max(float(min_local_snr), 1.8 if local_med > 0.5 else 1.4)
+                if snr < need:
+                    return False, snr
+                if bg_rel <= 0 and (peak_val - local_med) < 0.08:
+                    return False, snr
+
+        # Outer-slice margin: only peaks *inside* the bulk envelope but near the
+        # border (0 < d < margin). d==0 means outside the envelope — may be a
+        # sparse-FOV mis-segment; leave those to the one-sided edge gate.
+        margin = int(getattr(cfg, "blob_tissue_margin", 0) or 0)
+        if margin > 0 and tissue_dist is not None:
+            try:
+                d = float(tissue_dist[yi, xi])
+                if 0.0 < d < float(margin):
+                    return False, snr
+            except Exception:
+                pass
 
         if int(getattr(cfg, "blob_reject_tissue_edge", 1) or 0):
-            max_dark = float(getattr(cfg, "blob_edge_dark_frac", 0.32) or 0.32)
-            if self._peak_on_tissue_edge(image2d, yi, xi, radius, max_dark_frac=max_dark):
+            max_dark = float(getattr(cfg, "blob_edge_dark_frac", 0.40) or 0.40)
+            if self._peak_on_tissue_edge(
+                image2d,
+                yi,
+                xi,
+                radius,
+                max_dark_frac=max_dark,
+                intensity_floor=intensity_floor,
+            ):
                 return False, snr
 
         min_iso = float(getattr(cfg, "blob_min_isotropy", 0.0) or 0.0)
-        if min_iso > 0:
+        if min_iso > 0 and not relax_shape:
             iso = self._peak_isotropy(image2d, yi, xi, radius)
             if iso < min_iso:
                 return False, snr
 
         min_circ = float(getattr(cfg, "blob_min_circularity", 0.0) or 0.0)
         if min_circ > 0:
+            # Scale is 0–1 (circle = 1). Values like 2 mean "very round" → 0.80.
+            if min_circ > 1.0:
+                min_circ = 0.80
+            else:
+                min_circ = min(min_circ, 0.92)
             circ = self._peak_local_circularity(image2d, yi, xi, radius)
             if circ < min_circ:
                 return False, snr
 
+        max_elon = float(getattr(cfg, "blob_max_elongation", 0.0) or 0.0)
+        if max_elon > 0:
+            elon = self._peak_local_elongation(image2d, yi, xi, radius)
+            if elon > max_elon:
+                return False, snr
+
         return True, snr
+
+    def _bright_ridge_map(self, image2d, sigma=2.0):
+        """Bright-line strength in ~[0, 1]: high on folds/vessels, low on round nuclei.
+
+        Uses Hessian eigenvalues. A round blob has two similar negative eigenvalues;
+        a bright ridge has one large negative eigenvalue and one near zero.
+        """
+        img = np.asarray(image2d, dtype=np.float64)
+        if img.ndim != 2 or img.size < 64:
+            return np.zeros(img.shape[:2], dtype=np.float64)
+        try:
+            from skimage.feature import hessian_matrix, hessian_matrix_eigvals
+            try:
+                H = hessian_matrix(img, sigma=float(sigma), use_gaussian_derivatives=True)
+                ev = hessian_matrix_eigvals(H)
+            except TypeError:
+                hm = hessian_matrix(img, sigma=float(sigma))
+                if isinstance(hm, (tuple, list)) and len(hm) == 3:
+                    ev = hessian_matrix_eigvals(*hm)
+                else:
+                    ev = hessian_matrix_eigvals(hm)
+            l1 = np.asarray(ev[0], dtype=np.float64)
+            l2 = np.asarray(ev[1], dtype=np.float64)
+            # Bright ridge: λ1 << 0 and |λ1| >> |λ2|. Round nuclei: λ1 ≈ λ2 < 0.
+            # Do NOT min-max normalize across the image — that turns the strongest
+            # real nuclei into "ridges" on slices without a fold.
+            mag = np.clip(-l1, 0.0, None)
+            ratio = mag / (np.abs(l2) + 1e-8)
+            ratio = np.where(l1 < 0, ratio, 0.0)
+            # ratio 1.2 → 0 (blob), ratio ~5 → 1 (line)
+            ridge = np.clip((ratio - 1.2) / 3.8, 0.0, 1.0)
+            return ridge
+        except Exception as e:
+            logger.debug(f"ridge map failed: {e}")
+            return np.zeros(img.shape, dtype=np.float64)
+
+    def _cavity_reject_mask(self, image2d, rim_px):
+        """Boolean mask of hole/bubble interiors plus a rim band of ``rim_px``.
+
+        Internal ventricles come from fill-holes. Edge-nicking air bubbles are
+        concavities recovered by morphological closing (the previous EDT-to-tissue
+        map missed those, so raising Cavity Rim had no effect). Long thin bays
+        along the natural section contour are discarded so ventral cortex is kept.
+        """
+        img = np.asarray(image2d, dtype=np.float64)
+        rim_px = int(max(0, rim_px))
+        if img.size < 64 or rim_px <= 0:
+            return None
+        try:
+            from skimage.filters import gaussian as _gauss
+            smooth = _gauss(img, sigma=3.0, preserve_range=True)
+        except Exception:
+            smooth = ndi.gaussian_filter(img, sigma=3.0)
+        p2 = float(np.percentile(smooth, 2))
+        p50 = float(np.percentile(smooth, 50))
+        p90 = float(np.percentile(smooth, 90))
+        if p90 < 0.08:
+            return None
+        thr = max(p2 + 0.015, min(0.10, 0.30 * p50 + 0.12 * p90))
+        raw = smooth > thr
+        lab = measure.label(raw, connectivity=2)
+        if lab.max() == 0:
+            return None
+        counts = np.bincount(lab.ravel())
+        counts[0] = 0
+        main = int(np.argmax(counts))
+        if counts[main] < 0.08 * raw.size:
+            return None
+        tissue = lab == main
+        tissue_frac = float(np.mean(tissue))
+        if tissue_frac < 0.12 or tissue_frac > 0.97:
+            return None
+
+        filled = ndi.binary_fill_holes(tissue)
+        holes = filled & ~tissue
+
+        close_r = int(max(24, min(72, rim_px * 2)))
+        try:
+            closed = morphology.closing(tissue, footprint=morphology.disk(close_r))
+        except Exception:
+            k = close_r * 2 + 1
+            closed = ndi.binary_closing(tissue, structure=np.ones((k, k), dtype=bool))
+        bays = closed & ~tissue & ~holes
+
+        min_area = 40
+        max_area = int(0.045 * tissue.size)
+        bubble_cores = np.zeros_like(tissue, dtype=bool)
+        ventricle_cores = np.zeros_like(tissue, dtype=bool)
+
+        def _keep_components(mask, require_compact, dest):
+            if not np.any(mask):
+                return
+            clab = measure.label(mask, connectivity=2)
+            if clab.max() == 0:
+                return
+            for p in measure.regionprops(clab):
+                if p.area < min_area or p.area > max_area:
+                    continue
+                if require_compact:
+                    y0, x0, y1, x1 = p.bbox
+                    bh, bw = (y1 - y0), (x1 - x0)
+                    aspect = min(bh, bw) / max(bh, bw, 1)
+                    # Bubbles are compact; a long sliver along the ventral contour is not
+                    if aspect < 0.32 and float(getattr(p, "solidity", 1.0)) < 0.55:
+                        continue
+                dest[clab == p.label] = True
+
+        # Ventricles/aqueduct: do NOT dilate 24 px into PVN/SCN. Only the lumen
+        # plus a 2 px wall (ridge/chain still kill the bright fold).
+        _keep_components(holes, require_compact=False, dest=ventricle_cores)
+        # Air bubbles / edge bites: full Cavity Rim dilation (that is this control).
+        _keep_components(bays, require_compact=True, dest=bubble_cores)
+        if not np.any(bubble_cores) and not np.any(ventricle_cores):
+            return None
+        kill = np.zeros_like(tissue, dtype=bool)
+        try:
+            if np.any(bubble_cores):
+                kill |= morphology.dilation(
+                    bubble_cores, footprint=morphology.disk(max(1, rim_px))
+                )
+            if np.any(ventricle_cores):
+                kill |= ventricle_cores
+                kill |= morphology.dilation(
+                    ventricle_cores, footprint=morphology.disk(2)
+                )
+        except Exception:
+            if np.any(bubble_cores):
+                kill |= ndi.binary_dilation(bubble_cores, iterations=max(1, rim_px))
+            if np.any(ventricle_cores):
+                kill |= ventricle_cores
+                kill |= ndi.binary_dilation(ventricle_cores, iterations=2)
+        return kill
+
+    def _apply_chain_reject(self, survivors, strength=1.0, min_n=5, aniso=6.5, radius_px=36.0):
+        """Drop peaks whose local neighbors form a 1-D line or ring (not a 2-D cluster).
+
+        strength: 0=off, 1=default, 2–3=stronger (lower anisotropy bar, shorter strings).
+        Ventricle walls and bubble rims produce collinear strings. Real Fos clusters
+        are 2-D and survive.
+        """
+        s = float(strength)
+        if s <= 0:
+            return survivors
+        # 1 → aniso 6.5 / min_n 5; 2 → 5.2 / 4; 3 → 3.9 / 4
+        aniso = float(aniso) - 1.3 * max(0.0, s - 1.0)
+        aniso = max(3.2, aniso)
+        min_n = 5 if s <= 1.01 else 4
+        dense_skip = int(round(12 + 5 * max(0.0, s - 1.0)))  # still spare PVN/SCN packs
+        n = len(survivors)
+        if n < min_n:
+            return survivors
+        coords = np.array([[p["yi"], p["xi"]] for p in survivors], dtype=np.float64)
+        keep = np.ones(n, dtype=bool)
+        try:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(coords)
+            nbrs = tree.query_ball_tree(tree, r=float(radius_px))
+        except Exception:
+            nbrs = []
+            r2 = float(radius_px) ** 2
+            for i in range(n):
+                d2 = (coords[:, 0] - coords[i, 0]) ** 2 + (coords[:, 1] - coords[i, 1]) ** 2
+                nbrs.append(np.flatnonzero(d2 <= r2).tolist())
+        for i in range(n):
+            idx = nbrs[i]
+            if len(idx) < min_n:
+                continue
+            # Dense 2-D packs (PVN/SCN) have many neighbors; don't treat as a rim chain
+            if len(idx) >= dense_skip:
+                continue
+            pts = coords[idx]
+            pts = pts - pts.mean(axis=0)
+            cov = (pts.T @ pts) / max(1, pts.shape[0] - 1)
+            try:
+                evals = np.linalg.eigvalsh(cov)
+            except Exception:
+                continue
+            evals = np.sort(np.maximum(evals, 1e-8))
+            ratio = float(evals[-1] / evals[0])
+            if ratio >= float(aniso):
+                keep[i] = False
+        return [p for i, p in enumerate(survivors) if keep[i]]
+
+    def _apply_cluster_recover(self, survivors, seed_snr, recover_factor, bg_rel):
+        """Keep high-confidence seeds and dim peaks that sit next to them.
+
+        Density-aware: isolated peaks (sparse AHA-like cells) become seeds with a
+        milder SNR/contrast bar. Crowded weak peaks (speckle fields) still need a
+        real seed. Packed clusters (PVN) seed on bright nuclei and recover neighbors.
+        """
+        if not survivors:
+            return survivors
+        seed_snr = float(seed_snr)
+        contrast_seed = max(0.10, 1.7 * float(bg_rel or 0.0))
+        coords = np.array([[p["yi"], p["xi"]] for p in survivors], dtype=np.float64)
+        mean_r = float(np.mean([max(1, p["radius"]) for p in survivors]))
+        nb_r = max(12.0, 4.0 * mean_r)
+        n_nb = [0] * len(survivors)
+        try:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(coords)
+            n_nb = [max(0, len(ix) - 1) for ix in tree.query_ball_tree(tree, r=nb_r)]
+        except Exception:
+            nb_r2 = nb_r * nb_r
+            for i in range(len(survivors)):
+                d2 = (coords[:, 0] - coords[i, 0]) ** 2 + (coords[:, 1] - coords[i, 1]) ** 2
+                n_nb[i] = int(np.sum((d2 > 0) & (d2 <= nb_r2)))
+        seeds_idx = []
+        for i, p in enumerate(survivors):
+            isolated = n_nb[i] <= 2
+            if isolated:
+                if (p["snr"] >= min(0.7, seed_snr)) or (p["contrast"] >= max(0.045, 0.7 * contrast_seed)):
+                    seeds_idx.append(i)
+            elif (p["snr"] >= seed_snr) or (p["contrast"] >= contrast_seed):
+                seeds_idx.append(i)
+        if not seeds_idx:
+            return [
+                p
+                for i, p in enumerate(survivors)
+                if n_nb[i] <= 2 and p["snr"] >= 0.55
+            ]
+        if len(seeds_idx) == len(survivors):
+            return survivors
+        coords = np.array([[p["yi"], p["xi"]] for p in survivors], dtype=np.float64)
+        mean_r = float(np.mean([max(1, p["radius"]) for p in survivors]))
+        rec_r = max(10.0, float(recover_factor) * mean_r)
+        keep = np.zeros(len(survivors), dtype=bool)
+        keep[np.asarray(seeds_idx, dtype=int)] = True
+        try:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(coords[seeds_idx])
+            dist, _ = tree.query(coords, k=1)
+            keep |= dist <= rec_r
+        except Exception:
+            rec_r2 = rec_r * rec_r
+            seed_pts = coords[seeds_idx]
+            for i in range(len(survivors)):
+                if keep[i]:
+                    continue
+                d2 = (seed_pts[:, 0] - coords[i, 0]) ** 2 + (seed_pts[:, 1] - coords[i, 1]) ** 2
+                if float(np.min(d2)) <= rec_r2:
+                    keep[i] = True
+        return [p for i, p in enumerate(survivors) if keep[i]]
+
+    def _shape_cells_from_markers(self, work_n, peaks):
+        """Grow each accepted peak into the actual nucleus (not a circle).
+
+        Marker-controlled watershed on smoothed intensity, limited to pixels
+        that are brighter than local background and near a marker. Watershed
+        lines stay 0 so neighboring cells do not fuse.
+        """
+        h, w = work_n.shape[:2]
+        if not peaks:
+            return np.zeros((h, w), dtype=np.int32)
+        radii = [int(p.get("raw_radius", p.get("radius", 4)) or 4) for p in peaks]
+        max_r = max(3, int(np.median(radii)) if radii else 4)
+        grow = max(5, int(round(max_r * 2.0)))
+        pad = grow + int(3.0 * max(2.0, 0.9 * max_r)) + 4
+        ys = [int(p["yi"]) for p in peaks]
+        xs = [int(p["xi"]) for p in peaks]
+        cy0 = max(0, min(ys) - pad)
+        cx0 = max(0, min(xs) - pad)
+        cy1 = min(h, max(ys) + pad + 1)
+        cx1 = min(w, max(xs) + pad + 1)
+        use_crop = (cy1 - cy0) * (cx1 - cx0) < 0.80 * h * w
+        if use_crop:
+            img = np.asarray(work_n[cy0:cy1, cx0:cx1], dtype=np.float64)
+            peaks_c = []
+            for p in peaks:
+                q = dict(p)
+                q["yi"] = int(p["yi"]) - cy0
+                q["xi"] = int(p["xi"]) - cx0
+                peaks_c.append(q)
+            lab_c = self._shape_cells_from_markers_core(img, peaks_c, max_r, grow)
+            labels = np.zeros((h, w), dtype=np.int32)
+            labels[cy0:cy1, cx0:cx1] = lab_c
+            return labels
+        return self._shape_cells_from_markers_core(
+            np.asarray(work_n, dtype=np.float64), peaks, max_r, grow
+        )
+
+    def _shape_cells_from_markers_core(self, img, peaks, max_r, grow):
+        """Watershed nucleus shapes on a (possibly cropped) float image."""
+        h, w = img.shape[:2]
+        markers = np.zeros((h, w), dtype=np.int32)
+        for i, p in enumerate(peaks, 1):
+            yi, xi = int(p["yi"]), int(p["xi"])
+            if 0 <= yi < h and 0 <= xi < w:
+                markers[yi, xi] = i
+        try:
+            fg_img = ndi.gaussian_filter(img, sigma=0.6)
+            bg = ndi.gaussian_filter(img, sigma=max(2.0, 0.9 * max_r))
+        except Exception:
+            fg_img, bg = img, img
+        dist = distance_transform_edt(markers == 0)
+        mvals = fg_img[markers > 0]
+        peak_p = float(np.percentile(mvals, 20)) if mvals.size else float(np.percentile(fg_img, 92))
+        contrast = fg_img - bg
+        c_floor = max(0.012, 0.16 * max(peak_p - float(np.median(bg)), 0.02))
+        fg = (dist <= grow) & (
+            (contrast >= c_floor) | (fg_img >= 0.42 * max(peak_p, 1e-6))
+        )
+        try:
+            fg = ndi.binary_fill_holes(fg)
+        except Exception:
+            pass
+        if not np.any(fg):
+            return self._disks_from_peaks(img.shape, peaks)
+
+        try:
+            ws = segmentation.watershed(
+                -fg_img, markers, mask=fg, watershed_line=True
+            )
+        except TypeError:
+            ws = segmentation.watershed(-fg_img, markers, mask=fg)
+            lab = np.asarray(ws)
+            cut = np.zeros(lab.shape, dtype=bool)
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1),
+                           (-1, -1), (-1, 1), (1, -1), (1, 1)):
+                shifted = np.roll(np.roll(lab, dy, axis=0), dx, axis=1)
+                cut |= (lab > 0) & (shifted > 0) & (lab != shifted)
+            ws = lab.copy()
+            ws[cut] = 0
+
+        ws = np.asarray(ws, dtype=np.int32)
+        keep = np.zeros(int(ws.max()) + 1, dtype=bool)
+        keep[0] = True
+        m = markers > 0
+        lids = markers[m]
+        same = ws[m] == lids
+        if np.any(same):
+            keep[lids[same]] = True
+        if ws.max() >= 1:
+            ws = np.where(keep[np.clip(ws, 0, len(keep) - 1)], ws, 0)
+
+        cfg = self.cell_config
+        min_a = int(getattr(cfg, "blob_min_area", 8) or 8)
+        max_a = int(getattr(cfg, "blob_max_area", 500) or 500)
+        if ws.max() > 0:
+            counts = np.bincount(ws.ravel(), minlength=int(ws.max()) + 1)
+            lo = max(4, min_a // 2)
+            hi = max(max_a * 3, min_a + 1)
+            drop = (counts < lo) | (counts > hi)
+            drop[0] = False
+            if np.any(drop):
+                ws[drop[ws]] = 0
+
+        if int(ws.max()) <= 0:
+            return self._disks_from_peaks(img.shape, peaks)
+        return ws
+
+    def _disks_from_peaks(self, shape_hw, peaks):
+        """Fallback circular disks if intensity segmentation finds nothing."""
+        h, w = shape_hw[:2]
+        labels = np.zeros((h, w), dtype=np.int32)
+        for i, p in enumerate(peaks, 1):
+            yi, xi = int(p["yi"]), int(p["xi"])
+            r = max(1, int(p.get("radius", p.get("raw_radius", 3)) or 3))
+            y0, y1 = max(0, yi - r), min(h, yi + r + 1)
+            x0, x1 = max(0, xi - r), min(w, xi + r + 1)
+            yy, xx = np.ogrid[y0:y1, x0:x1]
+            disk = (yy - yi) ** 2 + (xx - xi) ** 2 <= r * r
+            empty = labels[y0:y1, x0:x1] == 0
+            labels[y0:y1, x0:x1][disk & empty] = i
+        return labels
 
     def _place_blob_peaks(
         self,
@@ -854,6 +1745,7 @@ class ImageProcessor:
         min_local_snr=None,
         density_radii=None,
         packing=None,
+        relax_shape=False,
     ):
         """Rasterize blob peaks to a labeled disk mask with optional density packing.
 
@@ -879,74 +1771,228 @@ class ImageProcessor:
             min_local_snr = float(getattr(cfg, "blob_min_local_snr", 0.0) or 0.0)
         excl = int(getattr(cfg, "blob_exclude_border", 1) or 0)
 
-        # Precompute neighbor density if packing adaptive
-        peak_list = []
+        # Once per placement: distance-to-exterior for bright edge-line margin gate
+        tissue_dist = None
+        margin = int(getattr(cfg, "blob_tissue_margin", 0) or 0)
+        if margin > 0:
+            try:
+                tissue_dist = self._tissue_distance_map(work_n)
+            except Exception as e:
+                logger.warning(f"tissue distance map failed: {e}")
+                tissue_dist = None
+        # Once per placement: global intensity floor (was recomputed per peak)
+        try:
+            intensity_floor = float(np.percentile(work_n, 2)) if work_n.size else 0.0
+        except Exception:
+            intensity_floor = 0.0
+
+        ridge_map = None
+        try:
+            ridge_thr = float(getattr(cfg, "blob_ridge_thresh", 0.40))
+        except Exception:
+            ridge_thr = 0.40
+        ridge_on = int(getattr(cfg, "blob_ridge_reject", 1) or 0) != 0 and ridge_thr > 0
+        map_y0 = map_x0 = 0
+        work_maps = work_n
+        try:
+            if blobs is not None and len(blobs):
+                pad_m = int(4.0 * max(3.0, float(getattr(cfg, "blob_max_sigma", 12) or 12))) + 8
+                ys = np.asarray(blobs)[:, 0]
+                xs = np.asarray(blobs)[:, 1]
+                my0 = max(0, int(np.min(ys)) - pad_m)
+                mx0 = max(0, int(np.min(xs)) - pad_m)
+                my1 = min(h, int(np.max(ys)) + pad_m + 1)
+                mx1 = min(w, int(np.max(xs)) + pad_m + 1)
+                if (my1 - my0) * (mx1 - mx0) < 0.60 * h * w:
+                    work_maps = work_n[my0:my1, mx0:mx1]
+                    map_y0, map_x0 = my0, mx0
+        except Exception:
+            work_maps = work_n
+            map_y0 = map_x0 = 0
+        if ridge_on:
+            try:
+                rsig = max(1.6, float(getattr(cfg, "blob_min_sigma", 2.0) or 2.0))
+                ridge_map = self._bright_ridge_map(work_maps, sigma=rsig)
+                for extra_s in (rsig * 1.5, rsig * 2.4):
+                    ridge_map = np.maximum(
+                        ridge_map, self._bright_ridge_map(work_maps, sigma=float(extra_s))
+                    )
+            except Exception as e:
+                logger.debug(f"ridge reject skipped: {e}")
+                ridge_map = None
+        cavity_rim_px = int(getattr(cfg, "blob_cavity_rim", 12) or 0)
+        cavity_mask = None
+        if cavity_rim_px > 0:
+            try:
+                cavity_mask = self._cavity_reject_mask(work_maps, cavity_rim_px)
+            except Exception as e:
+                logger.debug(f"cavity rim map failed: {e}")
+                cavity_mask = None
+
+        survivors = []
         for y, x, sigma in blobs:
             yi, xi = int(round(y)), int(round(x))
             if not (0 <= yi < h and 0 <= xi < w):
                 continue
-            radius = max(1, int(round(float(sigma) * radius_scale)))
-            peak_list.append((yi, xi, radius, float(sigma), float(work_n[yi, xi])))
-
-        # Sort by intensity descending
-        peak_list.sort(key=lambda t: t[4], reverse=True)
-
-        # Neighbor counts for density packing (within 3*mean radius)
-        n_nb = [0] * len(peak_list)
-        if packing is not None and len(peak_list) > 1:
-            coords = np.array([(p[0], p[1]) for p in peak_list], dtype=np.float64)
-            mean_r = float(np.mean([p[2] for p in peak_list]))
-            nb_r = max(8.0, 3.0 * mean_r)
-            nb_r2 = nb_r * nb_r
-            for i in range(len(peak_list)):
-                d2 = (coords[:, 0] - coords[i, 0]) ** 2 + (coords[:, 1] - coords[i, 1]) ** 2
-                n_nb[i] = int(np.sum((d2 > 0) & (d2 <= nb_r2)))
-
-        pack = None if packing is None else float(np.clip(packing, 0.0, 1.0))
-
-        for i, (yi, xi, radius, sigma, peak_val) in enumerate(peak_list):
             if excl > 0 and (yi < excl or xi < excl or yi >= h - excl or xi >= w - excl):
                 continue
+            peak_val = float(work_n[yi, xi])
             if min_peak > 0 and peak_val < min_peak:
                 continue
+            radius = max(1, int(round(float(sigma) * radius_scale)))
             area = int(np.pi * radius * radius)
             if not (cfg.blob_min_area <= area <= cfg.blob_max_area):
                 continue
-
+            if ridge_map is not None:
+                ry, rx = yi - map_y0, xi - map_x0
+                if 0 <= ry < ridge_map.shape[0] and 0 <= rx < ridge_map.shape[1]:
+                    if float(ridge_map[ry, rx]) >= ridge_thr:
+                        continue
+            if cavity_mask is not None:
+                try:
+                    cy, cx = yi - map_y0, xi - map_x0
+                    if 0 <= cy < cavity_mask.shape[0] and 0 <= cx < cavity_mask.shape[1]:
+                        if bool(cavity_mask[cy, cx]):
+                            continue
+                except Exception:
+                    pass
             ok, snr = self._peak_quality_ok(
-                work_n, yi, xi, radius, min_local_snr=min_local_snr
+                work_n,
+                yi,
+                xi,
+                radius,
+                min_local_snr=min_local_snr,
+                tissue_dist=tissue_dist,
+                intensity_floor=intensity_floor,
+                relax_shape=relax_shape,
             )
             if not ok:
+                # Sparse dim nuclei often fail BG-relative by a hair
+                ok, snr = self._peak_quality_ok(
+                    work_n,
+                    yi,
+                    xi,
+                    radius,
+                    min_local_snr=min_local_snr,
+                    tissue_dist=tissue_dist,
+                    intensity_floor=intensity_floor,
+                    bg_rel_scale=0.5,
+                    relax_shape=relax_shape,
+                )
+            if not ok:
                 continue
+            local_med = self._local_median_at(work_n, yi, xi, max(radius * 2, 8))
+            survivors.append(
+                {
+                    "yi": yi,
+                    "xi": xi,
+                    "radius": radius,
+                    "sigma": float(sigma),
+                    "peak_val": peak_val,
+                    "snr": float(snr),
+                    "contrast": float(peak_val - local_med),
+                }
+            )
 
-            # Density-aware free-space: dense neighbors → lower free_need
-            free_need_i = base_free
-            if pack is not None:
-                dens = min(1.0, n_nb[i] / 6.0)  # denser clusters scale faster
-                dens_eff = 0.4 * pack + 0.6 * dens
-                free_need_i = base_free * (1.0 - 0.7 * dens_eff)
-                # High-SNR peaks in clusters may pack tighter
-                if snr >= 1.5 and dens > 0.4:
-                    free_need_i *= 0.75
-                free_need_i = min(0.9, max(0.08, free_need_i))
-            elif n_nb[i] >= 3:
-                # Even without packing flag: slight ease in dense groups
-                free_need_i = max(0.12, base_free * 0.7)
+        if int(getattr(cfg, "blob_cluster_recover", 1) or 0) and survivors:
+            survivors = self._apply_cluster_recover(
+                survivors,
+                seed_snr=float(getattr(cfg, "blob_seed_snr", 1.15) or 1.15),
+                recover_factor=float(getattr(cfg, "blob_recover_factor", 3.8) or 3.8),
+                bg_rel=float(getattr(cfg, "blob_bg_relative", 0.0) or 0.0),
+            )
+        chain_s = float(getattr(cfg, "blob_chain_reject", 1) or 0)
+        if chain_s > 0 and survivors:
+            survivors = self._apply_chain_reject(survivors, strength=chain_s)
 
-            y0 = max(0, yi - radius)
-            y1 = min(h, yi + radius + 1)
-            x0 = max(0, xi - radius)
-            x1 = min(w, xi + radius + 1)
-            yy, xx = np.ogrid[y0:y1, x0:x1]
-            disk_local = (yy - yi) ** 2 + (xx - xi) ** 2 <= radius * radius
-            free_local = disk_local & (labels[y0:y1, x0:x1] == 0)
-            n_disk = int(disk_local.sum())
-            n_free = int(free_local.sum())
-            if n_disk < 1 or n_free < int(n_disk * free_need_i):
-                continue
-            labels[y0:y1, x0:x1][free_local] = cell_id
-            cell_id += 1
+        survivors.sort(key=lambda p: p["peak_val"], reverse=True)
+        n_nb = [0] * len(survivors)
+        if packing is not None and len(survivors) > 1:
+            coords = np.array([[p["yi"], p["xi"]] for p in survivors], dtype=np.float64)
+            mean_r = float(np.mean([p["radius"] for p in survivors]))
+            nb_r = max(8.0, 3.0 * mean_r)
+            try:
+                from scipy.spatial import cKDTree
+                tree = cKDTree(coords)
+                neighbors = tree.query_ball_tree(tree, r=nb_r)
+                n_nb = [max(0, len(nbrs) - 1) for nbrs in neighbors]
+            except Exception:
+                nb_r2 = nb_r * nb_r
+                for i in range(len(survivors)):
+                    d2 = (coords[:, 0] - coords[i, 0]) ** 2 + (coords[:, 1] - coords[i, 1]) ** 2
+                    n_nb[i] = int(np.sum((d2 > 0) & (d2 <= nb_r2)))
 
+        pack = None if packing is None else float(np.clip(packing, 0.0, 1.0))
+
+        for p in survivors:
+            p["raw_radius"] = int(max(1, p["radius"]))
+
+        # Cap drawn disk so two nuclei do not fuse into one oval (worms).
+        # Spacing between *centers* is controlled by blob_free_space below,
+        # using raw_radius — not this shrunken disk.
+        if len(survivors) > 1:
+            try:
+                xy = np.array([[p["yi"], p["xi"]] for p in survivors], dtype=np.float64)
+                from scipy.spatial import cKDTree
+                nn = cKDTree(xy).query(xy, k=2)[0][:, 1]
+                for i, p in enumerate(survivors):
+                    if np.isfinite(nn[i]) and nn[i] > 2.0:
+                        p["radius"] = max(
+                            1, min(int(p["radius"]), max(1, int(nn[i] / 2.0) - 1))
+                        )
+            except Exception:
+                pass
+
+        placed = []
+        placed_yx = []
+        placed_rr = []
+        # Center-to-center floor from free_space: 0.45 ≈ slight overlap of
+        # natural disks; 0.7 ≈ a clear gap. This is what the slider actually does.
+        sep_scale = 0.40 + 0.90 * float(base_free)
+
+        for i, p in enumerate(survivors):
+            yi, xi = p["yi"], p["xi"]
+            raw_r = int(p.get("raw_radius", p["radius"]))
+            if placed_yx:
+                dyx = np.asarray(placed_yx, dtype=np.float64) - np.array(
+                    [yi, xi], dtype=np.float64
+                )
+                d = np.sqrt((dyx ** 2).sum(axis=1))
+                need = (raw_r + np.asarray(placed_rr, dtype=np.float64)) * sep_scale
+                if np.any(d < need):
+                    continue
+            placed.append(p)
+            placed_yx.append((yi, xi))
+            placed_rr.append(raw_r)
+
+        if not placed:
+            return labels
+
+        labels = self._shape_cells_from_markers(work_n, placed)
+        # Recover extra packed peaks, then re-trace shapes so they are not circles
+        try:
+            stub = self._disks_from_peaks(work_n.shape, placed)
+            grown = self._recover_packed_nuclei(
+                work_n, stub, relax_shape=relax_shape
+            )
+            if grown is not None and int(grown.max()) > int(stub.max()):
+                extra = []
+                for lid in range(int(stub.max()) + 1, int(grown.max()) + 1):
+                    blob = grown == lid
+                    if not np.any(blob):
+                        continue
+                    ys, xs = np.where(blob)
+                    extra.append({
+                        "yi": int(np.mean(ys)),
+                        "xi": int(np.mean(xs)),
+                        "radius": max(1, int(round(np.sqrt(blob.sum() / np.pi)))),
+                        "raw_radius": max(1, int(round(np.sqrt(blob.sum() / np.pi)))),
+                    })
+                if extra:
+                    placed.extend(extra)
+                    labels = self._shape_cells_from_markers(work_n, placed)
+        except Exception as e:
+            logger.debug(f"shape recover skipped: {e}")
         return labels
 
     def _detect_cells_blob(self, img: np.ndarray):
@@ -959,11 +2005,131 @@ class ImageProcessor:
 
         thr = float(cfg.blob_threshold)
         thr_rel = float(getattr(cfg, "blob_threshold_rel", 0.0) or 0.0)
-        blobs = self._run_blob_detector(work_n, thr, method=method, thr_rel=thr_rel)
+        crop = self._padded_content_bbox(work_n, getattr(cfg, "blob_max_sigma", 12.0) or 12.0)
+        if crop is not None:
+            y0, y1, x0, x1 = crop
+            logger.debug(
+                f"LoG content crop {work_n.shape} -> {(y1 - y0, x1 - x0)} origin=({y0},{x0})"
+            )
+            blobs = self._run_blob_detector(
+                work_n[y0:y1, x0:x1], thr, method=method, thr_rel=thr_rel
+            )
+            if blobs is not None and len(blobs):
+                blobs = np.array(blobs, dtype=np.float64, copy=True)
+                blobs[:, 0] += y0
+                blobs[:, 1] += x0
+        else:
+            blobs = self._run_blob_detector(work_n, thr, method=method, thr_rel=thr_rel)
         if blobs is None or len(blobs) == 0:
             return img, np.zeros(work_n.shape, dtype=int)
         labels = self._place_blob_peaks(work_n, blobs)
         return img, labels
+
+    def _recover_packed_nuclei(self, work_n, labels, relax_shape=False):
+        """Add peaks that LoG merged away inside dense clusters (PVN/SCN).
+
+        Searches residual intensity in neighborhoods that already have many cells,
+        with a tighter min-distance than the original blob overlap prune.
+        """
+        cfg = self.cell_config
+        if labels is None or labels.max() < 4:
+            return labels
+        occupied = labels > 0
+        try:
+            dens = ndi.uniform_filter(occupied.astype(np.float64), size=28)
+        except Exception:
+            return labels
+        dense = dens >= 0.10
+        if not np.any(dense):
+            return labels
+        search = ndi.binary_dilation(dense, iterations=6)
+        if relax_shape:
+            zm = getattr(self, "_adaptive_zone_mask", None)
+            if zm is not None:
+                try:
+                    zarr = np.asarray(zm)
+                    if zarr.ndim > 2:
+                        zarr = zarr.squeeze()
+                    if zarr.shape[:2] == work_n.shape[:2]:
+                        search = search & (zarr > 0)
+                except Exception:
+                    pass
+        residual = np.array(work_n, copy=True)
+        residual[occupied] = 0.0
+        residual[~search] = 0.0
+        try:
+            props = measure.regionprops(labels)
+            radii = [max(1.0, 0.5 * (p.equivalent_diameter)) for p in props if p.area >= 3]
+            med_r = float(np.median(radii)) if radii else 4.0
+        except Exception:
+            med_r = 4.0
+        min_d = max(2, int(round(0.62 * med_r)))
+        thr = float(cfg.blob_threshold)
+        try:
+            loc = residual[search]
+            if loc.size > 20:
+                thr = max(thr, float(np.percentile(loc, 88)))
+        except Exception:
+            pass
+        try:
+            coords = feature.peak_local_max(
+                residual,
+                min_distance=min_d,
+                threshold_abs=thr,
+                exclude_border=True,
+            )
+        except TypeError:
+            coords = feature.peak_local_max(
+                residual, min_distance=min_d, threshold_abs=thr
+            )
+        if coords is None or len(coords) == 0:
+            return labels
+        h, w = work_n.shape[:2]
+        radius = max(2, int(round(med_r)))
+        cell_id = int(labels.max()) + 1
+        excl = int(getattr(cfg, "blob_exclude_border", 1) or 0)
+        try:
+            halo = ndi.binary_dilation(occupied, structure=np.ones((3, 3), dtype=bool))
+        except Exception:
+            halo = occupied.copy()
+        for y, x in coords:
+            yi, xi = int(y), int(x)
+            if not (0 <= yi < h and 0 <= xi < w):
+                continue
+            if occupied[yi, xi]:
+                continue
+            if excl > 0 and (yi < excl or xi < excl or yi >= h - excl or xi >= w - excl):
+                continue
+            ok, _snr = self._peak_quality_ok(
+                work_n,
+                yi,
+                xi,
+                radius,
+                min_local_snr=0.0,
+                bg_rel_scale=0.7,
+                relax_shape=relax_shape,
+            )
+            if not ok:
+                continue
+            y0, y1 = max(0, yi - radius), min(h, yi + radius + 1)
+            x0, x1 = max(0, xi - radius), min(w, xi + radius + 1)
+            yy, xx = np.ogrid[y0:y1, x0:x1]
+            disk = (yy - yi) ** 2 + (xx - xi) ** 2 <= radius * radius
+            free = disk & ~halo[y0:y1, x0:x1]
+            n_disk = int(disk.sum())
+            if n_disk < 1 or int(free.sum()) < int(0.12 * n_disk):
+                continue
+            labels[y0:y1, x0:x1][free] = cell_id
+            occupied[y0:y1, x0:x1][free] = True
+            try:
+                halo[y0:y1, x0:x1] |= ndi.binary_dilation(
+                    labels[y0:y1, x0:x1] == cell_id,
+                    structure=np.ones((3, 3), dtype=bool),
+                )
+            except Exception:
+                halo[y0:y1, x0:x1] |= labels[y0:y1, x0:x1] > 0
+            cell_id += 1
+        return labels
 
     def _detect_cells_adaptive(self, img: np.ndarray):
         """Adaptive detection for mixed background and density on one slice.
@@ -987,6 +2153,22 @@ class ImageProcessor:
         sens = min(3.0, max(0.25, sens))
         packing = float(getattr(cfg, "adaptive_packing", 0.5) or 0.5)
         dual = int(getattr(cfg, "adaptive_dual_pass", 1) or 0) != 0
+        region_mode_on = int(getattr(cfg, "adaptive_region_mode", 0) or 0) != 0
+        zm0 = getattr(self, "_adaptive_zone_mask", None)
+        has_zones = False
+        if zm0 is not None:
+            try:
+                has_zones = int(np.max(np.asarray(zm0))) > 0
+            except Exception:
+                has_zones = True
+        # Zone mask present (Region Mode 1 or Labeled regions only) → ROI-only windows
+        region_mode_on = region_mode_on or has_zones
+        # Packed nuclei (PVN/SCN / painted ROI): allow more blob overlap so LoG
+        # does not merge neighbors. Only when we are actually detecting in zones.
+        pack_overlap = float(cfg.blob_overlap)
+        # Keep nearby LoG peaks (do not prune one of a touching pair)
+        if packing >= 0.7 or has_zones:
+            pack_overlap = max(pack_overlap, 0.85)
         base_method = (getattr(cfg, "adaptive_base_method", None) or "blob").lower().strip()
         if base_method not in ("blob", "dog", "log"):
             base_method = "blob"
@@ -994,7 +2176,20 @@ class ImageProcessor:
         thr_rel = float(getattr(cfg, "blob_threshold_rel", 0.0) or 0.0)
         min_snr = float(getattr(cfg, "blob_min_local_snr", 0.0) or 0.0)
 
-        def _tile_threshold(tile_img, pass_scale=1.0):
+        # Once for the whole slice: distance-to-exterior for bright edge-line margin
+        tissue_dist = None
+        if int(getattr(cfg, "blob_tissue_margin", 0) or 0) > 0:
+            try:
+                tissue_dist = self._tissue_distance_map(work_n)
+            except Exception as e:
+                logger.warning(f"adaptive tissue distance map failed: {e}")
+                tissue_dist = None
+        try:
+            intensity_floor = float(np.percentile(work_n, 2)) if work_n.size else 0.0
+        except Exception:
+            intensity_floor = 0.0
+
+        def _tile_threshold(tile_img, pass_scale=1.0, painted_zone=False):
             """Map local brightness/noise → blob threshold."""
             t = np.asarray(tile_img, dtype=np.float64)
             if t.size < 16:
@@ -1004,6 +2199,15 @@ class ImageProcessor:
             p99 = float(np.percentile(t, 99))
             dynamic = max(p99 - p50, 1e-4)
             clutter = p50 / (p90 + 1e-4)
+            # Painted/atlas zone: the user marked this to be counted. Packed
+            # nuclei look like "high background" to percentiles — do not hike.
+            if painted_zone:
+                thr = base_thr * min(sens, 1.05) * pass_scale
+                if p90 > 0.40:
+                    thr *= 0.72
+                elif p90 < 0.22:
+                    thr *= 0.55
+                return float(np.clip(thr, 0.002, 0.22))
             thr = base_thr * sens * pass_scale
             thr *= 1.0 + 1.0 * clutter  # stronger raise on high-BG tiles
             # Dim tiles: much more sensitive so dark-field cells survive
@@ -1018,25 +2222,92 @@ class ImageProcessor:
                 thr *= 1.0 + 0.4 * min(1.0, float(np.std(band)) / (dynamic + 1e-4))
             return float(np.clip(thr, 0.002, 0.55))
 
-        def _tile_snr_floor(tile_img, base_floor):
-            """Raise SNR floor on bright tiles; ease on dark tiles."""
+        def _tile_snr_floor(tile_img, base_floor, painted_zone=False):
+            """Raise SNR floor on bright tiles; ease on dark tiles.
+
+            Keep pass identity: the sensitive dual-pass must stay below the
+            strict pass on high-BG tiles (old code forced both to 2.2).
+            """
             t = np.asarray(tile_img, dtype=np.float64)
             if t.size < 16:
                 return base_floor
             p50 = float(np.percentile(t, 50))
             floor = float(base_floor)
-            if p50 > 0.45:
-                floor = max(floor, 2.2 if base_floor > 0 else 2.0)
-            elif p50 > 0.30:
-                floor = max(floor, 1.5 if base_floor > 0 else 1.3)
-            elif p50 < 0.12:
+            if painted_zone:
+                # Surround includes neighboring nuclei; SNR looks worse than
+                # isolated cells. Keep a mild floor only.
+                if floor <= 0:
+                    return 0.55
+                return min(floor, 0.85)
+            sensitive = floor < 1.2
+            if p50 < 0.12:
                 # Dark field: only mild local contrast required
-                floor = min(floor, 0.9) if floor > 0 else 0.7
+                return min(floor, 0.9) if floor > 0 else 0.7
+            if p50 > 0.45:
+                if floor <= 0:
+                    return 1.2
+                if sensitive:
+                    return max(floor, min(floor + 0.5, 1.3))
+                return max(floor, 2.2)
+            if p50 > 0.30:
+                if floor <= 0:
+                    return 1.0
+                if sensitive:
+                    return max(floor, min(floor + 0.3, 1.1))
+                return max(floor, 1.5)
             return floor
 
-        def _collect_pass(pass_scale, snr_floor, quality_gate=True):
-            peaks = []  # (y, x, sigma, score)
-            rscale = float(getattr(cfg, "blob_radius_scale", 1.8) or 1.8)
+        def _iter_windows():
+            """Yield (y0, x0, y1, x1, keep_mask_or_None, is_painted_zone)."""
+            zm = getattr(self, "_adaptive_zone_mask", None)
+            region_mode = zm is not None
+            if region_mode and zm is not None:
+                zarr = np.asarray(zm)
+                if zarr.ndim > 2:
+                    zarr = zarr.squeeze()
+                if zarr.shape[:2] != (h, w):
+                    zarr = np.array(
+                        Image.fromarray(zarr.astype(np.uint8), mode="L").resize(
+                            (w, h), Image.NEAREST
+                        )
+                    )
+                pad = int(np.ceil(4.0 * float(getattr(cfg, "blob_max_sigma", 12) or 12))) + 2
+                covered = np.zeros((h, w), dtype=bool)
+                zids = np.unique(zarr)
+                zids = zids[zids > 0]
+                n_zones = 0
+                for zid in zids:
+                    inside = zarr == int(zid)
+                    if int(inside.sum()) < 48:
+                        continue
+                    ys, xs = np.where(inside)
+                    y0 = max(0, int(ys.min()) - pad)
+                    y1 = min(h, int(ys.max()) + 1 + pad)
+                    x0 = max(0, int(xs.min()) - pad)
+                    x1 = min(w, int(xs.max()) + 1 + pad)
+                    keep = inside[y0:y1, x0:x1]
+                    covered |= inside
+                    n_zones += 1
+                    # Large crescents (lcl vs lcr) often differ in brightness.
+                    # Tile the zone so a dimmer half is not stuck with the
+                    # brighter half's threshold.
+                    zh, zw = y1 - y0, x1 - x0
+                    if zh > tile * 1.15 or zw > tile * 1.15:
+                        for ty in range(y0, y1, step):
+                            for tx in range(x0, x1, step):
+                                ty1 = min(y1, ty + tile)
+                                tx1 = min(x1, tx + tile)
+                                keep_t = inside[ty:ty1, tx:tx1]
+                                if int(keep_t.sum()) < 48:
+                                    continue
+                                yield ty, tx, ty1, tx1, keep_t, True
+                    else:
+                        yield y0, x0, y1, x1, keep, True
+                logger.info(
+                    f"Adaptive region mode: {n_zones} painted/atlas zones; "
+                    "unlabeled tissue skipped (no dark-field grain outside ROIs)"
+                )
+                return
             for y0 in range(0, h, step):
                 for x0 in range(0, w, step):
                     y1 = min(h, y0 + tile)
@@ -1045,17 +2316,45 @@ class ImageProcessor:
                         continue
                     if x1 - x0 < tile // 3 and x0 > 0:
                         continue
+                    yield y0, x0, y1, x1, None, False
+
+        def _collect_pass(pass_scale, snr_floor, quality_gate=True):
+            peaks = []  # (y, x, sigma, score)
+            rscale = float(getattr(cfg, "blob_radius_scale", 1.8) or 1.8)
+            for y0, x0, y1, x1, keep, is_zone in _iter_windows():
                     tile_img = work_n[y0:y1, x0:x1]
-                    thr = _tile_threshold(tile_img, pass_scale=pass_scale)
-                    tile_snr = _tile_snr_floor(tile_img, snr_floor)
+                    if tile_img.size == 0:
+                        continue
+                    stat = tile_img if keep is None else tile_img[keep]
+                    if stat.size < 16:
+                        continue
+                    # Constant tiles have LoG = 0 → no blobs (exact skip)
+                    if float(np.max(stat)) == float(np.min(stat)):
+                        continue
+                    thr = _tile_threshold(
+                        stat, pass_scale=pass_scale, painted_zone=is_zone
+                    )
+                    tile_snr = _tile_snr_floor(
+                        stat, snr_floor, painted_zone=is_zone
+                    )
                     blobs = self._run_blob_detector(
-                        tile_img, thr, method=base_method, thr_rel=thr_rel
+                        tile_img,
+                        thr,
+                        method=base_method,
+                        thr_rel=thr_rel,
+                        overlap=pack_overlap,
                     )
                     if blobs is None or len(blobs) == 0:
                         continue
                     for by, bx, sig in blobs:
-                        yi = int(round(by)) + y0
-                        xi = int(round(bx)) + x0
+                        by_i, bx_i = int(round(by)), int(round(bx))
+                        if keep is not None:
+                            if not (0 <= by_i < keep.shape[0] and 0 <= bx_i < keep.shape[1]):
+                                continue
+                            if not keep[by_i, bx_i]:
+                                continue
+                        yi = by_i + y0
+                        xi = bx_i + x0
                         if not (0 <= yi < h and 0 <= xi < w):
                             continue
                         margin = 4
@@ -1066,19 +2365,24 @@ class ImageProcessor:
                             or (x1 < w and xi >= x1 - margin)
                         )
                         r = max(1, int(round(float(sig) * rscale)))
-                        # Quality gate early (isotropy / edge / high-BG)
+                        # Quality gate early (isotropy / edge / bright-rim / high-BG)
                         if quality_gate:
                             ok, snr = self._peak_quality_ok(
-                                work_n, yi, xi, r, min_local_snr=tile_snr
+                                work_n,
+                                yi,
+                                xi,
+                                r,
+                                min_local_snr=tile_snr,
+                                tissue_dist=tissue_dist,
+                                intensity_floor=intensity_floor,
+                                relax_shape=is_zone,
                             )
                             if not ok:
                                 continue
-                        elif tile_snr > 0:
-                            if self._local_snr_at(work_n, yi, xi, r) < tile_snr:
-                                continue
-                            snr = self._local_snr_at(work_n, yi, xi, r)
                         else:
                             snr = self._local_snr_at(work_n, yi, xi, r)
+                            if tile_snr > 0 and snr < tile_snr:
+                                continue
                         # Score: prefer high local SNR and interior peaks
                         score = float(work_n[yi, xi]) * (1.0 + 0.15 * snr)
                         if borderish:
@@ -1092,6 +2396,8 @@ class ImageProcessor:
             peaks = sorted(peaks, key=lambda p: p[3], reverse=True)
             kept = []
             rscale = float(getattr(cfg, "blob_radius_scale", 1.8) or 1.8)
+            cell = 8.0
+            grid = {}
             for yi, xi, sig, score in peaks:
                 r = max(1, int(round(float(sig) * rscale)))
                 # Tighter NMS for high-score (real) peaks allows denser packing
@@ -1100,19 +2406,33 @@ class ImageProcessor:
                     mdf = min(mdf, 0.55)
                 min_d = max(1.5, mdf * r)
                 min_d2 = min_d * min_d
+                gy, gx = int(yi // cell), int(xi // cell)
+                rad_cells = int(min_d // cell) + 1
                 ok = True
-                for ky, kx, ks, _ in kept:
-                    if (yi - ky) ** 2 + (xi - kx) ** 2 < min_d2:
-                        ok = False
+                for dy in range(-rad_cells, rad_cells + 1):
+                    for dx in range(-rad_cells, rad_cells + 1):
+                        bucket = grid.get((gy + dy, gx + dx))
+                        if not bucket:
+                            continue
+                        for ky, kx, _ks, _sc in bucket:
+                            if (yi - ky) ** 2 + (xi - kx) ** 2 < min_d2:
+                                ok = False
+                                break
+                        if not ok:
+                            break
+                    if not ok:
                         break
                 if ok:
-                    kept.append((yi, xi, sig, score))
+                    rec = (yi, xi, sig, score)
+                    kept.append(rec)
+                    grid.setdefault((gy, gx), []).append(rec)
             if not kept:
                 return np.zeros((0, 3))
             return np.array([[p[0], p[1], p[2]] for p in kept], dtype=np.float64)
 
         # Pass A: sensitive (dark-bg / low-contrast cells)
         # Pass B: strict (high-bg clutter)
+        nms_md = 0.48 if packing >= 0.7 else 0.6
         if dual:
             sens_scale = 0.50 / sens
             strict_scale = 1.45 * sens
@@ -1121,39 +2441,53 @@ class ImageProcessor:
             peaks_a = _collect_pass(sens_scale, snr_sens, quality_gate=True)
             peaks_b = _collect_pass(strict_scale, snr_strict, quality_gate=True)
             fused = list(peaks_b)
+            cell = 8.0
+            grid_b = {}
+            for q in peaks_b:
+                grid_b.setdefault((int(q[0] // cell), int(q[1] // cell)), []).append(q)
             for p in peaks_a:
                 yi, xi, sig, score = p
                 r = max(
                     1,
                     int(round(sig * float(getattr(cfg, "blob_radius_scale", 1.8) or 1.8))),
                 )
-                min_d2 = (max(1.5, 0.7 * r)) ** 2
-                if any((yi - q[0]) ** 2 + (xi - q[1]) ** 2 < min_d2 for q in peaks_b):
+                min_d = max(1.5, 0.7 * r)
+                min_d2 = min_d * min_d
+                gy, gx = int(yi // cell), int(xi // cell)
+                rad_cells = int(min_d // cell) + 1
+                conflict = False
+                for dy in range(-rad_cells, rad_cells + 1):
+                    for dx in range(-rad_cells, rad_cells + 1):
+                        bucket = grid_b.get((gy + dy, gx + dx))
+                        if not bucket:
+                            continue
+                        if any((yi - q[0]) ** 2 + (xi - q[1]) ** 2 < min_d2 for q in bucket):
+                            conflict = True
+                            break
+                    if conflict:
+                        break
+                if conflict:
                     continue
                 fused.append(p)
-            blobs = _nms_peaks(fused, min_dist_factor=0.6)
+            blobs = _nms_peaks(fused, min_dist_factor=nms_md)
             # Placement: mild SNR; quality gates re-apply in _place_blob_peaks
             snr_place = max(0.5, snr_sens * 0.8)
         else:
             peaks = _collect_pass(1.0 * sens, max(min_snr, 0.8) if min_snr > 0 else 0.8)
-            blobs = _nms_peaks(peaks)
+            blobs = _nms_peaks(peaks, min_dist_factor=nms_md)
             snr_place = min_snr if min_snr > 0 else 0.5
 
         if blobs is None or len(blobs) == 0:
             return img, np.zeros((h, w), dtype=int)
 
-        # Prefer denser packing under adaptive (clusters)
         pack_use = packing if packing is not None else 0.5
-        pack_use = max(pack_use, 0.55)
         labels = self._place_blob_peaks(
             work_n,
             blobs,
-            free_need=min(
-                float(getattr(cfg, "blob_free_space", 0.45) or 0.45),
-                0.35,
-            ),
+            free_need=float(getattr(cfg, "blob_free_space", 0.45) or 0.45),
             min_local_snr=snr_place,
             packing=pack_use,
+            relax_shape=has_zones,
         )
         logger.info(
             f"Adaptive detection: tiles~{tile}px dual={dual} method={base_method} "
@@ -1214,14 +2548,16 @@ class ImageProcessor:
         return img, labels
 
 # This is old so we should drop it to prevent obscurity
-def binary_mask_cell_count(background_pil, processor=None):
+def binary_mask_cell_count(background_pil, processor=None, zone_mask=None):
     """Enhanced cell detection using ImageProcessor class.
     If processor is provided, use its current config (important for live Mask Settings + Autotune).
+    zone_mask: optional painted/atlas zone IDs in image coordinates (Adaptive Region Mode).
     """
     if processor is None:
         processor = ImageProcessor()
-    img, labels = processor.detect_cells(background_pil)
-    return img, labels > 0
+    img, labels = processor.detect_cells(background_pil, zone_mask=zone_mask)
+    # Keep integer cell IDs so touching nuclei are not merged into one "worm"
+    return img, labels
     
 
 def split_stacked_tiff(file_path):
@@ -1343,6 +2679,14 @@ class PDFViewer:
         self._crop_draw_anchor = None  # (x, y) canvas start of rubber-band
         self._crop_move_origin = None  # (x, y) canvas pointer at move start
         self._crop_box_at_move_start = None
+        # Aspect lock for atlas crop rubber-band (W/H). Off = free drag.
+        self.crop_aspect_lock_var = tk.BooleanVar(value=True)
+        # Human-readable preset shown in UI (see _CROP_ASPECT_PRESETS)
+        self.crop_aspect_preset_var = tk.StringVar(value="Match TIFF image")
+        self.crop_aspect_w_var = tk.StringVar(value="1")
+        self.crop_aspect_h_var = tk.StringVar(value="1")
+        self._crop_aspect_panel = None
+        self._crop_aspect_howto_shown = False
         self.start_x = None
         self.start_y = None
 
@@ -1353,13 +2697,32 @@ class PDFViewer:
         self.drag_start_x = None
         self.drag_start_y = None
 
+        # Atlas alignment stack (landmarks → edge snap → local refine)
+        self.atlas_align_active = False
+        self.atlas_align_mode = None  # 'landmarks' | None
+        self.atlas_align_pairs = []  # list of {atlas: (x,y), tissue: (x,y)} in image coords
+        self.atlas_align_pending_atlas = None  # first click of a pair (atlas, image-space)
+        self.atlas_align_markers = []
+        self.atlas_align_status_window = None
+        self.atlas_align_status_var = None
+        self.atlas_align_detail_var = None
+        self._last_landmark_pairs = []  # last applied landmark pairs (image space)
+        self._edge_snap_dialog = None
+        self._edge_snap_snapshot = None  # pristine layers for pose-only apply
+        self._edge_snap_preview = None  # last computed pose + contours
+        self._edge_snap_overlay_ids = []
+
         # Mask editing state
         self.editing_mask = False
         self.mask_edit_add = True  # True = add cells, False = remove cells
         self.splitting_cells = False  # True = Split Cell click mode
         self.current_mask = None   # reference to the current mask being edited
         self.auto_mask = None
+        self.auto_labels = None
         self.showing_auto_mask = False
+        # Native-res RGBA ring overlay. Zoom/redraw scale this like paint_layer
+        # instead of rebuilding (or dropping) the mask on every wheel tick.
+        self.mask_overlay_layer = None
 
         # Measure Tune — TP/FP/FN/TN click labeling → detection parameters
         self.measure_tune_active = False
@@ -1394,6 +2757,16 @@ class PDFViewer:
         self.area_tune_result = None
         # Smart Suggest session history (trajectory-aware recipes)
         self._smart_suggest_history = []
+        self.smart_suggest_labeled_only = tk.BooleanVar(value=False)
+        # Blob/Show Mask: apply detection only inside painted/atlas regions
+        self.blob_labeled_regions_only = tk.BooleanVar(value=False)
+        # Two Blob Detection panels (Config A / Config B) assigned per labeled region
+        self.dual_settings_mode = tk.BooleanVar(
+            value=bool(getattr(self.image_processor, "dual_settings_mode_pref", False))
+        )
+        self.zone_criteria = {}  # {page: {zid: "A"|"B"}}
+        self.autotune_cfg_a = tk.BooleanVar(value=True)
+        self.autotune_cfg_b = tk.BooleanVar(value=True)
 
         # View zoom (separate from PDF render zoom)
         self.view_scale = 1.0
@@ -1420,6 +2793,7 @@ class PDFViewer:
 
         # Atlas ribbon visibility and state (must be created before _build_gui so View menu can reference it)
         self.show_atlas_ribbon = tk.BooleanVar(value=True)
+        self.show_cell_mask = tk.BooleanVar(value=True)
         self.atlas_ribbon_expanded = False
         self.border_mode_var = tk.BooleanVar(value=False)
         self.region_move_mode = tk.BooleanVar(value=False)
@@ -1461,6 +2835,12 @@ class PDFViewer:
         self.tiff_file_list = []   # list of full paths (source TIFFs only)
         self.current_tiff_path = None  # full path of the TIFF currently open in the viewer
         self._tree_path_to_iid = {}  # normalized path -> tree iid (for highlight)
+        self._excluded_images = set()  # lowercase basenames excluded from workflow
+        self._file_browser_context_path = None
+
+        # Combined project counts (File → Select Project Output Directory)
+        self.project_output_directory = None
+        self.project_name = None
 
         # Last DF for counts
         self.last_df = None
@@ -1481,8 +2861,8 @@ class PDFViewer:
         self.random_perineuronal_cells = None
         self.perineuronal_area_factor = 2.0
 
-        # Brightness
-        self.brightness = 0.0
+        # Brightness (slider -100..400; default is maximum)
+        self.brightness = float(self.BRIGHTNESS_DEFAULT)
         self._brightness_after_id = None  # debounce handle for slider
         # Cache: display-sized background *without* brightness (keyed by scale + image id)
         self._bg_display_base_cache = None  # (key, PIL.Image)
@@ -1534,6 +2914,10 @@ class PDFViewer:
         self.master.bind('<Control-Left>', self._nav_previous_image_event)
         self.master.bind('<Control-Right>', self._nav_next_image_event)
         self.master.bind('<Control-Shift-Right>', self._nav_next_uncounted_event)
+        # Dual Settings Mode: A/B keys assign the selected Atlas Manager region
+        # bind_all so it works after clicking the canvas or list (focus is on a child).
+        for _key in ("<KeyPress-a>", "<KeyPress-A>", "<KeyPress-b>", "<KeyPress-B>"):
+            self.master.bind_all(_key, self._on_zone_criteria_key)
 
         # Bind click event for highlighting
         self.output.bind("<Button-1>", self.highlight_region)
@@ -1706,6 +3090,10 @@ class PDFViewer:
         filemenu.add_command(label="Save Atlas Schematic…", command=self.save_atlas_schematic)
         filemenu.add_command(label="Load Atlas Schematic…", command=self.load_atlas_schematic)
         filemenu.add_command(label="Save Flattened Image", command=self.save_flattened_image)
+        filemenu.add_command(
+            label="Select Project Output Directory",
+            command=self.select_project_output_directory,
+        )
         filemenu.add_separator()
         filemenu.add_command(label="Previous Image", command=self.previous_image, accelerator="Ctrl+Left")
         filemenu.add_command(label="Next Image", command=self.next_image, accelerator="Ctrl+Right")
@@ -1741,6 +3129,19 @@ class PDFViewer:
         atlasmenu.add_command(label="Rotate", command=self.show_rotate_settings)
         atlasmenu.add_command(label="Scale", command=self.show_scale_settings)
         atlasmenu.add_command(label="Fit Atlas to Image", command=self.fit_atlas_to_image)
+        atlasmenu.add_separator()
+        atlasmenu.add_command(
+            label="Align: Landmarks (point pairs)…",
+            command=self.start_atlas_landmark_align,
+        )
+        atlasmenu.add_command(
+            label="Align: Edge Snap…",
+            command=self.run_atlas_edge_snap,
+        )
+        atlasmenu.add_command(
+            label="Align: Local Refine (guide)…",
+            command=self.start_atlas_local_refine_guide,
+        )
         atlasmenu.add_separator()
         atlasmenu.add_command(label="Save Atlas Schematic…", command=self.save_atlas_schematic)
         atlasmenu.add_command(label="Load Atlas Schematic…", command=self.load_atlas_schematic)
@@ -1799,6 +3200,10 @@ class PDFViewer:
         cell_count_menu = tk.Menu(cellmenu, tearoff=0)
         cellmenu.add_cascade(label="Counting", menu=cell_count_menu)
         cell_count_menu.add_command(label="Count Cells", command=self.count_cells)
+        cell_count_menu.add_command(
+            label="Reload Last Count Session…",
+            command=self.reload_last_count_session,
+        )
         cell_count_menu.add_checkbutton(
             label="Show Zone Labels & Counts",
             variable=self.show_zone_labels_var,
@@ -1868,6 +3273,11 @@ class PDFViewer:
             variable=self.show_atlas_ribbon,
             command=self._toggle_atlas_ribbon_visibility
         )
+        viewmenu.add_checkbutton(
+            label="Show Cell Mask",
+            variable=self.show_cell_mask,
+            command=self._on_show_cell_mask_toggled,
+        )
 
 
         # Add highlight regions button to manually enable this
@@ -1919,12 +3329,15 @@ class PDFViewer:
         # Enable mouse wheel zoom
         self._bind_mousewheel()
 
-        # Alt + drag panning
+        # Alt + left-drag, or hold the scroll-wheel (middle button), to pan
         self._pan_start_x = None
         self._pan_start_y = None
+        self._pan_active = False
+        self._pan_prev_cursor = ""
         self.output.bind("<Alt-ButtonPress-1>", self._start_pan)
         self.output.bind("<Alt-B1-Motion>", self._do_pan)
         self.output.bind("<Alt-ButtonRelease-1>", self._end_pan)
+        self._bind_middle_button_pan()
 
         # Interactive border drag support for selected atlas regions (pull only the dragged side)
         # These are additive so they coexist with other mode-specific bindings
@@ -2210,6 +3623,7 @@ class PDFViewer:
                 "type": "paint_with_regions",
                 "saved_background_size": list(layer.size),
                 "zone_names": self.zone_names.get(page, {}),
+                "zone_criteria": self._serialize_zone_criteria(page=page),
                 "painted_zone_outlines": getattr(self, 'painted_zone_outlines', {}),
             }
             zf.writestr('manifest.json', json.dumps(manifest, indent=2))
@@ -2413,6 +3827,12 @@ class PDFViewer:
                                 self.zone_names[page] = {}
                             self.zone_names[page].update(names)
                             restored = True
+                        try:
+                            self._ingest_zone_criteria(
+                                data.get("zone_criteria") or {}, page=page, merge=True
+                            )
+                        except Exception:
+                            pass
                         outlines = data.get("painted_zone_outlines", {})
                         if outlines:
                             outlines = {int(k): v for k, v in outlines.items()}
@@ -2450,7 +3870,7 @@ class PDFViewer:
         """
         self.open_paint()
 
-    def _load_barccpaint_bundle(self, path):
+    def _load_barccpaint_bundle(self, path, show_messages=True):
         """Load a .barccpaint bundle (strokes.png + zones.png + manifest with names).
         Restores both the visual painted boundaries and the labeled regions (names + shapes)
         into the Atlas Manager at the correct location relative to the current background.
@@ -2506,6 +3926,12 @@ class PDFViewer:
                     if page not in self.zone_names:
                         self.zone_names[page] = {}
                     self.zone_names[page].update(names)
+                try:
+                    self._ingest_zone_criteria(
+                        manifest.get("zone_criteria") or {}, page=page, merge=True
+                    )
+                except Exception:
+                    pass
 
                 outlines = manifest.get('painted_zone_outlines', {})
                 if outlines:
@@ -2538,11 +3964,15 @@ class PDFViewer:
                     except Exception:
                         pass
 
-            messagebox.showinfo("Paint Loaded", f"Loaded paint + labeled regions from:\n{path}")
+            if show_messages:
+                messagebox.showinfo("Paint Loaded", f"Loaded paint + labeled regions from:\n{path}")
             logger.info(f"Loaded barccpaint bundle: {path}")
         except Exception as e:
-            messagebox.showerror("Load Error", f"Failed to load paint bundle:\n{e}")
             logger.error(f"Failed to load barccpaint bundle {path}: {e}")
+            if show_messages:
+                messagebox.showerror("Load Error", f"Failed to load paint bundle:\n{e}")
+            else:
+                raise
 
     # ------------------------------------------------------------------
     # .catlas schematic — cropped/labeled atlas + paint + Atlas Manager
@@ -2586,6 +4016,69 @@ class PDFViewer:
             except Exception:
                 out[str(k)] = str(v)
         return out
+
+    def _serialize_zone_criteria(self, page=None):
+        """JSON-safe Config A/B assignment: string keys, 'A' or 'B'."""
+        store = getattr(self, "zone_criteria", None) or {}
+        if page is not None:
+            m = store.get(page, {}) or {}
+            return {
+                str(int(k) if str(k).lstrip("-").isdigit() else k): (
+                    "B" if str(v).upper().strip() == "B" else "A"
+                )
+                for k, v in m.items()
+            }
+        out = {}
+        for pg, m in store.items():
+            out[str(pg)] = {
+                str(int(k) if str(k).lstrip("-").isdigit() else k): (
+                    "B" if str(v).upper().strip() == "B" else "A"
+                )
+                for k, v in (m or {}).items()
+            }
+        return out
+
+    def _ingest_zone_criteria(self, data, page=None, merge=True):
+        """Load a zone_criteria map from JSON (page-local or {page: {zid: A/B}})."""
+        if not data or not isinstance(data, dict):
+            return
+        if not hasattr(self, "zone_criteria") or self.zone_criteria is None:
+            self.zone_criteria = {}
+
+        def _parse_map(m):
+            parsed = {}
+            for k, v in (m or {}).items():
+                try:
+                    parsed[int(k)] = "B" if str(v).upper().strip() == "B" else "A"
+                except Exception:
+                    continue
+            return parsed
+
+        # Page-local {zid: A/B}
+        sample_key = next(iter(data), None)
+        looks_page_map = sample_key is not None and (
+            str(sample_key).lstrip("-").isdigit()
+            and str(data.get(sample_key, "A")).upper().strip() in ("A", "B")
+        )
+        if page is not None and (looks_page_map or not any(
+            isinstance(v, dict) for v in data.values()
+        )):
+            parsed = _parse_map(data)
+            if merge:
+                self.zone_criteria.setdefault(page, {}).update(parsed)
+            else:
+                self.zone_criteria[page] = parsed
+            return
+        for pg, m in data.items():
+            try:
+                pgi = int(pg)
+            except Exception:
+                continue
+            parsed = _parse_map(m if isinstance(m, dict) else {})
+            if merge:
+                self.zone_criteria.setdefault(pgi, {}).update(parsed)
+            else:
+                self.zone_criteria[pgi] = parsed
 
     def _serialize_painted_outlines(self, outlines):
         out = {}
@@ -2946,6 +4439,7 @@ class PDFViewer:
             "source_background_size": bg_size,
             "atlas_size": atlas_size,
             "zone_names": self._serialize_zone_names(zone_names),
+            "zone_criteria": self._serialize_zone_criteria(page=page),
             "zone_counter": zone_counter,
             "painted_zone_outlines": self._serialize_painted_outlines(
                 getattr(self, "painted_zone_outlines", {}) or {}
@@ -3275,6 +4769,12 @@ class PDFViewer:
             self.zone_names[page] = names
         else:
             self.zone_names.setdefault(page, {})
+        try:
+            self._ingest_zone_criteria(
+                manifest.get("zone_criteria") or {}, page=page, merge=False
+            )
+        except Exception:
+            pass
 
         zc = int(manifest.get("zone_counter", 0) or 0)
         if self.zone_names.get(page):
@@ -4248,6 +5748,13 @@ class PDFViewer:
         tk.Label(window, text="Brush Size: ").grid(row=2, column=0)
         choose_size_button = tk.Scale(window, from_=1, to=10, orient=tk.HORIZONTAL, variable=self.brush_size)
         choose_size_button.grid(row=2, column=1, padx=5, pady=5)
+        tk.Label(
+            window,
+            text="Add Cell: 1 = tight nucleus, 10 = more aggressive fill.",
+            font=("Helvetica", 8),
+            wraplength=280,
+            justify=tk.LEFT,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 6))
         # Close button
         close_button = tk.Button(window, text="Close", command=lambda: window.destroy())
         close_button.grid(row=10, column=1, sticky=tk.SE, padx=5, pady=5)
@@ -4322,10 +5829,16 @@ class PDFViewer:
         brightness_label = ttk.Label(window, text="Brightness:")
         brightness_label.grid(row=0, column=0)
         brightness_slider = ttk.Scale(
-            window, from_=-100, to=400, orient=tk.HORIZONTAL, command=self.update_brightness
+            window,
+            from_=self.BRIGHTNESS_MIN,
+            to=self.BRIGHTNESS_MAX,
+            orient=tk.HORIZONTAL,
+            command=self.update_brightness,
         )
         brightness_slider.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
-        brightness_slider.set(getattr(self, "brightness", 0.0) or 0.0)
+        brightness_slider.set(
+            getattr(self, "brightness", self.BRIGHTNESS_DEFAULT)
+        )
         window.columnconfigure(1, weight=1)
         ttk.Label(
             window,
@@ -4336,16 +5849,150 @@ class PDFViewer:
         close_button = tk.Button(window, text="Close", command=lambda: window.destroy())
         close_button.grid(row=10, column=1, sticky=tk.SE, padx=5, pady=5)
 
+    def _commit_mask_settings_entries(self):
+        """Write every Mask Settings box into the live config (including unfocused edits)."""
+        for item in getattr(self, "_mask_settings_setters", []) or []:
+            try:
+                setter = item[1] if isinstance(item, tuple) and len(item) >= 2 else item
+                if callable(setter):
+                    setter()
+            except Exception:
+                pass
+
+    def _sync_mask_settings_entries_from_config(self):
+        """Make Mask Settings boxes / method radios match the live configs.
+
+        Smart Suggest writes cell_config directly. The open dialog must show
+        those values or the next analysis still reads the old recipe.
+        """
+        cfg = self.image_processor.cell_config
+        pcfg = self.image_processor.preprocess_config
+        for item in getattr(self, "_mask_settings_setters", []) or []:
+            try:
+                if not (isinstance(item, tuple) and len(item) >= 2):
+                    continue
+                entry, setter = item[0], item[1]
+                attr = item[2] if len(item) >= 3 else None
+                config = item[3] if len(item) >= 4 else None
+                if attr and config is not None and hasattr(config, attr):
+                    val = getattr(config, attr)
+                else:
+                    continue
+                shown = str(entry.get()) if hasattr(entry, "get") else None
+                want = str(val)
+                if shown != want:
+                    entry.delete(0, "end")
+                    entry.insert(0, want)
+            except Exception:
+                pass
+        try:
+            if hasattr(self, "detection_method_var"):
+                m = (cfg.detection_method or "blob").lower().strip()
+                if m == "adaptive":
+                    m = (getattr(cfg, "adaptive_base_method", None) or "blob").lower().strip()
+                    if m not in ("blob", "dog", "log"):
+                        m = "blob"
+                if m in ("blob", "dog", "watershed"):
+                    self.detection_method_var.set(m)
+            if hasattr(self, "adaptive_enabled_var"):
+                self.adaptive_enabled_var.set(
+                    1 if int(getattr(cfg, "adaptive_enabled", 0) or 0) else 0
+                )
+            if hasattr(self, "bg_correction_type"):
+                self.bg_correction_type.set(pcfg.background_method)
+            if hasattr(self, "noise_reduction_type"):
+                self.noise_reduction_type.set(pcfg.denoise_method)
+            if hasattr(self, "contrast_enhance_type"):
+                self.contrast_enhance_type.set(pcfg.contrast_method)
+            if hasattr(self, "signal_enhance_type"):
+                self.signal_enhance_type.set(pcfg.enhance_method)
+            if hasattr(self, "threshold_type"):
+                self.threshold_type.set(cfg.threshold_method)
+            lock = getattr(self, "_update_detection_param_lock", None)
+            if callable(lock):
+                lock()
+        except Exception:
+            pass
+
+    def _clear_manual_cell_edits(self):
+        """Drop Add Cell / Remove Cell strokes so a new detection is the source of truth."""
+        self.manual_add_mask = None
+        self.manual_remove_mask = None
+        self._last_smart_add_blob = None
+        self._last_smart_remove_blob = None
+        self._add_cell_photos = []
+        self._mask_edit_last_stamp = None
+        if getattr(self, "editing_mask", False) and self.original_background is not None:
+            try:
+                empty = Image.new("L", self.original_background.size, 0)
+                if getattr(self, "mask_edit_add", True):
+                    self.manual_add_mask = empty
+                else:
+                    self.manual_remove_mask = empty
+                self.current_mask = empty
+            except Exception:
+                self.current_mask = None
+        else:
+            self.current_mask = None
+
+    def _reload_open_mask_settings(self):
+        """Refresh Mask Settings so entry boxes match the live cell_config."""
+        win = getattr(self, "_mask_settings_window", None)
+        alive = False
+        try:
+            alive = win is not None and bool(win.winfo_exists())
+        except Exception:
+            alive = False
+        if alive:
+            self._sync_mask_settings_entries_from_config()
+            try:
+                win.lift()
+                win.attributes("-topmost", "true")
+            except Exception:
+                pass
+            return
+        if win is None:
+            return
+        geom = None
+        try:
+            geom = win.geometry()
+        except Exception:
+            geom = None
+        try:
+            self._mask_settings_window = None
+            win.destroy()
+        except Exception:
+            self._mask_settings_window = None
+        self.show_mask_settings(restore_geometry=geom)
+
     def show_mask_settings(self, restore_geometry=None):
         mask_settings_win = None
         window = mask_settings_win
         window = Toplevel(self.master)
         window.attributes('-topmost', 'true')
         # Allow the window's X button to close the dialog properly
-        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        def _on_mask_settings_close():
+            if getattr(self, "_mask_settings_window", None) is window:
+                self._mask_settings_window = None
+            try:
+                window.destroy()
+            except Exception:
+                pass
+
+        window.protocol("WM_DELETE_WINDOW", _on_mask_settings_close)
         self._register_transparent_window(window)
+        self._mask_settings_window = window
+
+        def _on_mask_settings_destroy(event, w=window):
+            if getattr(event, "widget", None) is not w:
+                return
+            if getattr(self, "_mask_settings_window", None) is w:
+                self._mask_settings_window = None
+
+        window.bind("<Destroy>", _on_mask_settings_destroy, add="+")
 
         window.title("Mask Settings")
+        self._mask_settings_setters = []
 
         if restore_geometry:
             window.geometry(restore_geometry)
@@ -4355,11 +6002,23 @@ class PDFViewer:
         window.columnconfigure(1, weight=1)
 
         def save_settings():
+            try:
+                self.image_processor.dual_settings_mode_pref = bool(
+                    self.dual_settings_mode.get()
+                )
+            except Exception:
+                pass
             self.image_processor.save_config()
 
         def load_settings():
             geom = window.geometry()
             self.image_processor.load_config()
+            try:
+                self.dual_settings_mode.set(
+                    bool(getattr(self.image_processor, "dual_settings_mode_pref", False))
+                )
+            except Exception:
+                pass
             window.destroy()  # Reopen to refresh values
             self.show_mask_settings(restore_geometry=geom)
 
@@ -4372,21 +6031,35 @@ class PDFViewer:
             # Automatically refresh the mask visualization using the new autotuned settings
             self.show_cell_mask_threshold(calculate=True)
 
-        def _is_blob_method():
-            m = (self.image_processor.cell_config.detection_method or "blob").lower()
+        def _is_blob_method(cfg=None):
+            cfg = cfg if cfg is not None else self.image_processor.cell_config
+            m = (cfg.detection_method or "blob").lower()
             # Legacy "adaptive" counts as blob-family
             return m in ("blob", "dog", "log", "adaptive")
 
-        def _adaptive_on():
-            cfg = self.image_processor.cell_config
+        def _adaptive_on(cfg=None):
+            cfg = cfg if cfg is not None else self.image_processor.cell_config
             m = (cfg.detection_method or "blob").lower().strip()
             if m == "adaptive":
                 return True
             return int(getattr(cfg, "adaptive_enabled", 0) or 0) != 0
 
+        def _autotune_each(mutate):
+            cfgs = self._autotune_target_configs()
+            if not cfgs:
+                return
+            for cfg in cfgs:
+                mutate(cfg)
+            _apply_autotune_and_refresh(lambda: None)
+
         def autotune_more_cells():
-            cfg = self.image_processor.cell_config
-            if _is_blob_method():
+            def mutate(cfg):
+                if not _is_blob_method(cfg):
+                    cfg.min_cell_size = max(5, cfg.min_cell_size - 6)
+                    cfg.peak_min_intensity = max(0.01, round(cfg.peak_min_intensity - 0.06, 2))
+                    cfg.circularity_threshold = max(0.25, round(cfg.circularity_threshold - 0.06, 2))
+                    cfg.min_peak_distance = max(2, cfg.min_peak_distance - 1)
+                    return
                 cfg.blob_threshold = max(0.005, round(cfg.blob_threshold - 0.02, 3))
                 cfg.blob_min_sigma = max(0.8, round(cfg.blob_min_sigma - 0.3, 1))
                 cfg.blob_min_area = max(3, cfg.blob_min_area - 4)
@@ -4394,90 +6067,182 @@ class PDFViewer:
                 cfg.blob_min_peak_intensity = max(
                     0.0, round(float(getattr(cfg, "blob_min_peak_intensity", 0.0)) - 0.05, 2)
                 )
-                if _adaptive_on():
+                if _adaptive_on(cfg):
                     cfg.adaptive_sensitivity = max(
                         0.25, round(float(getattr(cfg, "adaptive_sensitivity", 1.0)) - 0.15, 2)
                     )
                     cfg.adaptive_packing = min(
                         1.0, round(float(getattr(cfg, "adaptive_packing", 0.5)) + 0.1, 2)
                     )
-            else:
-                cfg.min_cell_size = max(5, cfg.min_cell_size - 6)
-                cfg.peak_min_intensity = max(0.01, round(cfg.peak_min_intensity - 0.06, 2))
-                cfg.circularity_threshold = max(0.25, round(cfg.circularity_threshold - 0.06, 2))
-                cfg.min_peak_distance = max(2, cfg.min_peak_distance - 1)
-            _apply_autotune_and_refresh(lambda: None)
+            _autotune_each(mutate)
 
         def autotune_less_cells():
-            cfg = self.image_processor.cell_config
-            if _is_blob_method():
+            def mutate(cfg):
+                if not _is_blob_method(cfg):
+                    cfg.min_cell_size += 6
+                    cfg.peak_min_intensity = min(0.95, round(cfg.peak_min_intensity + 0.06, 2))
+                    cfg.circularity_threshold = min(0.95, round(cfg.circularity_threshold + 0.06, 2))
+                    cfg.min_peak_distance += 1
+                    return
                 cfg.blob_threshold = min(0.9, round(cfg.blob_threshold + 0.025, 3))
                 cfg.blob_min_area += 6
                 cfg.blob_free_space = min(0.9, round(float(getattr(cfg, "blob_free_space", 0.45)) + 0.08, 2))
-                if _adaptive_on():
+                if _adaptive_on(cfg):
                     cfg.adaptive_sensitivity = min(
                         3.0, round(float(getattr(cfg, "adaptive_sensitivity", 1.0)) + 0.15, 2)
                     )
                     cfg.adaptive_packing = max(
                         0.0, round(float(getattr(cfg, "adaptive_packing", 0.5)) - 0.1, 2)
                     )
-            else:
-                cfg.min_cell_size += 6
-                cfg.peak_min_intensity = min(0.95, round(cfg.peak_min_intensity + 0.06, 2))
-                cfg.circularity_threshold = min(0.95, round(cfg.circularity_threshold + 0.06, 2))
-                cfg.min_peak_distance += 1
-            _apply_autotune_and_refresh(lambda: None)
+            _autotune_each(mutate)
 
         def autotune_bigger_cells():
-            cfg = self.image_processor.cell_config
-            if _is_blob_method():
+            def mutate(cfg):
+                if not _is_blob_method(cfg):
+                    cfg.min_cell_size += 8
+                    cfg.max_cell_size += 25
+                    cfg.circularity_threshold = min(0.92, round(cfg.circularity_threshold + 0.04, 2))
+                    cfg.watershed_compactness = min(0.8, round(cfg.watershed_compactness + 0.15, 2))
+                    return
                 cfg.blob_max_sigma = min(40.0, round(cfg.blob_max_sigma + 2.0, 1))
                 cfg.blob_max_area += 80
                 cfg.blob_radius_scale = min(3.5, round(float(getattr(cfg, "blob_radius_scale", 1.8)) + 0.15, 2))
-            else:
-                cfg.min_cell_size += 8
-                cfg.max_cell_size += 25
-                cfg.circularity_threshold = min(0.92, round(cfg.circularity_threshold + 0.04, 2))
-                cfg.watershed_compactness = min(0.8, round(cfg.watershed_compactness + 0.15, 2))
-            _apply_autotune_and_refresh(lambda: None)
+            _autotune_each(mutate)
 
         def autotune_smaller_cells():
-            cfg = self.image_processor.cell_config
-            if _is_blob_method():
+            def mutate(cfg):
+                if not _is_blob_method(cfg):
+                    cfg.min_cell_size = max(5, cfg.min_cell_size - 8)
+                    cfg.max_cell_size = max(20, cfg.max_cell_size - 20)
+                    cfg.circularity_threshold = max(0.3, round(cfg.circularity_threshold - 0.04, 2))
+                    return
                 cfg.blob_max_sigma = max(cfg.blob_min_sigma + 1.0, round(cfg.blob_max_sigma - 2.0, 1))
                 cfg.blob_max_area = max(cfg.blob_min_area + 10, cfg.blob_max_area - 60)
                 cfg.blob_radius_scale = max(1.0, round(float(getattr(cfg, "blob_radius_scale", 1.8)) - 0.15, 2))
-            else:
-                cfg.min_cell_size = max(5, cfg.min_cell_size - 8)
-                cfg.max_cell_size = max(20, cfg.max_cell_size - 20)
-                cfg.circularity_threshold = max(0.3, round(cfg.circularity_threshold - 0.04, 2))
-            _apply_autotune_and_refresh(lambda: None)
+            _autotune_each(mutate)
 
         def autotune_brighter_cells():
-            cfg = self.image_processor.cell_config
-            if _is_blob_method():
+            def mutate(cfg):
+                if not _is_blob_method(cfg):
+                    cfg.peak_min_intensity = min(0.95, round(cfg.peak_min_intensity + 0.10, 2))
+                    cfg.circularity_threshold = min(0.9, round(cfg.circularity_threshold + 0.03, 2))
+                    return
                 cfg.blob_threshold = min(0.9, round(cfg.blob_threshold + 0.02, 3))
                 cfg.blob_min_peak_intensity = min(
                     0.9, round(float(getattr(cfg, "blob_min_peak_intensity", 0.0)) + 0.08, 2)
                 )
-            else:
-                cfg.peak_min_intensity = min(0.95, round(cfg.peak_min_intensity + 0.10, 2))
-                cfg.circularity_threshold = min(0.9, round(cfg.circularity_threshold + 0.03, 2))
-            _apply_autotune_and_refresh(lambda: None)
+            _autotune_each(mutate)
 
         def autotune_dimmer_cells():
-            cfg = self.image_processor.cell_config
-            if _is_blob_method():
+            def mutate(cfg):
+                if not _is_blob_method(cfg):
+                    cfg.peak_min_intensity = max(0.01, round(cfg.peak_min_intensity - 0.10, 2))
+                    cfg.min_cell_size = max(5, cfg.min_cell_size - 3)
+                    return
                 cfg.blob_threshold = max(0.005, round(cfg.blob_threshold - 0.03, 3))
                 cfg.blob_min_sigma = max(0.8, round(cfg.blob_min_sigma - 0.4, 1))
                 cfg.blob_min_area = max(3, cfg.blob_min_area - 4)
                 cfg.blob_min_peak_intensity = max(
                     0.0, round(float(getattr(cfg, "blob_min_peak_intensity", 0.0)) - 0.08, 2)
                 )
-            else:
-                cfg.peak_min_intensity = max(0.01, round(cfg.peak_min_intensity - 0.10, 2))
-                cfg.min_cell_size = max(5, cfg.min_cell_size - 3)
-            _apply_autotune_and_refresh(lambda: None)
+            _autotune_each(mutate)
+
+        def autotune_background_higher():
+            """Reduce FPs from bright neuropil / high background (not packed nuclei)."""
+            def mutate(cfg):
+                if not _is_blob_method(cfg):
+                    cfg.peak_min_intensity = min(0.95, round(cfg.peak_min_intensity + 0.08, 2))
+                    cfg.circularity_threshold = min(0.95, round(cfg.circularity_threshold + 0.05, 2))
+                    return
+                cur_snr = float(getattr(cfg, "blob_min_local_snr", 0.0) or 0.0)
+                if cur_snr <= 0:
+                    cfg.blob_min_local_snr = 1.4
+                else:
+                    cfg.blob_min_local_snr = min(2.6, round(cur_snr + 0.25, 2))
+                cfg.blob_bg_relative = min(
+                    0.18,
+                    round(max(float(getattr(cfg, "blob_bg_relative", 0.0) or 0.0), 0.06) + 0.02, 3),
+                )
+                cfg.blob_threshold = min(0.25, round(float(cfg.blob_threshold) + 0.01, 3))
+                cfg.blob_min_isotropy = max(
+                    float(getattr(cfg, "blob_min_isotropy", 0.0) or 0.0), 0.30
+                )
+                cur_circ = float(getattr(cfg, "blob_min_circularity", 0.0) or 0.0)
+                if cur_circ <= 0:
+                    cfg.blob_min_circularity = 0.30
+                elif cur_circ < 0.55:
+                    cfg.blob_min_circularity = round(min(0.55, cur_circ + 0.05), 2)
+                cfg.blob_reject_tissue_edge = 1
+                cfg.blob_ridge_reject = 1
+                cfg.adaptive_enabled = 1
+                cfg.adaptive_dual_pass = 1
+                cfg.adaptive_sensitivity = min(
+                    2.2,
+                    round(max(float(getattr(cfg, "adaptive_sensitivity", 1.0) or 1.0), 1.0) + 0.12, 2),
+                )
+            _autotune_each(mutate)
+
+        def autotune_denser_packing():
+            """Packed clusters: tighter centers, easier SNR, smaller max sigma."""
+            def mutate(cfg):
+                if not _is_blob_method(cfg):
+                    cfg.min_peak_distance = max(2, int(cfg.min_peak_distance) - 1)
+                    return
+                cfg.adaptive_enabled = 1
+                cfg.adaptive_dual_pass = 1
+                cfg.adaptive_packing = min(
+                    1.0,
+                    round(max(float(getattr(cfg, "adaptive_packing", 0.5) or 0.5), 0.55) + 0.12, 2),
+                )
+                cfg.blob_free_space = max(
+                    0.20,
+                    round(float(getattr(cfg, "blob_free_space", 0.45) or 0.45) - 0.08, 2),
+                )
+                cfg.blob_overlap = min(
+                    0.92,
+                    round(max(float(getattr(cfg, "blob_overlap", 0.5) or 0.5), 0.70) + 0.06, 2),
+                )
+                cfg.blob_cluster_recover = 1
+                seed = float(getattr(cfg, "blob_seed_snr", 0.85) or 0.85)
+                if seed > 0.7:
+                    cfg.blob_seed_snr = round(max(0.65, seed - 0.10), 2)
+                snr = float(getattr(cfg, "blob_min_local_snr", 0.0) or 0.0)
+                if snr > 1.0:
+                    cfg.blob_min_local_snr = round(max(0.0, snr - 0.30), 2)
+                max_s = float(cfg.blob_max_sigma)
+                if max_s > 7.0:
+                    cfg.blob_max_sigma = round(max(4.5, max(float(cfg.blob_min_sigma) + 1.5, max_s - 1.8)), 1)
+                circ = float(getattr(cfg, "blob_min_circularity", 0.0) or 0.0)
+                if circ > 0.40:
+                    cfg.blob_min_circularity = 0.32
+            _autotune_each(mutate)
+
+        def autotune_sparser_packing():
+            """Sparse field: more space between nuclei, mild SNR/BG against grain."""
+            def mutate(cfg):
+                if not _is_blob_method(cfg):
+                    cfg.min_peak_distance = int(cfg.min_peak_distance) + 1
+                    return
+                cfg.adaptive_enabled = 1
+                cfg.adaptive_dual_pass = 1
+                cfg.adaptive_packing = max(
+                    0.20,
+                    round(float(getattr(cfg, "adaptive_packing", 0.5) or 0.5) - 0.12, 2),
+                )
+                cfg.blob_free_space = min(
+                    0.70,
+                    round(max(float(getattr(cfg, "blob_free_space", 0.45) or 0.45), 0.42) + 0.08, 2),
+                )
+                snr = float(getattr(cfg, "blob_min_local_snr", 0.0) or 0.0)
+                if snr <= 0:
+                    cfg.blob_min_local_snr = 1.25
+                else:
+                    cfg.blob_min_local_snr = min(2.0, round(snr + 0.20, 2))
+                cfg.blob_bg_relative = min(
+                    0.12,
+                    round(max(float(getattr(cfg, "blob_bg_relative", 0.0) or 0.0), 0.06) + 0.02, 3),
+                )
+            _autotune_each(mutate)
 
 
         def generate_setting(frame, attr, value, row, config):
@@ -4492,10 +6257,13 @@ class PDFViewer:
                 setter = create_setter(entry, config, attr)
                 entry.bind("<FocusOut>", setter)
                 entry.bind("<Return>", setter)
-                # Track for method-based lock/dim
+                if not hasattr(self, "_mask_settings_setters"):
+                    self._mask_settings_setters = []
+                self._mask_settings_setters.append((entry, setter, attr, config))
+                # Track for method-based lock/dim (attr kept so Dual B can refresh)
                 if not hasattr(frame, "_param_widgets"):
                     frame._param_widgets = []
-                frame._param_widgets.append((label, entry))
+                frame._param_widgets.append((label, entry, attr))
 
         def generate_option_frames():
             # Preprocess image
@@ -4560,9 +6328,19 @@ class PDFViewer:
             self.other_circularity_frame = ttk.LabelFrame(option_frame, text='Circularity')
             self.other_watershed_frame = ttk.LabelFrame(option_frame, text='Watershed')
             self.blob_frame = ttk.LabelFrame(option_frame, text='Blob Detection (Recommended)')
+            self.blob_frame_b = ttk.LabelFrame(option_frame, text='Blob Detection — Config B')
             self.adaptive_det_frame = ttk.LabelFrame(
                 option_frame, text='Adaptive Detection (mixed background / density)'
             )
+            self.adaptive_det_frame_b = ttk.LabelFrame(
+                option_frame, text='Adaptive Detection — Config B'
+            )
+            self._mask_option_frame = option_frame
+            try:
+                option_frame.columnconfigure(0, weight=1)
+                option_frame.columnconfigure(1, weight=1)
+            except Exception:
+                pass
 
             # Quick method switcher (blob/dog/watershed) + Adaptive overlay checkbox
             method_frame = ttk.Frame(option_frame)
@@ -4582,16 +6360,23 @@ class PDFViewer:
             )
 
             def _set_det_method(m):
-                self.image_processor.cell_config.detection_method = m
-                if m in ("blob", "dog", "log"):
-                    self.image_processor.cell_config.adaptive_base_method = (
-                        "dog" if m == "dog" else "blob"
-                    )
+                for cfg in (
+                    self.image_processor.cell_config,
+                    getattr(self.image_processor, "cell_config_b", None),
+                ):
+                    if cfg is None:
+                        continue
+                    cfg.detection_method = m
+                    if m in ("blob", "dog", "log"):
+                        cfg.adaptive_base_method = "dog" if m == "dog" else "blob"
                 _update_detection_param_lock()
 
             def _set_adaptive_enabled():
                 on = 1 if self.adaptive_enabled_var.get() else 0
                 self.image_processor.cell_config.adaptive_enabled = on
+                cfg_b = getattr(self.image_processor, "cell_config_b", None)
+                if cfg_b is not None:
+                    cfg_b.adaptive_enabled = on
                 _update_detection_param_lock()
 
             rb_blob = ttk.Radiobutton(
@@ -4626,6 +6411,22 @@ class PDFViewer:
             )
             cb_adaptive.pack(side="left", padx=(12, 0))
             self._mask_settings_adaptive_cb = cb_adaptive
+            cb_blob_roi = ttk.Checkbutton(
+                method_frame,
+                text="Labeled regions only",
+                variable=self.blob_labeled_regions_only,
+                command=lambda: setattr(self.image_processor, "_detect_cache", None),
+            )
+            cb_blob_roi.pack(side="left", padx=(12, 0))
+            self._mask_settings_blob_roi_cb = cb_blob_roi
+            cb_dual = ttk.Checkbutton(
+                method_frame,
+                text="Dual Settings Mode",
+                variable=self.dual_settings_mode,
+                command=self._on_dual_settings_toggled,
+            )
+            cb_dual.pack(side="left", padx=(12, 0))
+            self._mask_settings_dual_cb = cb_dual
             attach_param_tooltip(
                 rb_blob,
                 "detection_method",
@@ -4647,6 +6448,21 @@ class PDFViewer:
                 "Overlay on Blob/DoG: tile-local thresholds, dual-pass fusion, density packing. "
                 "Leave unchecked for plain Blob or DoG. Ignored when Watershed is selected.",
             )
+            attach_param_tooltip(
+                cb_blob_roi,
+                "blob_labeled_regions_only",
+                "Show Mask / Count Cells: apply the mask only inside painted or atlas "
+                "regions. Each region (e.g. lcl vs lcr) is detected with its own local "
+                "threshold. Does not change Smart Suggest.",
+            )
+            attach_param_tooltip(
+                cb_dual,
+                "dual_settings_mode",
+                "Duplicate Blob Detection to the right as Config B. In Atlas Manager, "
+                "select a labeled region and press A or B to assign it. Packed regions "
+                "can use B while sparse regions use A, on the same slice.",
+            )
+            self._mask_method_frame = method_frame
             method_frame.grid(row=3, column=0, sticky='w', pady=8)
 
             tm_otsu_options = [] # None
@@ -4660,26 +6476,27 @@ class PDFViewer:
                 "blob_max_sigma",
                 "blob_num_sigma",
                 "blob_threshold",
-                "blob_threshold_rel",
                 "blob_overlap",
                 "blob_min_area",
                 "blob_max_area",
-                "blob_radius_scale",
                 "blob_free_space",
-                "blob_min_peak_intensity",
                 "blob_min_local_snr",
-                "blob_local_snr_outer",
-                "blob_exclude_border",
+                "blob_bg_relative",
+                "blob_max_elongation",
                 "blob_min_circularity",
                 "blob_min_isotropy",
                 "blob_reject_tissue_edge",
-                "blob_edge_dark_frac",
-                "blob_bg_relative",
+                "blob_ridge_reject",
+                "blob_ridge_thresh",
+                "blob_cavity_rim",
+                "blob_chain_reject",
+                "blob_cluster_recover",
+                "blob_seed_snr",
             ]
             # Base detector is the Blob/DoG radio; adaptive_base_method is synced automatically
             adaptive_det_options = [
+                "adaptive_region_mode",
                 "adaptive_tile_size",
-                "adaptive_tile_overlap",
                 "adaptive_sensitivity",
                 "adaptive_packing",
                 "adaptive_dual_pass",
@@ -4713,11 +6530,28 @@ class PDFViewer:
                     generate_setting(frame, attr, value, row, config)
                     row += 1
 
+            cfg_b = self._ensure_cell_config_b(
+                copy_from_a_if_new=bool(self.dual_settings_mode.get())
+            )
+            row_b = 0
+            for attr in blob_options:
+                generate_setting(
+                    self.blob_frame_b, attr, getattr(cfg_b, attr), row_b, cfg_b
+                )
+                row_b += 1
+            row_b = 0
+            for attr in adaptive_det_options:
+                generate_setting(
+                    self.adaptive_det_frame_b, attr, getattr(cfg_b, attr), row_b, cfg_b
+                )
+                row_b += 1
+
             # Static: do not change with radiobutton, so they can be shown now
             self.other_circularity_frame.grid(row=0, column=0, sticky='news')
             self.other_watershed_frame.grid(row=1, column=0, sticky='news')
             self.blob_frame.grid(row=2, column=0, sticky='news')
             self.adaptive_det_frame.grid(row=4, column=0, sticky='news')
+            self._apply_dual_settings_layout()
 
             # Dim styles for inactive method panels (~70% translucent look)
             try:
@@ -4752,7 +6586,8 @@ class PDFViewer:
                     pass
 
                 widgets = getattr(frame, "_param_widgets", None) or []
-                for label, entry in widgets:
+                for item in widgets:
+                    label, entry = item[0], item[1]
                     try:
                         if locked:
                             entry.state(["disabled"])
@@ -4825,10 +6660,17 @@ class PDFViewer:
 
                 # Blob/DoG shared params
                 _set_frame_locked(self.blob_frame, locked=not blob_family)
+                _set_frame_locked(
+                    getattr(self, "blob_frame_b", None), locked=not blob_family
+                )
 
                 # Adaptive overlay — only with Blob/DoG + Adaptive checked
                 _set_frame_locked(
                     self.adaptive_det_frame,
+                    locked=not (blob_family and adaptive_on),
+                )
+                _set_frame_locked(
+                    getattr(self, "adaptive_det_frame_b", None),
                     locked=not (blob_family and adaptive_on),
                 )
 
@@ -4841,21 +6683,57 @@ class PDFViewer:
 
         def create_setter(entry_widget, config_obj, attr_name):
             def setter(*args):
-                val = entry_widget.get()
+                raw = entry_widget.get()
+                declared = _config_declared_type(config_obj, attr_name)
                 try:
-                    current_type = type(getattr(config_obj, attr_name))
-                    if current_type == int:
-                        val = int(val)
-                    elif current_type == float:
-                        val = float(val)
-                    elif current_type == str:
-                        val = str(val)
+                    if attr_name == "blob_tissue_margin":
+                        # Must be a whole number ≥ 0 (0 disables the gate)
+                        s = str(raw).strip()
+                        if s == "":
+                            raise ValueError("empty")
+                        as_float = float(s)
+                        if not as_float.is_integer() or as_float < 0:
+                            raise ValueError("not non-negative integer")
+                        val = int(as_float)
+                    else:
+                        val = _coerce_config_value(config_obj, attr_name, raw)
                     setattr(config_obj, attr_name, val)
+                    try:
+                        self.image_processor._detect_cache = None
+                    except Exception:
+                        pass
+                    # Normalize display for coerced ints (e.g. "6.0" → "6")
+                    if attr_name == "blob_tissue_margin":
+                        try:
+                            if str(entry_widget.get()).strip() != str(val):
+                                entry_widget.delete(0, "end")
+                                entry_widget.insert(0, str(val))
+                        except Exception:
+                            pass
                     logger.debug(f"Successfully set {attr_name} to {val}")
                 except ValueError as e:
                     logger.error(f"Invalid input for {attr_name}: {e}")
-                    messagebox.showerror("Invalid Input", 
-                                       f"Please enter a valid {current_type.__name__} for {attr_name}.")
+                    if attr_name == "blob_tissue_margin":
+                        messagebox.showerror(
+                            "Invalid Input",
+                            "blob_tissue_margin must be an integer ≥ 0 "
+                            "(use 0 to turn off).\n\n"
+                            "Examples: 0, 6, 12\n"
+                            "Not allowed: decimals (e.g. 6.5), text, or negative values.",
+                        )
+                        # Restore last valid value in the entry
+                        try:
+                            prev = int(getattr(config_obj, attr_name, 0) or 0)
+                            entry_widget.delete(0, "end")
+                            entry_widget.insert(0, str(prev))
+                        except Exception:
+                            pass
+                    else:
+                        kind = declared.__name__ if hasattr(declared, "__name__") else "number"
+                        messagebox.showerror(
+                            "Invalid Input",
+                            f"Please enter a valid {kind} for {attr_name}.",
+                        )
             return setter
 
         def hide_children(input_frame):
@@ -4927,7 +6805,15 @@ class PDFViewer:
         control_frame.grid(row=0, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
         ttk.Button(control_frame, text="Save", command=save_settings).grid(row=0, column=0, padx=5)
         ttk.Button(control_frame, text="Load", command=load_settings).grid(row=0, column=1, padx=5)
-        ttk.Button(control_frame, text="Show Mask", command=self.show_cell_mask_threshold).grid(row=0, column=2, padx=5)
+        def _show_mask_from_settings():
+            self._commit_mask_settings_entries()
+            try:
+                self.image_processor._detect_cache = None
+            except Exception:
+                pass
+            self.show_cell_mask_threshold(calculate=True)
+
+        ttk.Button(control_frame, text="Show Mask", command=_show_mask_from_settings).grid(row=0, column=2, padx=5)
         tip_lbl = ttk.Label(
             control_frame,
             text="Hover for help. Mixed BG: Blob/DoG + Adaptive + dual-pass. High-BG noise: "
@@ -4942,7 +6828,23 @@ class PDFViewer:
         tip_lbl.grid(row=0, column=3, columnspan=3, sticky="w", padx=8)
 
         # Autotune panel (second row in control_frame)
-        ttk.Label(control_frame, text="Autotune:").grid(row=1, column=0, padx=(5, 8), pady=(6, 2), sticky='w')
+        auto_hdr = ttk.Frame(control_frame)
+        auto_hdr.grid(row=1, column=0, padx=(5, 8), pady=(6, 2), sticky="nw")
+        ttk.Label(auto_hdr, text="Autotune:").pack(anchor="w")
+        self._autotune_target_frame = ttk.Frame(auto_hdr)
+        ttk.Label(self._autotune_target_frame, text="Apply to:").pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            self._autotune_target_frame,
+            text="A",
+            variable=self.autotune_cfg_a,
+            width=3,
+        ).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            self._autotune_target_frame,
+            text="B",
+            variable=self.autotune_cfg_b,
+            width=3,
+        ).pack(side=tk.LEFT)
         auto_btns = ttk.Frame(control_frame)
         auto_btns.grid(row=1, column=1, columnspan=3, pady=(6, 2), sticky='w')
 
@@ -4952,15 +6854,56 @@ class PDFViewer:
         ttk.Button(auto_btns, text="Smaller cells", width=12, command=autotune_smaller_cells).grid(row=1, column=0, padx=2, pady=1)
         ttk.Button(auto_btns, text="Brighter cells", width=12, command=autotune_brighter_cells).grid(row=1, column=1, padx=2, pady=1)
         ttk.Button(auto_btns, text="Dimmer cells", width=12, command=autotune_dimmer_cells).grid(row=1, column=2, padx=2, pady=1)
+        ttk.Button(
+            auto_btns, text="Denser packing", width=16, command=autotune_denser_packing
+        ).grid(row=2, column=0, padx=2, pady=(4, 1))
+        ttk.Button(
+            auto_btns, text="Sparser packing", width=16, command=autotune_sparser_packing
+        ).grid(row=2, column=1, padx=2, pady=(4, 1))
+        ttk.Button(
+            auto_btns, text="Background higher", width=18, command=autotune_background_higher
+        ).grid(row=3, column=0, columnspan=2, padx=2, pady=(2, 1), sticky="w")
 
         # Smart Suggest + Measure Tune (informed blob tuning from user-picked samples)
         suggest_frame = ttk.Frame(control_frame)
         suggest_frame.grid(row=1, column=4, padx=(15, 5), pady=(6, 2), sticky='w')
-        ttk.Button(
-            suggest_frame,
+        ss_row = ttk.Frame(suggest_frame)
+        ss_row.pack(anchor='w')
+        self._ss_a_btn = ttk.Button(
+            ss_row,
             text="Smart Suggest (Pre-tuning smart settings)",
-            command=self._show_smart_suggest_dialog,
-        ).pack(anchor='w')
+            command=lambda: self._show_smart_suggest_dialog(target="A"),
+        )
+        self._ss_a_btn.pack(side=tk.LEFT)
+        self._ss_b_btn = ttk.Button(
+            ss_row,
+            text="Smart Suggest B",
+            command=lambda: self._show_smart_suggest_dialog(target="B"),
+        )
+        ss_cb = ttk.Checkbutton(
+            ss_row,
+            text="Labeled regions only",
+            variable=self.smart_suggest_labeled_only,
+            command=self._update_smart_suggest_buttons,
+        )
+        self._ss_labeled_cb = ss_cb
+        ss_cb.pack(side=tk.LEFT, padx=(8, 0))
+        attach_param_tooltip(
+            ss_cb,
+            "smart_suggest_labeled_only",
+            "Smart Suggest only: fit from painted/atlas pixels. "
+            "With Dual Settings Mode on, check this to show Smart Suggest A and B "
+            "(one recipe per assigned region group). "
+            "Does not change where Show Mask is drawn.",
+        )
+        attach_param_tooltip(
+            self._ss_b_btn,
+            "dual_settings_mode",
+            "Fit Config B from regions assigned to B (select a region and press B). "
+            "Shown when Dual Settings Mode and Labeled regions only are both on. "
+            "Does not change Config A.",
+        )
+        self._update_smart_suggest_buttons()
         ttk.Button(
             suggest_frame,
             text="Measure Tune (TP/FP/FN/TN)",
@@ -5152,6 +7095,308 @@ class PDFViewer:
         close_button = tk.Button(window, text="Close", command=lambda: window.destroy())
         close_button.grid(row=10, column=1, sticky=tk.SE, padx=5, pady=5)
 
+    def _ensure_cell_config_b(self, copy_from_a_if_new=False):
+        """Return Config B, optionally seeding it from Config A the first time."""
+        ip = self.image_processor
+        if getattr(ip, "cell_config_b", None) is None:
+            ip.cell_config_b = CellDetectionConfig()
+        if copy_from_a_if_new and not getattr(ip, "_cell_config_b_loaded", False):
+            _copy_cell_config_fields(ip.cell_config, ip.cell_config_b)
+            ip._cell_config_b_loaded = True
+        return ip.cell_config_b
+
+    def _refresh_dual_b_entries(self):
+        """Rewrite Config B Mask Settings entries after copying A → B."""
+        cfg_b = getattr(self.image_processor, "cell_config_b", None)
+        if cfg_b is None:
+            return
+        for frame in (
+            getattr(self, "blob_frame_b", None),
+            getattr(self, "adaptive_det_frame_b", None),
+        ):
+            if frame is None:
+                continue
+            for item in getattr(frame, "_param_widgets", None) or []:
+                if len(item) < 3:
+                    continue
+                _label, entry, attr = item[0], item[1], item[2]
+                try:
+                    entry.delete(0, "end")
+                    entry.insert(0, str(getattr(cfg_b, attr)))
+                except Exception:
+                    pass
+
+    def _on_dual_settings_toggled(self):
+        """Show or hide the Config B Blob Detection panel."""
+        ip = self.image_processor
+        dual = False
+        try:
+            dual = bool(self.dual_settings_mode.get())
+        except Exception:
+            dual = False
+        if dual:
+            was_loaded = bool(getattr(ip, "_cell_config_b_loaded", False))
+            self._ensure_cell_config_b(copy_from_a_if_new=True)
+            if not was_loaded:
+                self._refresh_dual_b_entries()
+        try:
+            ip.dual_settings_mode_pref = dual
+        except Exception:
+            pass
+        self._apply_dual_settings_layout()
+        try:
+            ip._detect_cache = None
+        except Exception:
+            pass
+        try:
+            self._update_region_list_hint()
+            self._populate_region_list()
+        except Exception:
+            pass
+
+    def _apply_dual_settings_layout(self):
+        """Grid Config B to the right of Blob Detection when Dual Settings Mode is on."""
+        dual = False
+        try:
+            dual = bool(self.dual_settings_mode.get())
+        except Exception:
+            dual = False
+        blob_a = getattr(self, "blob_frame", None)
+        blob_b = getattr(self, "blob_frame_b", None)
+        ad_a = getattr(self, "adaptive_det_frame", None)
+        ad_b = getattr(self, "adaptive_det_frame_b", None)
+        method = getattr(self, "_mask_method_frame", None)
+        if blob_a is None:
+            return
+        try:
+            if dual:
+                blob_a.configure(text="Blob Detection — Config A")
+                if ad_a is not None:
+                    ad_a.configure(text="Adaptive Detection — Config A")
+                blob_a.grid(row=2, column=0, sticky="news")
+                if blob_b is not None:
+                    blob_b.grid(row=2, column=1, sticky="news", padx=(10, 0))
+                if ad_a is not None:
+                    ad_a.grid(row=4, column=0, sticky="news")
+                if ad_b is not None:
+                    ad_b.grid(row=4, column=1, sticky="news", padx=(10, 0))
+                if method is not None:
+                    method.grid(row=3, column=0, columnspan=2, sticky="w", pady=8)
+            else:
+                blob_a.configure(text="Blob Detection (Recommended)")
+                if ad_a is not None:
+                    ad_a.configure(
+                        text="Adaptive Detection (mixed background / density)"
+                    )
+                blob_a.grid(row=2, column=0, sticky="news")
+                if blob_b is not None:
+                    blob_b.grid_forget()
+                if ad_a is not None:
+                    ad_a.grid(row=4, column=0, sticky="news")
+                if ad_b is not None:
+                    ad_b.grid_forget()
+                if method is not None:
+                    method.grid(row=3, column=0, columnspan=1, sticky="w", pady=8)
+            self._update_smart_suggest_buttons()
+            self._update_autotune_target_ui()
+        except Exception as e:
+            logger.debug(f"dual settings layout skipped: {e}")
+
+    def _autotune_target_configs(self):
+        """Configs Autotune should mutate: A, B, or both when Dual Settings is on."""
+        dual = False
+        try:
+            dual = bool(self.dual_settings_mode.get())
+        except Exception:
+            dual = False
+        if not dual:
+            return [self.image_processor.cell_config]
+        want_a = True
+        want_b = True
+        try:
+            want_a = bool(self.autotune_cfg_a.get())
+            want_b = bool(self.autotune_cfg_b.get())
+        except Exception:
+            pass
+        if not want_a and not want_b:
+            messagebox.showinfo(
+                "Autotune",
+                "Check A and/or B to choose which Dual Settings config to tune.",
+            )
+            return []
+        cfgs = []
+        if want_a:
+            cfgs.append(self.image_processor.cell_config)
+        if want_b:
+            cfgs.append(self._ensure_cell_config_b())
+        return cfgs
+
+    def _update_autotune_target_ui(self):
+        """Show A/B Autotune checkboxes only in Dual Settings Mode."""
+        frame = getattr(self, "_autotune_target_frame", None)
+        if frame is None:
+            return
+        dual = False
+        try:
+            dual = bool(self.dual_settings_mode.get())
+        except Exception:
+            dual = False
+        try:
+            if dual:
+                frame.pack(anchor="w", pady=(2, 0))
+            else:
+                frame.pack_forget()
+        except Exception:
+            pass
+
+    def _update_smart_suggest_buttons(self, *_args):
+        """Show Smart Suggest A/B only when Dual Settings and Labeled regions only are on."""
+        dual = False
+        labeled = False
+        try:
+            dual = bool(self.dual_settings_mode.get())
+        except Exception:
+            dual = False
+        try:
+            labeled = bool(self.smart_suggest_labeled_only.get())
+        except Exception:
+            labeled = False
+        ss_a = getattr(self, "_ss_a_btn", None)
+        ss_b = getattr(self, "_ss_b_btn", None)
+        ss_cb = getattr(self, "_ss_labeled_cb", None)
+        if ss_a is None:
+            return
+        for w in (ss_a, ss_b, ss_cb):
+            if w is None:
+                continue
+            try:
+                w.pack_forget()
+            except Exception:
+                pass
+        if dual:
+            if ss_cb is not None:
+                ss_cb.pack(side=tk.LEFT)
+            if labeled:
+                ss_a.configure(text="Smart Suggest A")
+                ss_a.pack(side=tk.LEFT, padx=(8, 0))
+                if ss_b is not None:
+                    ss_b.pack(side=tk.LEFT, padx=(8, 0))
+            else:
+                ss_a.configure(text="Smart Suggest (Pre-tuning smart settings)")
+                ss_a.pack(side=tk.LEFT, padx=(8, 0))
+        else:
+            ss_a.configure(text="Smart Suggest (Pre-tuning smart settings)")
+            ss_a.pack(side=tk.LEFT)
+            if ss_cb is not None:
+                ss_cb.pack(side=tk.LEFT, padx=(8, 0))
+
+    def _zone_criteria_for(self, zid, page=None):
+        """Return 'A' or 'B' for a labeled region (default A)."""
+        if zid is None:
+            return "A"
+        page = self.current_page if page is None else page
+        store = (getattr(self, "zone_criteria", None) or {}).get(page, {}) or {}
+        try:
+            zid = int(zid)
+        except Exception:
+            return "A"
+        which = store.get(zid, store.get(str(zid), "A"))
+        return "B" if str(which).upper().strip() == "B" else "A"
+
+    def _assign_zone_criteria(self, zid, which, page=None, save_undo=True):
+        """Tag a labeled region as Config A or Config B."""
+        if zid is None:
+            return False
+        which = "B" if str(which).upper().strip() == "B" else "A"
+        page = self.current_page if page is None else page
+        try:
+            zid = int(zid)
+        except Exception:
+            return False
+        if self._zone_criteria_for(zid, page=page) == which:
+            return True
+        if save_undo:
+            try:
+                self.save_state()
+            except Exception:
+                pass
+        if not hasattr(self, "zone_criteria") or self.zone_criteria is None:
+            self.zone_criteria = {}
+        if page not in self.zone_criteria:
+            self.zone_criteria[page] = {}
+        self.zone_criteria[page][zid] = which
+        try:
+            self.image_processor._detect_cache = None
+        except Exception:
+            pass
+        try:
+            self._populate_region_list()
+            self._update_ribbon_selection()
+        except Exception:
+            pass
+        logger.info(f"Region {zid} assigned to Config {which}")
+        return True
+
+    def _on_zone_criteria_key(self, event=None):
+        """A/B keys assign the selected Atlas Manager region when Dual Settings Mode is on."""
+        try:
+            if not bool(self.dual_settings_mode.get()):
+                return
+        except Exception:
+            return
+        w = None
+        try:
+            w = self.master.focus_get()
+        except Exception:
+            w = None
+        if w is not None:
+            try:
+                cls = str(w.winfo_class())
+            except Exception:
+                cls = ""
+            if cls in ("Entry", "TEntry", "Text", "TCombobox", "Spinbox", "TSpinbox"):
+                return
+        zid = getattr(self, "selected_zone_id", None)
+        if zid is None:
+            try:
+                sel = self.region_listbox.curselection() if hasattr(self, "region_listbox") else ()
+                if sel:
+                    zid = getattr(self, "region_list_id_map", {}).get(sel[0])
+            except Exception:
+                zid = None
+        if zid is None:
+            return
+        raw = ""
+        if event is not None:
+            raw = (getattr(event, "keysym", None) or getattr(event, "char", None) or "")
+        key = str(raw).lower().strip()
+        if key == "a":
+            self._assign_zone_criteria(zid, "A")
+            return "break"
+        if key == "b":
+            self._assign_zone_criteria(zid, "B")
+            return "break"
+
+    def _update_region_list_hint(self):
+        """Atlas Manager list caption: mention A/B keys when Dual Settings Mode is on."""
+        lbl = getattr(self, "_region_list_hint", None)
+        if lbl is None:
+            return
+        dual = False
+        try:
+            dual = bool(self.dual_settings_mode.get())
+        except Exception:
+            dual = False
+        if dual:
+            lbl.configure(
+                text="Labeled Regions (current page) — click to select; "
+                "press A or B to assign Config A/B; right-click for Rename / Delete:"
+            )
+        else:
+            lbl.configure(
+                text="Labeled Regions (current page) — click to select; "
+                "right-click for Rename / Delete:"
+            )
 
     def start_add_cells(self):
         """Begin drawing to add cells to the mask"""
@@ -5163,28 +7408,37 @@ class PDFViewer:
         self.start_mask_edit(add=True)
 
     def start_remove_cells(self):
-        """Begin drawing to remove cells from the mask"""
+        """Click a masked cell to remove that whole nucleus (not a paint stroke)."""
         if self.background_image is None:
             messagebox.showerror("Error", "Please import a TIFF file first.")
             return
         self.splitting_cells = False
-        self.show_brush_settings()
         self.start_mask_edit(add=False)
 
     def start_split_cell(self):
         """Enable Split Cell mode: click a merged mask blob to split it into two cells.
 
-        Uses distance-transform peaks (and intensity fallbacks) to place two markers,
-        then watershed to find the most probable separation, and records the cut in
-        the manual remove mask so Count Cells treats them as two objects.
+        Uses intensity + shape to place two seeds, watershed to cut the most
+        apparent valley, and records the cut in the manual remove mask so
+        Count Cells treats them as two objects.
         """
         if self.original_background is None and self.background_image is None:
             messagebox.showerror("Error", "Please import a TIFF file first.")
             return
+        if self.original_background is None:
+            self.original_background = self.background_image.copy()
 
-        # Ensure we have a current cell mask displayed
+        # Reuse the mask already on screen — do not re-detect (that stalled Split Cell
+        # and could change which blobs the user is looking at).
         try:
-            self.show_cell_mask_threshold(calculate=True)
+            has_auto = (
+                getattr(self, "auto_mask", None) is not None
+                and not isinstance(getattr(self, "auto_mask", None), bool)
+            )
+            if not has_auto:
+                self.show_cell_mask_threshold(calculate=True)
+            elif getattr(self, "mask_overlay_layer", None) is None:
+                self.show_cell_mask_threshold(calculate=False)
         except Exception as e:
             logger.error(f"Could not prepare mask for Split Cell: {e}")
             messagebox.showerror("Split Cell", f"Could not build the cell mask:\n{e}")
@@ -5201,12 +7455,10 @@ class PDFViewer:
         base_size = self.original_background.size
         if self.manual_remove_mask is None:
             self.manual_remove_mask = Image.new('L', base_size, 0)
-        # Keep remove mask size in sync with the image
         if self.manual_remove_mask.size != base_size:
             self.manual_remove_mask = self.manual_remove_mask.resize(base_size, Image.NEAREST)
         self.current_mask = self.manual_remove_mask
 
-        # Click-only interaction (no brush drag)
         self.output.unbind("<Button-1>")
         self.output.unbind("<B1-Motion>")
         self.output.unbind("<ButtonRelease-1>")
@@ -5217,14 +7469,13 @@ class PDFViewer:
         self.output.unbind("<B3-Motion>")
         self.output.unbind("<ButtonRelease-3>")
         self.output.bind("<Button-1>", self.split_cell_at_click)
+        self._bind_middle_button_pan()
+        try:
+            self.output.config(cursor="crosshair")
+        except Exception:
+            pass
 
-        logger.info("Started Split Cell mode")
-        messagebox.showinfo(
-            "Split Cell",
-            "Click on a single masked cell (red blob) that should be two cells.\n\n"
-            "BARCC will split it into the two most probable cell blobs.\n"
-            "Use Finish Mask Edit when done, then Count Cells.",
-        )
+        logger.info("Started Split Cell mode — click a merged red mask to split it")
 
     def start_mask_edit(self, add=True):
         """Enable mask editing mode while keeping the cell detection overlay visible."""
@@ -5237,25 +7488,22 @@ class PDFViewer:
         self.region_translate_zid = None
         self.output.unbind("<Button-1>")
         self.output.bind("<Button-1>", self.edit_mask_draw)
-        self.output.bind("<B1-Motion>", self.edit_mask_draw)
+        # Add Cell and Remove Cell are both click-to-edit one nucleus (no drag-paint)
+        self.output.unbind("<B1-Motion>")
         # On release: refresh combined mask rings (still keep edit mode)
         self.output.bind(
             "<ButtonRelease-1>",
             lambda event: self._finish_mask_edit_stroke(event),
         )
-        # Right click erases paint from the active layer
-        self.output.bind("<Button-2>", lambda event: self.edit_mask_draw(event, eraser=True))
-        self.output.bind("<B2-Motion>", lambda event: self.edit_mask_draw(event, eraser=True))
-        self.output.bind(
-            "<ButtonRelease-2>",
-            lambda event: self._finish_mask_edit_stroke(event),
-        )
+        # Right click erases paint from the active layer.
+        # Middle mouse (scroll-wheel click) stays pan — see _bind_middle_button_pan.
         self.output.bind("<Button-3>", lambda event: self.edit_mask_draw(event, eraser=True))
         self.output.bind("<B3-Motion>", lambda event: self.edit_mask_draw(event, eraser=True))
         self.output.bind(
             "<ButtonRelease-3>",
             lambda event: self._finish_mask_edit_stroke(event),
         )
+        self._bind_middle_button_pan()
 
         # Initialize the correct mask depending on edit mode
         base_size = self.original_background.size
@@ -5266,6 +7514,14 @@ class PDFViewer:
             if self.manual_add_mask.size != base_size:
                 self.manual_add_mask = self.manual_add_mask.resize(base_size, Image.NEAREST)
             self.current_mask = self.manual_add_mask
+            # Cache detection-scale image so each click can grow a real nucleus fast
+            self._add_cell_work_n = None
+            try:
+                bg = self.original_background.convert("L")
+                pre = self.image_processor.preprocess_image(bg)
+                self._add_cell_work_n, _ = self.image_processor._as_gray2d_normalized(pre)
+            except Exception as e:
+                logger.debug(f"Add-cell intensity cache skipped: {e}")
         else:
             if self.manual_remove_mask is None:
                 self.manual_remove_mask = Image.new('L', base_size, 0)
@@ -5273,7 +7529,16 @@ class PDFViewer:
                 self.manual_remove_mask = self.manual_remove_mask.resize(base_size, Image.NEAREST)
             self.current_mask = self.manual_remove_mask
 
-        # Ensure detection mask exists and show rings + paint (do not leave blank TIFF)
+        # Show detection rings once at mode entry. Per-click drawing is a cheap
+        # canvas stamp — never rebuild the full-res overlay while painting.
+        self._mask_edit_last_stamp = None
+        self._mask_edit_stroke_saved = False
+        self._last_smart_add_blob = None
+        self._last_smart_remove_blob = None
+        try:
+            self.output.config(cursor="crosshair")
+        except Exception:
+            pass
         try:
             has_auto = (
                 getattr(self, "auto_mask", None) is not None
@@ -5281,16 +7546,20 @@ class PDFViewer:
             )
             if not has_auto:
                 self.show_cell_mask_threshold(calculate=True)
-            # Re-enter edit bindings after show_cell_mask (does not rebind)
+            elif getattr(self, "mask_overlay_layer", None) is None:
+                self.show_cell_mask_threshold(calculate=False)
             self.editing_mask = True
             self.mask_edit_add = add
             self.current_mask = self.manual_add_mask if add else self.manual_remove_mask
-            self._refresh_mask_edit_display()
+            self.showing_auto_mask = True
         except Exception as e:
             logger.warning(f"Could not show mask for edit mode: {e}")
             self._refresh_mask_edit_display()
 
-        logger.info(f"Started mask edit mode: {'add' if add else 'remove'} cells")
+        logger.info(
+            f"Started mask edit mode: {'add' if add else 'remove'} cells "
+            f"({'click a nucleus to add' if add else 'click a nucleus to remove it'})"
+        )
 
     def _build_live_mask_edit_overlay(self):
         """Composite cell-detection rings + add/remove paint so the mask stays visible.
@@ -5380,32 +7649,409 @@ class PDFViewer:
             logger.warning(f"Mask edit display refresh failed: {e}")
 
     def _finish_mask_edit_stroke(self, event=None):
-        """After a brush stroke, refresh combined rings without leaving edit mode."""
+        """End a brush stroke without rebuilding the full-res ring overlay."""
+        self._mask_edit_last_stamp = None
+        self._mask_edit_stroke_saved = False
         if not getattr(self, "editing_mask", False):
             return
-        # Prefer full combined view (applies remove to rings) after stroke ends
+        # Canvas ovals + overlay stamps already show the stroke. Calling
+        # show_cell_mask_threshold / show_page here made Add Cell lag on every click.
+
+    def _stamp_mask_edit_on_overlay(self, x, y, r, eraser=False):
+        """Paint a small disk onto the cached overlay (native pixels, cheap)."""
+        overlay = getattr(self, "mask_overlay_layer", None)
+        if overlay is None:
+            return
         try:
-            # Rebuild combined detection rings + paint (for remove, now subtract)
-            was_add = getattr(self, "mask_edit_add", True)
-            if not was_add:
-                # Temporarily show true combined for accuracy after stroke
-                self.show_cell_mask_threshold(calculate=False)
-                self.editing_mask = True
-                self.mask_edit_add = False
-                self.current_mask = self.manual_remove_mask
-                # Layer yellow paint back on top of final combined rings
-                self._refresh_mask_edit_display()
+            if overlay.mode != "RGBA":
+                overlay = overlay.convert("RGBA")
+                self.mask_overlay_layer = overlay
+            w, h = overlay.size
+            x, y, r = int(x), int(y), int(max(1, r))
+            x0, y0 = max(0, x - r), max(0, y - r)
+            x1, y1 = min(w, x + r + 1), min(h, y + r + 1)
+            if x1 <= x0 or y1 <= y0:
+                return
+            arr = np.array(overlay.crop((x0, y0, x1, y1)))
+            yy, xx = np.ogrid[0:arr.shape[0], 0:arr.shape[1]]
+            cy, cx = y - y0, x - x0
+            disk = (xx - cx) ** 2 + (yy - cy) ** 2 <= r * r
+            if not np.any(disk):
+                return
+            if eraser:
+                arr[disk] = 0
+            elif getattr(self, "mask_edit_add", True):
+                arr[disk] = (255, 40, 40, 150)
+                inner = max(0, r - 2)
+                ring = disk & (((xx - cx) ** 2 + (yy - cy) ** 2) >= inner * inner)
+                arr[ring] = (255, 0, 0, 230)
             else:
-                self.show_cell_mask_threshold(calculate=False)
-                self.editing_mask = True
-                self.mask_edit_add = True
-                self.current_mask = self.manual_add_mask
-                self._refresh_mask_edit_display()
+                arr[disk] = (255, 210, 0, 180)
+            overlay.paste(Image.fromarray(arr, "RGBA"), (x0, y0))
+        except Exception as e:
+            logger.debug(f"Mask-edit overlay stamp skipped: {e}")
+
+    def _cell_like_blob_at(self, ix, iy):
+        """Grow the most cell-like nucleus under a click (native image x, y).
+
+        Snaps to the nearest bright peak that is not already detected, then
+        traces that nucleus with the same intensity watershed as detection.
+        Returns (y0, x0, local_bool) or None.
+        """
+        work = getattr(self, "_add_cell_work_n", None)
+        if work is None:
+            try:
+                bg = self.original_background.convert("L")
+                pre = self.image_processor.preprocess_image(bg)
+                work, _ = self.image_processor._as_gray2d_normalized(pre)
+                self._add_cell_work_n = work
+            except Exception:
+                return None
+        img = np.asarray(work, dtype=np.float64)
+        if img.ndim > 2:
+            img = np.squeeze(img)
+        h, w = img.shape[:2]
+        xi, yi = int(round(ix)), int(round(iy))
+        if not (0 <= yi < h and 0 <= xi < w):
+            return None
+
+        cfg = self.image_processor.cell_config
+        try:
+            brush = int(self.brush_size.get() or 4)
         except Exception:
-            self._refresh_mask_edit_display()
+            brush = 4
+        brush = max(1, min(10, brush))
+        # 1 = tight, 4 = default, 10 = greedy fill
+        rad_scale = 0.40 + 0.15 * float(brush)
+        r_search = max(
+            5,
+            int(round(float(getattr(cfg, "blob_max_sigma", 12) or 12) * 1.4 * rad_scale)),
+        )
+        y0s, y1s = max(0, yi - r_search), min(h, yi + r_search + 1)
+        x0s, x1s = max(0, xi - r_search), min(w, xi + r_search + 1)
+        crop = img[y0s:y1s, x0s:x1s]
+        try:
+            sm = ndi.gaussian_filter(crop, 0.8)
+        except Exception:
+            sm = crop
+        yy, xx = np.ogrid[0:crop.shape[0], 0:crop.shape[1]]
+        d2 = (yy - (yi - y0s)) ** 2 + (xx - (xi - x0s)) ** 2
+        score = sm - 0.015 * np.sqrt(d2)
+
+        taken = np.zeros(crop.shape, dtype=bool)
+        auto = getattr(self, "auto_mask", None)
+        if auto is not None and not isinstance(auto, bool):
+            ab = np.asarray(auto)
+            if ab.ndim > 2:
+                ab = ab.squeeze()
+            if ab.shape[:2] == (h, w):
+                taken |= ab[y0s:y1s, x0s:x1s] > 0
+        if self.manual_add_mask is not None:
+            am = np.array(self.manual_add_mask)
+            if am.ndim > 2:
+                am = am.squeeze()
+            if am.shape[:2] == (h, w):
+                taken |= am[y0s:y1s, x0s:x1s] > 0
+        score[taken] = -1e9
+        if float(np.max(score)) < -1e8:
+            return None
+        py, px = np.unravel_index(int(np.argmax(score)), score.shape)
+        cy, cx = int(py + y0s), int(px + x0s)
+
+        r_est = max(
+            2,
+            int(round(
+                float(getattr(cfg, "blob_min_sigma", 2.0) or 2.0)
+                * float(getattr(cfg, "blob_radius_scale", 1.8) or 1.8)
+                * rad_scale
+            )),
+        )
+        r_max = max(
+            r_est + 2,
+            int(round(
+                float(getattr(cfg, "blob_max_sigma", 12.0) or 12.0)
+                * float(getattr(cfg, "blob_radius_scale", 1.8) or 1.8)
+                * rad_scale
+            )),
+        )
+        peak = {
+            "yi": cy,
+            "xi": cx,
+            "radius": r_est,
+            "raw_radius": min(
+                r_max,
+                max(
+                    r_est,
+                    int(np.sqrt(max(int(getattr(cfg, "blob_max_area", 56) or 56), 9) / np.pi) * rad_scale),
+                ),
+            ),
+        }
+        try:
+            labels = self.image_processor._shape_cells_from_markers(img, [peak])
+        except Exception as e:
+            logger.debug(f"smart add-cell shape failed: {e}")
+            labels = None
+        if labels is None:
+            return None
+        blob = np.asarray(labels) > 0
+        if auto is not None and not isinstance(auto, bool):
+            ab = np.asarray(auto)
+            if ab.shape[:2] == blob.shape:
+                blob = blob & ~(ab > 0)
+        if self.manual_add_mask is not None:
+            am = np.array(self.manual_add_mask)
+            if am.ndim > 2:
+                am = am.squeeze()
+            if am.shape[:2] == blob.shape:
+                blob = blob & ~(am > 0)
+        if int(blob.sum()) < 6:
+            return None
+        blob = self._apply_add_cell_brush(blob, img, cy, cx, brush, taken_full=None)
+        if auto is not None and not isinstance(auto, bool):
+            ab = np.asarray(auto)
+            if ab.shape[:2] == blob.shape:
+                blob = blob & ~(ab > 0)
+        if self.manual_add_mask is not None:
+            am = np.array(self.manual_add_mask)
+            if am.ndim > 2:
+                am = am.squeeze()
+            if am.shape[:2] == blob.shape:
+                blob = blob & ~(am > 0)
+        if int(blob.sum()) < 6:
+            return None
+        ys, xs = np.where(blob)
+        y0, x0 = int(ys.min()), int(xs.min())
+        y1, x1 = int(ys.max()) + 1, int(xs.max()) + 1
+        return y0, x0, blob[y0:y1, x0:x1]
+
+    def _apply_add_cell_brush(self, blob, img, cy, cx, brush, taken_full=None):
+        """Tighten or expand a traced nucleus from brush size (1=tight, 10=greedy)."""
+        blob = np.asarray(blob, dtype=bool)
+        brush = int(max(1, min(10, brush)))
+        if brush == 4 or not blob.any():
+            return blob
+        h, w = blob.shape[:2]
+        try:
+            if brush < 4:
+                iters = 4 - brush
+                eroded = ndi.binary_erosion(blob, iterations=iters)
+                if int(eroded.sum()) >= 8:
+                    return eroded
+                return blob
+            iters = min(5, brush - 4)
+            grown = ndi.binary_dilation(blob, iterations=iters)
+            peak = float(img[int(cy), int(cx)]) if 0 <= cy < h and 0 <= cx < w else 0.0
+            # Larger brush accepts dimmer halo; still reject near-black.
+            floor = max(0.02, peak * (0.28 + 0.035 * (10 - brush)))
+            try:
+                grown = grown & (np.asarray(img) >= floor)
+            except Exception:
+                pass
+            yy, xx = np.ogrid[0:h, 0:w]
+            orig_r = max(3, int(np.sqrt(max(int(blob.sum()), 1) / np.pi)) + iters + 1)
+            grown = grown & (((yy - int(cy)) ** 2 + (xx - int(cx)) ** 2) <= orig_r * orig_r)
+            if taken_full is not None and taken_full.shape[:2] == grown.shape:
+                grown = grown & ~np.asarray(taken_full, dtype=bool)
+            if int(grown.sum()) >= int(blob.sum()):
+                return grown
+            return blob
+        except Exception:
+            return blob
+
+    def _crop_blob_bbox(self, blob):
+        """Return (y0, x0, local_bool) for a full-image boolean blob, or None."""
+        blob = np.asarray(blob, dtype=bool)
+        if not blob.any():
+            return None
+        ys, xs = np.where(blob)
+        y0, x0 = int(ys.min()), int(xs.min())
+        y1, x1 = int(ys.max()) + 1, int(xs.max()) + 1
+        return y0, x0, blob[y0:y1, x0:x1]
+
+    def _detected_cell_blob_at(self, ix, iy):
+        """Whole counted nucleus under a click (native image x, y).
+
+        Prefers instance IDs from auto_labels so packed neighbors stay intact.
+        Manual Add cells use their own connected component. Already-removed
+        pixels are ignored so a second click does not snap to a neighbor.
+        Returns (y0, x0, local_bool) or None.
+        """
+        combined = self._get_combined_cell_mask()
+        if combined is None:
+            return None
+        h, w = combined.shape[:2]
+        xi, yi = int(round(ix)), int(round(iy))
+
+        rem = None
+        if self.manual_remove_mask is not None:
+            try:
+                rem = np.array(self.manual_remove_mask)
+                if rem.ndim > 2:
+                    rem = rem.squeeze()
+                if rem.shape[:2] != (h, w):
+                    rem = np.array(
+                        self.manual_remove_mask.resize((w, h), Image.NEAREST)
+                    )
+                    if rem.ndim > 2:
+                        rem = rem.squeeze()
+                rem = rem > 0
+            except Exception:
+                rem = None
+        # Click already on a removed cell: do not snap onto a neighbor
+        if rem is not None and 0 <= yi < h and 0 <= xi < w and rem[yi, xi] and not combined[yi, xi]:
+            return None
+
+        snapped = self._snap_click_to_mask(combined, xi, yi)
+        if snapped is None:
+            return None
+        x, y = snapped
+        if not (0 <= y < h and 0 <= x < w) or not combined[y, x]:
+            return None
+
+        add_mask = None
+        if self.manual_add_mask is not None:
+            try:
+                add_arr = np.array(self.manual_add_mask)
+                if add_arr.ndim > 2:
+                    add_arr = add_arr.squeeze()
+                if add_arr.shape[:2] != (h, w):
+                    add_arr = np.array(
+                        self.manual_add_mask.resize((w, h), Image.NEAREST)
+                    )
+                    if add_arr.ndim > 2:
+                        add_arr = add_arr.squeeze()
+                add_mask = add_arr > 0
+            except Exception:
+                add_mask = None
+
+        lab = getattr(self, "auto_labels", None)
+        try:
+            if lab is not None and not isinstance(lab, bool):
+                arr = np.asarray(lab)
+                if arr.ndim > 2:
+                    arr = arr.squeeze()
+                if (
+                    arr.shape[:2] == (h, w)
+                    and np.issubdtype(arr.dtype, np.integer)
+                    and int(arr[y, x]) > 0
+                ):
+                    blob = arr == int(arr[y, x])
+                    if rem is not None:
+                        blob = blob & ~rem
+                    if int(blob.sum()) >= 3:
+                        return self._crop_blob_bbox(blob)
+        except Exception:
+            pass
+
+        if add_mask is not None and add_mask[y, x]:
+            try:
+                add_lab = measure.label(add_mask, connectivity=2)
+                tid = int(add_lab[y, x])
+                if tid > 0:
+                    blob = add_lab == tid
+                    if rem is not None:
+                        blob = blob & ~rem
+                    if int(blob.sum()) >= 3:
+                        return self._crop_blob_bbox(blob)
+            except Exception:
+                pass
+
+        try:
+            labels_cc = measure.label(combined, connectivity=2)
+            tid = int(labels_cc[y, x])
+            if tid > 0:
+                blob = labels_cc == tid
+                if int(blob.sum()) >= 3:
+                    return self._crop_blob_bbox(blob)
+        except Exception:
+            pass
+        return None
+
+    def _stamp_mask_edit_blob(self, y0, x0, blob, eraser=False):
+        """Write an irregular blob into the add/remove mask and overlay."""
+        blob = np.asarray(blob, dtype=bool)
+        if not blob.any():
+            return
+        arr = np.array(self.current_mask)
+        if arr.ndim > 2:
+            arr = arr.squeeze()
+        y1, x1 = y0 + blob.shape[0], x0 + blob.shape[1]
+        y1 = min(arr.shape[0], y1)
+        x1 = min(arr.shape[1], x1)
+        bh, bw = y1 - y0, x1 - x0
+        if bh < 1 or bw < 1:
+            return
+        region = arr[y0:y1, x0:x1]
+        sub = blob[:bh, :bw]
+        region[sub] = 0 if eraser else 255
+        arr[y0:y1, x0:x1] = region
+        self.current_mask = Image.fromarray(arr.astype(np.uint8), mode="L")
+        if getattr(self, "mask_edit_add", True):
+            self.manual_add_mask = self.current_mask
+        else:
+            self.manual_remove_mask = self.current_mask
+
+        overlay = getattr(self, "mask_overlay_layer", None)
+        if overlay is None:
+            return
+        try:
+            if overlay.mode != "RGBA":
+                overlay = overlay.convert("RGBA")
+                self.mask_overlay_layer = overlay
+            patch = np.array(overlay.crop((x0, y0, x1, y1)))
+            if eraser:
+                patch[sub] = 0
+            elif getattr(self, "mask_edit_add", True):
+                patch[sub] = (255, 40, 40, 110)
+                try:
+                    ring = segmentation.find_boundaries(sub.astype(np.uint8), mode="inner")
+                    patch[ring] = (255, 0, 0, 230)
+                except Exception:
+                    pass
+            else:
+                # Punch the red ring and mark the whole nucleus gold
+                patch[sub] = (255, 210, 0, 180)
+                try:
+                    ring = segmentation.find_boundaries(sub.astype(np.uint8), mode="inner")
+                    patch[ring] = (204, 153, 0, 230)
+                except Exception:
+                    pass
+            overlay.paste(Image.fromarray(patch, "RGBA"), (x0, y0))
+        except Exception as e:
+            logger.debug(f"mask-edit blob overlay stamp skipped: {e}")
+
+    def _draw_blob_on_canvas(self, y0, x0, blob, fill_rgba=(255, 40, 40, 90), ring_rgba=(255, 0, 0, 230)):
+        """Draw the blob outline in screen space (no full redraw)."""
+        try:
+            ring = segmentation.find_boundaries(np.asarray(blob, dtype=np.uint8), mode="outer")
+        except Exception:
+            ring = np.zeros(np.asarray(blob).shape, dtype=bool)
+        scale = float(self.view_scale) if self.view_scale else 1.0
+        try:
+            rgba = np.zeros((blob.shape[0], blob.shape[1], 4), dtype=np.uint8)
+            rgba[np.asarray(blob, dtype=bool)] = fill_rgba
+            rgba[ring] = ring_rgba
+            img = Image.fromarray(rgba, "RGBA")
+            if abs(scale - 1.0) > 0.02:
+                img = img.resize(
+                    (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+                    Image.NEAREST if scale >= 1 else Image.BILINEAR,
+                )
+            photo = ImageTk.PhotoImage(img)
+            photos = getattr(self, "_add_cell_photos", None)
+            if photos is None:
+                photos = []
+                self._add_cell_photos = photos
+            photos.append(photo)
+            self.output.create_image(
+                x0 * scale, y0 * scale, image=photo, anchor="nw",
+                tags=("mask_edit_stroke", "mask"),
+            )
+        except Exception:
+            pass
 
     def edit_mask_draw(self, event, eraser=False):
-        """Draw directly on the binary mask. Coordinates respect current zoom level."""
+        """Add/remove cells. Click one nucleus; right-click still brush-erases."""
         if not self.editing_mask or self.current_mask is None:
             return
         if getattr(self, 'splitting_cells', False):
@@ -5414,17 +8060,81 @@ class PDFViewer:
         cx = self.output.canvasx(event.x)
         cy = self.output.canvasy(event.y)
         x, y = self._canvas_to_image(cx, cy)   # convert to native image space
+
+        # Add Cell: one click → one intensity-traced nucleus (not a brush circle)
+        if getattr(self, "mask_edit_add", True) and not eraser:
+            last = getattr(self, "_last_smart_add_blob", None)
+            if last is not None:
+                y0, x0, blob = last
+                ly, lx = int(y) - y0, int(x) - x0
+                if 0 <= ly < blob.shape[0] and 0 <= lx < blob.shape[1] and blob[ly, lx]:
+                    return
+            found = self._cell_like_blob_at(x, y)
+            if found is None:
+                return
+            y0, x0, blob = found
+            self.save_state()
+            self._last_smart_add_blob = (y0, x0, blob)
+            self._stamp_mask_edit_blob(y0, x0, blob, eraser=False)
+            self._draw_blob_on_canvas(y0, x0, blob)
+            return
+
+        # Remove Cell: one click → delete that whole counted nucleus
+        if not getattr(self, "mask_edit_add", True) and not eraser:
+            last = getattr(self, "_last_smart_remove_blob", None)
+            if last is not None:
+                y0, x0, blob = last
+                ly, lx = int(y) - y0, int(x) - x0
+                if 0 <= ly < blob.shape[0] and 0 <= lx < blob.shape[1] and blob[ly, lx]:
+                    return
+            found = self._detected_cell_blob_at(x, y)
+            if found is None:
+                return
+            y0, x0, blob = found
+            self.save_state()
+            self._last_smart_remove_blob = (y0, x0, blob)
+            self._stamp_mask_edit_blob(y0, x0, blob, eraser=False)
+            self._draw_blob_on_canvas(
+                y0, x0, blob,
+                fill_rgba=(255, 210, 0, 140),
+                ring_rgba=(204, 153, 0, 230),
+            )
+            return
+
         r = int(self.brush_size.get())
+        if r < 1:
+            r = 1
+
+        stamp_key = (int(x), int(y), int(r), bool(eraser))
+        if stamp_key == getattr(self, "_mask_edit_last_stamp", None):
+            return
+        if not getattr(self, "_mask_edit_stroke_saved", False):
+            self.save_state()
+            self._mask_edit_stroke_saved = True
+        self._mask_edit_last_stamp = stamp_key
 
         draw = ImageDraw.Draw(self.current_mask)
-        if eraser == False:
-            color = 255
-        else:
-            color = 0
-        draw.ellipse((x - r, y - r, x + r, y + r), fill=color)
+        draw.ellipse((x - r, y - r, x + r, y + r), fill=0 if eraser else 255)
 
-        # Keep detection mask visible under the paint strokes
-        self._refresh_mask_edit_display()
+        # Instant screen feedback (same idea as paint strokes)
+        scale = float(self.view_scale) if self.view_scale else 1.0
+        sr = max(1.0, r * scale)
+        if eraser:
+            fill, outline = "", "#888888"
+        else:
+            fill, outline = "#ffd200", "#cc9900"
+        oval_kw = dict(
+            outline=outline,
+            width=2,
+            tags=("mask_edit_stroke", "mask"),
+        )
+        if fill:
+            oval_kw["fill"] = fill
+            oval_kw["stipple"] = "gray50"
+        self.output.create_oval(cx - sr, cy - sr, cx + sr, cy + sr, **oval_kw)
+
+        # Keep the native overlay in sync so zoom does not drop the new cell
+        self._stamp_mask_edit_on_overlay(x, y, r, eraser=eraser)
 
     def _get_combined_cell_mask(self):
         """Return the current boolean cell mask (auto | add) & ~remove, or None."""
@@ -5436,7 +8146,7 @@ class PDFViewer:
 
         auto_mask = getattr(self, 'auto_mask', None)
         if auto_mask is None or isinstance(auto_mask, bool):
-            _, auto_labels = binary_mask_cell_count(background, processor=self.image_processor)
+            _, auto_labels = self._run_cell_detection(background)
             auto_mask = np.asarray(auto_labels, dtype=bool).squeeze()
             self.auto_mask = auto_mask
         else:
@@ -5467,6 +8177,302 @@ class PDFViewer:
         """Boolean ndarray → PIL L image (0/255)."""
         m = np.asarray(mask_bool, dtype=bool).squeeze()
         return Image.fromarray((m.astype(np.uint8) * 255), mode="L")
+
+    def _paint_layer_as_roi(self, bh, bw):
+        """Filled ROI from the paint layer (outlines are hole-filled)."""
+        pl = getattr(self, "paint_layer", None)
+        if pl is None:
+            return None
+        try:
+            arr = np.array(pl)
+        except Exception:
+            return None
+        if arr.size == 0:
+            return None
+        if arr.ndim == 3 and arr.shape[2] >= 4:
+            ink = arr[..., 3] > 20
+        elif arr.ndim == 3:
+            ink = np.any(arr > 20, axis=-1)
+        else:
+            ink = arr > 20
+        if ink.shape != (bh, bw):
+            ink = np.array(
+                Image.fromarray((ink.astype(np.uint8) * 255), mode="L").resize(
+                    (bw, bh), Image.NEAREST
+                )
+            ) > 0
+        if not np.any(ink):
+            return None
+        try:
+            closed = ndi.binary_closing(ink, iterations=4)
+            filled = ndi.binary_fill_holes(closed)
+        except Exception:
+            filled = ink
+        return filled
+
+    def _labeled_region_id_mask(self, bh, bw):
+        """Uint8 zone IDs from atlas/named paint, plus unnamed paint interiors."""
+        zm = None
+        try:
+            zm = self._zone_mask_for_detection(bh, bw)
+        except Exception:
+            zm = None
+        paint_roi = None
+        try:
+            paint_roi = self._paint_layer_as_roi(bh, bw)
+        except Exception:
+            paint_roi = None
+        if zm is None and paint_roi is None:
+            return None
+        if zm is None:
+            return paint_roi.astype(np.uint8)
+        out = np.asarray(zm, dtype=np.uint8).copy()
+        if paint_roi is not None:
+            extra = paint_roi & (out == 0)
+            if np.any(extra):
+                nid = int(out.max()) + 1
+                if nid > 255:
+                    nid = 255
+                out[extra] = nid
+        if int(out.max()) <= 0:
+            return None
+        return out
+
+    def _labeled_region_bool_mask(self, target_hw=None):
+        """Boolean mask of painted + atlas zones, optionally resized to (h, w).
+
+        Returns None when no labeled regions exist. Unnamed paint outlines are
+        filled so the interior of a drawn crescent counts as labeled.
+        """
+        bg = self._working_background_pil()
+        if bg is None:
+            return None
+        bw, bh = bg.size
+        zm = self._labeled_region_id_mask(bh, bw)
+        if zm is None:
+            return None
+        labeled = np.asarray(zm) > 0
+        if target_hw is not None:
+            th, tw = int(target_hw[0]), int(target_hw[1])
+            if labeled.shape != (th, tw):
+                labeled = np.array(
+                    Image.fromarray((labeled.astype(np.uint8) * 255), mode="L").resize(
+                        (tw, th), Image.NEAREST
+                    )
+                ) > 0
+        return labeled
+
+    def _criteria_region_bool_mask(self, which="A", target_hw=None, include_unlabeled=False):
+        """Boolean ROI for Config A or Config B assigned zones.
+
+        B is always the B-assigned labeled pixels. A is A-assigned zones,
+        plus unlabeled tissue when include_unlabeled is True (B pixels stay out).
+        """
+        which = "B" if str(which).upper().strip() == "B" else "A"
+        bg = self._working_background_pil()
+        if bg is None:
+            return None
+        bw, bh = bg.size
+        zm = None
+        try:
+            zm = self._labeled_region_id_mask(bh, bw)
+        except Exception:
+            zm = None
+        if zm is None:
+            if which == "B":
+                return None
+            m = np.ones((bh, bw), dtype=bool) if include_unlabeled else None
+        else:
+            zm_a, zm_b, b_pix = self._split_zone_masks_ab(zm)
+            if which == "B":
+                m = (np.asarray(zm_b) > 0) if zm_b is not None else None
+            else:
+                m = (np.asarray(zm_a) > 0) if zm_a is not None else np.zeros((bh, bw), dtype=bool)
+                if include_unlabeled:
+                    if b_pix is not None:
+                        m = m | ~np.asarray(b_pix, dtype=bool)
+                    else:
+                        m = np.ones((bh, bw), dtype=bool)
+        if m is None or not np.any(m):
+            return None
+        if target_hw is not None:
+            th, tw = int(target_hw[0]), int(target_hw[1])
+            if m.shape != (th, tw):
+                m = np.array(
+                    Image.fromarray((m.astype(np.uint8) * 255), mode="L").resize(
+                        (tw, th), Image.NEAREST
+                    )
+                ) > 0
+        return m
+
+    def _run_config_detection_for_suggest(self, background_pil, cfg, zone_mask, clip_outside):
+        """Run one CellDetectionConfig (A or B) without the dual merge."""
+        ip = self.image_processor
+        live = ip.cell_config
+        try:
+            ip.cell_config = cfg
+            pre = ip.preprocess_image(background_pil)
+            _, labels = ip.detect_cells(
+                background_pil,
+                zone_mask=zone_mask,
+                preprocessed=pre,
+                clip_outside_zones=bool(clip_outside) and zone_mask is not None,
+            )
+            return np.asarray(labels)
+        finally:
+            ip.cell_config = live
+
+    def _zone_mask_for_detection(self, bh, bw):
+        """Painted/atlas zone IDs registered to the TIFF (HxW uint8), or None."""
+        try:
+            page = getattr(self, "current_page", 0)
+            mask_img = (getattr(self, "mask_images", None) or {}).get(page)
+            if mask_img is None:
+                return None
+            arr, _, _ = self._zone_mask_registered_to_background(mask_img, bh, bw)
+            if arr is None or int(np.max(arr)) <= 0:
+                return None
+            return np.asarray(arr, dtype=np.uint8)
+        except Exception as e:
+            logger.debug(f"zone mask for detection skipped: {e}")
+            return None
+
+    def _run_cell_detection(self, background_pil):
+        """Run detection, passing atlas/paint zones for region-scoped masking."""
+        zm = None
+        cfg = self.image_processor.cell_config
+        blob_roi_only = False
+        try:
+            blob_roi_only = bool(self.blob_labeled_regions_only.get())
+        except Exception:
+            blob_roi_only = False
+        dual = False
+        try:
+            dual = bool(self.dual_settings_mode.get())
+        except Exception:
+            dual = False
+        use_zones = blob_roi_only or (
+            int(getattr(cfg, "adaptive_enabled", 0) or 0)
+            and int(getattr(cfg, "adaptive_region_mode", 0) or 0)
+        )
+        if use_zones or dual:
+            try:
+                arr = np.array(background_pil)
+                bh, bw = arr.shape[:2]
+                zm = self._labeled_region_id_mask(bh, bw)
+            except Exception:
+                zm = None
+        if dual:
+            return self._run_dual_cell_detection(
+                background_pil, zm, blob_roi_only, use_zones
+            )
+        return binary_mask_cell_count(
+            background_pil, processor=self.image_processor, zone_mask=zm
+        )
+
+    def _split_zone_masks_ab(self, zm):
+        """Split a zone-ID mask into Config A vs Config B ID maps.
+
+        Returns (zm_a, zm_b_or_None, b_pixels_or_None). B-assigned IDs are
+        zeroed in zm_a so each pass stays exclusive.
+        """
+        zm = np.asarray(zm)
+        page = getattr(self, "current_page", 0)
+        store = (getattr(self, "zone_criteria", None) or {}).get(page, {}) or {}
+        b_ids = set()
+        for k, v in store.items():
+            if str(v).upper().strip() == "B":
+                try:
+                    b_ids.add(int(k))
+                except Exception:
+                    pass
+        zm_a = zm.copy()
+        zm_b = np.zeros_like(zm)
+        b_pix = np.zeros(zm.shape, dtype=bool)
+        if b_ids:
+            for bid in b_ids:
+                hit = zm == bid
+                if np.any(hit):
+                    b_pix |= hit
+                    zm_b[hit] = zm[hit]
+            zm_a[b_pix] = 0
+        if not np.any(b_pix):
+            return zm_a, None, None
+        return zm_a, zm_b, b_pix
+
+    def _merge_dual_labels(self, labels_a, labels_b):
+        """Combine Config A and Config B label maps with unique IDs."""
+        a = np.asarray(labels_a)
+        if labels_b is None:
+            return a
+        b = np.asarray(labels_b)
+        if b.shape[:2] != a.shape[:2]:
+            try:
+                b = np.array(
+                    Image.fromarray(b.astype(np.int32)).resize(
+                        (a.shape[1], a.shape[0]), Image.NEAREST
+                    )
+                )
+            except Exception:
+                return a
+        if int(np.max(b) if b.size else 0) <= 0:
+            return a
+        out = a.copy()
+        offset = int(out.max()) if out.size else 0
+        remap = b.copy()
+        remap[b > 0] = b[b > 0] + offset
+        out[b > 0] = remap[b > 0]
+        return out
+
+    def _run_dual_cell_detection(self, background_pil, zm, blob_roi_only, use_zones):
+        """Run Config A then Config B on assigned regions and merge labels."""
+        ip = self.image_processor
+        cfg_a = ip.cell_config
+        cfg_b = self._ensure_cell_config_b()
+        zm_a = zm
+        zm_b = None
+        b_pix = None
+        if zm is not None:
+            zm_a, zm_b, b_pix = self._split_zone_masks_ab(zm)
+
+        try:
+            pre = ip.preprocess_image(background_pil)
+        except Exception as e:
+            logger.warning(f"Dual Settings preprocess failed, falling back: {e}")
+            pre = None
+
+        try:
+            ip.cell_config = cfg_a
+            zm_a_pass = zm_a if (use_zones and zm_a is not None) else None
+            _, labels_a = ip.detect_cells(
+                background_pil,
+                zone_mask=zm_a_pass,
+                preprocessed=pre,
+                clip_outside_zones=bool(blob_roi_only),
+            )
+            labels_a = np.asarray(labels_a).copy()
+            if b_pix is not None and np.any(b_pix):
+                labels_a[b_pix] = 0
+
+            labels_b = None
+            if zm_b is not None and int(np.max(zm_b)) > 0:
+                ip.cell_config = cfg_b
+                _, labels_b = ip.detect_cells(
+                    background_pil,
+                    zone_mask=zm_b,
+                    preprocessed=pre,
+                    clip_outside_zones=True,
+                )
+            merged = self._merge_dual_labels(labels_a, labels_b)
+            logger.info(
+                "Dual Settings detection: A cells=%s B cells=%s merged=%s",
+                int(np.max(labels_a) if np.asarray(labels_a).size else 0),
+                int(np.max(labels_b) if labels_b is not None and np.asarray(labels_b).size else 0),
+                int(np.max(merged) if np.asarray(merged).size else 0),
+            )
+            return background_pil, merged
+        finally:
+            ip.cell_config = cfg_a
 
     def _l_image_to_bool_mask(self, img, target_hw=None):
         """PIL/L path image → boolean mask; optional resize to (h, w)."""
@@ -5683,7 +8689,7 @@ class PDFViewer:
             logger.error(f"save_cell_mask failed: {e}", exc_info=True)
             messagebox.showerror("Save Cell Mask", f"Failed to save cell mask:\n{e}")
 
-    def load_cell_mask(self):
+    def load_cell_mask(self, path=None, show_messages=True):
         """Load a previously saved cell mask onto the current channel.
 
         Applies the mask to auto_mask / last_cell_mask (resized if needed) so
@@ -5691,25 +8697,26 @@ class PDFViewer:
         """
         try:
             if self.original_background is None and self.background_image is None:
-                messagebox.showwarning(
-                    "Load Cell Mask",
-                    "Load a TIFF image first, then load the cell mask.",
-                )
-                return
+                if show_messages:
+                    messagebox.showwarning(
+                        "Load Cell Mask",
+                        "Load a TIFF image first, then load the cell mask.",
+                    )
+                return False
 
-            initial_dir = self._preferred_open_dir(feature="cell_masks")
-
-            path = fd.askopenfilename(
-                title="Load Cell Mask",
-                initialdir=initial_dir,
-                filetypes=[
-                    ("BARCC Cell Mask", "*.barccmask"),
-                    ("PNG / TIFF mask", "*.png *.tif *.tiff"),
-                    ("All files", "*.*"),
-                ],
-            )
             if not path:
-                return
+                initial_dir = self._preferred_open_dir(feature="cell_masks")
+                path = fd.askopenfilename(
+                    title="Load Cell Mask",
+                    initialdir=initial_dir,
+                    filetypes=[
+                        ("BARCC Cell Mask", "*.barccmask"),
+                        ("PNG / TIFF mask", "*.png *.tif *.tiff"),
+                        ("All files", "*.*"),
+                    ],
+                )
+            if not path:
+                return False
 
             bg = self.original_background or self.background_image
             tw, th = bg.size  # PIL width, height
@@ -5834,20 +8841,24 @@ class PDFViewer:
             # Show overlay without re-detecting
             self.show_cell_mask_threshold(calculate=False)
 
-            messagebox.showinfo(
-                "Cell Mask Loaded",
-                f"Loaded cell mask from:\n{path}\n\n"
-                f"Cell pixels: {n_pix}\n"
-                f"Size: {tw}×{th}{size_note}\n\n"
-                "Mask is locked for Count Cells (no re-detection).\n"
-                "Use Cell → Show Mask to re-detect and unlock if needed.",
-            )
+            if show_messages:
+                messagebox.showinfo(
+                    "Cell Mask Loaded",
+                    f"Loaded cell mask from:\n{path}\n\n"
+                    f"Cell pixels: {n_pix}\n"
+                    f"Size: {tw}×{th}{size_note}\n\n"
+                    "Mask is locked for Count Cells (no re-detection).\n"
+                    "Use Cell → Show Mask to re-detect and unlock if needed.",
+                )
             logger.info(
                 f"Cell mask loaded from {path}: pixels={n_pix} size={tw}x{th} locked=True"
             )
+            return True
         except Exception as e:
             logger.error(f"load_cell_mask failed: {e}", exc_info=True)
-            messagebox.showerror("Load Cell Mask", f"Failed to load cell mask:\n{e}")
+            if show_messages:
+                messagebox.showerror("Load Cell Mask", f"Failed to load cell mask:\n{e}")
+            return False
 
     def _get_ground_truth_cell_mask(self):
         """Ground-truth cell mask for null distributions (loaded or detected)."""
@@ -7336,73 +10347,147 @@ class PDFViewer:
         messagebox.showinfo("Random Mask Saved", msg)
         logger.info(f"Random cell mask saved: {png_path}")
 
-    def _find_two_probable_cell_centers(self, blob, intensity):
-        """Find two seed points inside a binary blob for the most probable two-cell split.
-
-        Preference order:
-          1. Top two distance-transform peaks (centers of mass of thickness)
-          2. Top two intensity peaks inside the blob
-          3. Geometric: max-distance pixel + farthest other blob pixel
-        Returns array shape (2, 2) of (row, col), or None if the blob is too small.
-        """
-        blob = np.asarray(blob, dtype=bool)
-        if blob.sum() < 6:
-            return None
-
-        distance = distance_transform_edt(blob)
-        # min_distance scales with blob size so the two peaks stay distinct
-        area = int(blob.sum())
-        min_dist = max(2, int(np.sqrt(area) / 6.0))
-
+    def _peak_local_max_coords(self, image, *, min_distance, num_peaks, labels=None):
+        """peak_local_max across skimage versions → (N, 2) int coords or None."""
+        kwargs = dict(min_distance=int(max(1, min_distance)), exclude_border=False)
+        if labels is not None:
+            kwargs["labels"] = np.asarray(labels, dtype=np.int32)
         coords = None
         try:
-            coords = feature.peak_local_max(
-                distance,
-                min_distance=min_dist,
-                labels=blob.astype(np.int32),
-                num_peaks=2,
-            )
+            coords = feature.peak_local_max(image, num_peaks=int(num_peaks), **kwargs)
         except TypeError:
             try:
-                coords = feature.peak_local_max(distance, min_distance=min_dist, num_peaks=2)
-                if coords is not None and len(coords):
-                    coords = np.array([c for c in coords if blob[c[0], c[1]]])
+                coords = feature.peak_local_max(image, **kwargs)
             except Exception:
-                coords = None
+                return None
         except Exception:
-            coords = None
+            return None
+        if coords is None:
+            return None
+        coords = np.asarray(coords)
+        if coords.size == 0:
+            return None
+        if coords.dtype == bool or (coords.ndim == 2 and coords.shape == image.shape):
+            coords = np.column_stack(np.where(coords))
+        if coords.ndim != 2 or coords.shape[1] != 2:
+            return None
+        coords = coords.astype(int)
+        if len(coords) > num_peaks:
+            vals = image[coords[:, 0], coords[:, 1]]
+            coords = coords[np.argsort(vals)[::-1][:num_peaks]]
+        return coords
 
-        if coords is not None and len(coords) >= 2:
-            return np.asarray(coords[:2], dtype=int)
-
-        # Intensity peaks (brighter spots are more probable cell centers)
-        inten = np.asarray(intensity, dtype=np.float64).copy()
+    def _split_cell_landscape(self, blob, intensity):
+        """Hybrid score: thicker + brighter regions are more likely cell centers."""
+        blob = np.asarray(blob, dtype=bool)
+        edt = distance_transform_edt(blob).astype(np.float64)
+        inten = np.asarray(intensity, dtype=np.float64)
         if inten.shape != blob.shape:
-            try:
-                inten = np.array(
-                    Image.fromarray(
-                        ((inten - inten.min()) / (inten.max() - inten.min() + 1e-8) * 255).astype(np.uint8)
-                    ).resize((blob.shape[1], blob.shape[0]), Image.BILINEAR)
-                ).astype(np.float64)
-            except Exception:
-                inten = distance
-        inten = inten.astype(np.float64)
-        inten[~blob] = 0
+            inten = edt
         try:
-            coords = feature.peak_local_max(
-                inten,
-                min_distance=min_dist,
-                labels=blob.astype(np.int32),
-                num_peaks=2,
-            )
+            inten = ndi.gaussian_filter(inten, sigma=1.0)
         except Exception:
-            coords = None
-        if coords is not None and len(coords) >= 2:
-            return np.asarray(coords[:2], dtype=int)
+            pass
+        inten = np.where(blob, inten, 0.0)
 
-        # Geometric fallback: thickest point + farthest point in the blob
-        flat = np.argmax(distance)
-        y1, x1 = np.unravel_index(int(flat), distance.shape)
+        def _norm(a):
+            vals = a[blob]
+            if vals.size == 0:
+                return np.zeros_like(a)
+            m = float(vals.min())
+            M = float(vals.max())
+            if M <= m:
+                out = np.zeros_like(a)
+                out[blob] = 1.0
+                return out
+            out = (a - m) / (M - m)
+            out[~blob] = 0.0
+            return out
+
+        return 0.45 * _norm(edt) + 0.55 * _norm(inten)
+
+    def _intensity_weighted_two_centers(self, blob, intensity):
+        """2-means on blob pixels, weighted by intensity, initialized along the long axis."""
+        ys, xs = np.where(blob)
+        if len(ys) < 2:
+            return None
+        pts = np.column_stack([ys.astype(np.float64), xs.astype(np.float64)])
+        w = np.asarray(intensity, dtype=np.float64)[ys, xs]
+        w = np.clip(w, 0.0, None)
+        if w.max() > w.min():
+            w = (w - w.min()) / (w.max() - w.min())
+        else:
+            w = np.ones_like(w)
+        pts_c = pts - pts.mean(axis=0)
+        try:
+            _, _, vt = np.linalg.svd(pts_c, full_matrices=False)
+            axis = vt[0]
+        except Exception:
+            axis = np.array([0.0, 1.0])
+        proj = pts_c @ axis
+        c0 = pts[int(np.argmin(proj))].copy()
+        c1 = pts[int(np.argmax(proj))].copy()
+        ww = w + 1e-6
+        for _ in range(16):
+            d0 = ((pts - c0) ** 2).sum(axis=1)
+            d1 = ((pts - c1) ** 2).sum(axis=1)
+            m0 = d0 <= d1
+            m1 = ~m0
+            if int(m0.sum()) < 1 or int(m1.sum()) < 1:
+                break
+            n0 = np.average(pts[m0], axis=0, weights=ww[m0])
+            n1 = np.average(pts[m1], axis=0, weights=ww[m1])
+            if np.allclose(n0, c0) and np.allclose(n1, c1):
+                break
+            c0, c1 = n0, n1
+
+        def _snap(c):
+            d2 = (pts[:, 0] - c[0]) ** 2 + (pts[:, 1] - c[1]) ** 2
+            i = int(np.argmin(d2))
+            return int(pts[i, 0]), int(pts[i, 1])
+
+        a = _snap(c0)
+        b = _snap(c1)
+        if a == b:
+            return None
+        return np.array([a, b], dtype=int)
+
+    def _find_two_probable_cell_centers(self, blob, intensity):
+        """Two seed points for the most apparent two cells inside a merged blob.
+
+        Preference: hybrid intensity+shape peaks, then intensity-weighted 2-means,
+        then distance-transform peaks, then long-axis ends.
+        Returns (2, 2) array of (row, col), or None.
+        """
+        blob = np.asarray(blob, dtype=bool)
+        if int(blob.sum()) < 6:
+            return None
+        intensity = np.asarray(intensity, dtype=np.float64)
+        if intensity.shape != blob.shape:
+            intensity = distance_transform_edt(blob).astype(np.float64)
+
+        area = int(blob.sum())
+        min_dist = max(2, int(np.sqrt(area) / 6.0))
+        labels = blob.astype(np.int32)
+        landscape = self._split_cell_landscape(blob, intensity)
+
+        for image in (landscape, intensity, distance_transform_edt(blob).astype(np.float64)):
+            img = np.where(blob, np.asarray(image, dtype=np.float64), 0.0)
+            coords = self._peak_local_max_coords(
+                img, min_distance=min_dist, num_peaks=2, labels=labels
+            )
+            if coords is not None and len(coords) >= 2:
+                if blob[coords[0, 0], coords[0, 1]] and blob[coords[1, 0], coords[1, 1]]:
+                    if (coords[0, 0], coords[0, 1]) != (coords[1, 0], coords[1, 1]):
+                        return np.asarray(coords[:2], dtype=int)
+
+        centers = self._intensity_weighted_two_centers(blob, intensity)
+        if centers is not None:
+            return centers
+
+        # Last resort: thickest pixel + farthest blob pixel
+        distance = distance_transform_edt(blob)
+        y1, x1 = np.unravel_index(int(np.argmax(distance)), distance.shape)
         if not blob[y1, x1]:
             ys, xs = np.where(blob)
             if len(ys) < 2:
@@ -7414,6 +10499,156 @@ class PDFViewer:
         if d2[i2] < 1:
             return None
         return np.array([[y1, x1], [int(ys[i2]), int(xs[i2])]], dtype=int)
+
+    def _snap_click_to_mask(self, combined, x, y):
+        """If the click missed the filled mask, snap to the nearest mask pixel."""
+        h, w = combined.shape
+        if 0 <= y < h and 0 <= x < w and combined[y, x]:
+            return x, y
+        scale = float(getattr(self, "view_scale", 1.0) or 1.0)
+        rad = max(6, int(round(14.0 / max(scale, 0.05))))
+        y0, y1 = max(0, y - rad), min(h, y + rad + 1)
+        x0, x1 = max(0, x - rad), min(w, x + rad + 1)
+        crop = combined[y0:y1, x0:x1]
+        if not crop.any():
+            return None
+        ys, xs = np.where(crop)
+        d2 = (ys.astype(np.float64) - (y - y0)) ** 2 + (xs.astype(np.float64) - (x - x0)) ** 2
+        i = int(np.argmin(d2))
+        return int(xs[i] + x0), int(ys[i] + y0)
+
+    def _watershed_cut_between_centers(self, blob, landscape, centers):
+        """Watershed cut (8-connected) between two seeds. Returns bool cut or None."""
+        markers = np.zeros(blob.shape, dtype=np.int32)
+        markers[int(centers[0, 0]), int(centers[0, 1])] = 1
+        markers[int(centers[1, 0]), int(centers[1, 1])] = 2
+        inv = np.where(blob, -np.asarray(landscape, dtype=np.float64), 0.0)
+        try:
+            split_labels = segmentation.watershed(
+                inv, markers, mask=blob, watershed_line=True
+            )
+        except TypeError:
+            split_labels = segmentation.watershed(inv, markers, mask=blob)
+
+        cut_pixels = blob & (np.asarray(split_labels) == 0)
+        if not cut_pixels.any():
+            lab = np.asarray(split_labels)
+            if int(lab.max()) < 2:
+                return None
+            cut = np.zeros_like(blob, dtype=bool)
+            for dy, dx in (
+                (-1, 0), (1, 0), (0, -1), (0, 1),
+                (-1, -1), (-1, 1), (1, -1), (1, 1),
+            ):
+                shifted = np.roll(np.roll(lab, dy, axis=0), dx, axis=1)
+                cut |= (lab > 0) & (shifted > 0) & (lab != shifted) & blob
+            cut_pixels = cut
+        if not cut_pixels.any():
+            return None
+
+        blob_area = int(blob.sum())
+
+        def _n_components(cut):
+            after = blob.copy()
+            after[cut] = False
+            return int(measure.label(after, connectivity=2).max())
+
+        n_after = _n_components(cut_pixels)
+        # 8-connected labeling still sees diagonal bridges — thicken until split
+        for _ in range(3):
+            if n_after >= 2:
+                break
+            thicker = ndi.binary_dilation(cut_pixels, structure=np.ones((3, 3))) & blob
+            if thicker.sum() > 0.35 * blob_area:
+                break
+            cut_pixels = thicker
+            n_after = _n_components(cut_pixels)
+        if n_after < 2:
+            return None
+        return cut_pixels
+
+    def _apply_split_cut_visual(self, blob, cut_pixels):
+        """Redraw rings for the split blob locally (no full-image morphology)."""
+        h, w = blob.shape
+        ys, xs = np.where(blob)
+        if len(ys) == 0:
+            return
+        pad = 3
+        y0 = max(0, int(ys.min()) - pad)
+        x0 = max(0, int(xs.min()) - pad)
+        y1 = min(h, int(ys.max()) + 1 + pad)
+        x1 = min(w, int(xs.max()) + 1 + pad)
+
+        after = blob.copy()
+        after[cut_pixels] = False
+        crop = after[y0:y1, x0:x1]
+        ring = self._cell_detection_ring_overlay(
+            crop, size=None, color=(255, 0, 0), alpha=230, thickness=2
+        ).convert("RGBA")
+
+        overlay = getattr(self, "mask_overlay_layer", None)
+        if overlay is None or tuple(overlay.size) != (w, h):
+            try:
+                self.show_cell_mask_threshold(calculate=False)
+            except Exception:
+                pass
+            return
+        if overlay.mode != "RGBA":
+            overlay = overlay.convert("RGBA")
+
+        arr = np.array(overlay)
+        blob_crop = blob[y0:y1, x0:x1]
+        dest = arr[y0:y1, x0:x1]
+        dest[blob_crop] = 0
+        ring_arr = np.array(ring)
+        if ring_arr.shape[:2] == dest.shape[:2]:
+            alpha = ring_arr[..., 3] > 0
+            dest[alpha] = ring_arr[alpha]
+        arr[y0:y1, x0:x1] = dest
+        self.mask_overlay_layer = Image.fromarray(arr, "RGBA")
+        self.showing_auto_mask = True
+
+        # Opaque local patch covers the old unsplit ring on the current canvas
+        try:
+            bg = (self.original_background or self.background_image).convert("RGBA")
+            patch_bg = bg.crop((x0, y0, x1, y1))
+            try:
+                patch_bg = self.adjust_image(patch_bg.convert("RGB")).convert("RGBA")
+            except Exception:
+                pass
+            if getattr(self, "paint_layer", None) is not None:
+                try:
+                    pl = self.paint_layer.crop((x0, y0, x1, y1))
+                    if pl.mode != "RGBA":
+                        pl = pl.convert("RGBA")
+                    if pl.size == patch_bg.size:
+                        patch_bg = Image.alpha_composite(patch_bg, pl)
+                except Exception:
+                    pass
+            patch_ov = self.mask_overlay_layer.crop((x0, y0, x1, y1))
+            composed = Image.alpha_composite(patch_bg, patch_ov)
+            scale = float(self.view_scale) if self.view_scale else 1.0
+            dw = max(1, int(composed.width * scale))
+            dh = max(1, int(composed.height * scale))
+            if (dw, dh) != composed.size:
+                resample = Image.NEAREST if scale >= 1.0 else Image.BILINEAR
+                composed = composed.resize((dw, dh), resample)
+            photo = ImageTk.PhotoImage(composed)
+            photos = getattr(self, "_split_patch_photos", None)
+            if photos is None:
+                photos = []
+                self._split_patch_photos = photos
+            photos.append(photo)
+            self.output.create_image(
+                x0 * scale, y0 * scale, image=photo, anchor="nw",
+                tags=("mask", "split_patch"),
+            )
+            try:
+                self.output.tag_raise("mask")
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug(f"Split-cell canvas patch skipped: {e}")
 
     def split_cell_at_click(self, event):
         """Click handler: split the masked cell under the cursor into two blobs."""
@@ -7434,17 +10669,15 @@ class PDFViewer:
             return
 
         h, w = combined.shape
-        if x < 0 or y < 0 or x >= w or y >= h:
-            messagebox.showinfo("Split Cell", "Click inside the image.")
-            return
-        if not combined[y, x]:
+        snapped = self._snap_click_to_mask(combined, x, y)
+        if snapped is None:
             messagebox.showinfo(
                 "Split Cell",
                 "Click on a red masked cell. The click landed outside the cell mask.",
             )
             return
+        x, y = snapped
 
-        # Connected component under the click = the single "masked cell" to split
         labels_cc = measure.label(combined, connectivity=2)
         target_id = int(labels_cc[y, x])
         if target_id == 0:
@@ -7459,7 +10692,6 @@ class PDFViewer:
             )
             return
 
-        # Preprocessed intensity for probabilistic centers (same pipeline as detection)
         try:
             bg = self.original_background.convert('L')
             intensity = self.image_processor.preprocess_image(bg)
@@ -7483,77 +10715,23 @@ class PDFViewer:
             )
             return
 
-        # Watershed with exactly two markers → two most probable blobs
-        markers = np.zeros(blob.shape, dtype=np.int32)
-        markers[int(centers[0, 0]), int(centers[0, 1])] = 1
-        markers[int(centers[1, 0]), int(centers[1, 1])] = 2
-
-        distance = distance_transform_edt(blob)
-        try:
-            # watershed_line=True leaves the ridge as 0 → natural split for labeling
-            split_labels = segmentation.watershed(
-                -distance, markers, mask=blob, watershed_line=True
-            )
-        except TypeError:
-            split_labels = segmentation.watershed(-distance, markers, mask=blob)
-            # Manually mark inter-label boundary as cut if watershed_line unsupported
-            cut = np.zeros_like(blob, dtype=bool)
-            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                shifted = np.roll(split_labels, shift=dy, axis=0)
-                shifted = np.roll(shifted, shift=dx, axis=1)
-                cut |= (
-                    (split_labels > 0)
-                    & (shifted > 0)
-                    & (split_labels != shifted)
-                )
-            # Apply cut into labels as 0
-            split_labels = split_labels.copy()
-            split_labels[cut] = 0
-
-        # Pixels that belonged to the blob but are no longer labeled = the cut ridge
-        cut_pixels = blob & (split_labels == 0)
-        if not cut_pixels.any():
-            # Force a thin cut between the two seeds along the gradient of distance
-            # by dilating the watershed ridge once from inter-label neighbors
-            lab = split_labels.copy()
-            if lab.max() < 2:
-                messagebox.showinfo(
-                    "Split Cell",
-                    "Watershed could not separate two regions. Try Remove Cell to cut manually.",
-                )
-                return
-            cut = np.zeros_like(blob, dtype=bool)
-            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                shifted = np.roll(lab, shift=dy, axis=0)
-                shifted = np.roll(shifted, shift=dx, axis=1)
-                cut |= (lab > 0) & (shifted > 0) & (lab != shifted) & blob
-            cut_pixels = cut
-
-        if not cut_pixels.any():
+        landscape = self._split_cell_landscape(blob, intensity)
+        cut_pixels = self._watershed_cut_between_centers(blob, landscape, centers)
+        if cut_pixels is None:
+            # Geometry-only fallback
+            edt = distance_transform_edt(blob).astype(np.float64)
+            cut_pixels = self._watershed_cut_between_centers(blob, edt, centers)
+        if cut_pixels is None:
             messagebox.showinfo(
                 "Split Cell",
-                "Could not create a separation line between the two blobs.",
+                "Could not separate two cells in that mask. Try Remove Cell to cut manually.",
             )
             return
 
-        # Verify we actually get two components after the cut
         after = blob.copy()
         after[cut_pixels] = False
-        n_after = measure.label(after, connectivity=2).max()
-        if n_after < 2:
-            # Widen the cut slightly (1-pixel dilation of the ridge, still inside blob)
-            cut_pixels = ndi.binary_dilation(cut_pixels, iterations=1) & blob
-            after = blob.copy()
-            after[cut_pixels] = False
-            n_after = measure.label(after, connectivity=2).max()
-        if n_after < 2:
-            messagebox.showinfo(
-                "Split Cell",
-                "Split did not produce two separate cells. The shape may not be a double cell.",
-            )
-            return
+        n_after = int(measure.label(after, connectivity=2).max())
 
-        # Persist the cut via manual remove mask (survives re-detect + Count Cells)
         self.save_state()
         base_size = self.original_background.size
         if self.manual_remove_mask is None:
@@ -7575,15 +10753,21 @@ class PDFViewer:
         self.manual_remove_mask = Image.fromarray(rem.astype(np.uint8), mode='L')
         self.current_mask = self.manual_remove_mask
 
-        # Keep auto_mask in sync for immediate redisplay without full redetect:
-        # do not modify auto_mask permanently; remove_mask is the source of truth.
+        # Keep last_cell_mask consistent for flattened export
+        try:
+            if getattr(self, "last_cell_mask", None) is not None:
+                lm = np.asarray(self.last_cell_mask)
+                if lm.shape == cut_pixels.shape:
+                    self.last_cell_mask = (lm.astype(bool) & ~cut_pixels)
+        except Exception:
+            pass
+
         logger.info(
             f"Split cell at ({x},{y}): area={blob_area}, cut_pixels={int(cut_pixels.sum())}, "
             f"components_after={n_after}"
         )
 
-        # Refresh overlay (use cached auto_mask)
-        self.show_cell_mask_threshold(calculate=False)
+        self._apply_split_cut_visual(blob, cut_pixels)
 
     def stop_mask_edit(self, event=None):
         """Exit mask editing mode (add / remove / split)."""
@@ -7602,10 +10786,15 @@ class PDFViewer:
         self.output.unbind("<ButtonRelease-3>")
         self.output.bind("<Button-1>", self.highlight_region)
         self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
+        self._bind_middle_button_pan()
         self.region_move_mode.set(False)
         self.region_translate_active = False
         self.region_translate_original_mask = None
         self.region_translate_zid = None
+        try:
+            self.output.config(cursor="")
+        except Exception:
+            pass
         logger.info("Stopped mask edit mode")
         messagebox.showinfo("Mask Editing", "Mask edits applied. You can now re-count cells.")
 
@@ -7701,7 +10890,13 @@ class PDFViewer:
         if max_sigma <= min_sigma:
             max_sigma = min_sigma + 1.0
         num_sigma = int(max(3, num_sigma))
-        sigmas = np.linspace(float(min_sigma), float(max_sigma), num_sigma)
+        log_scale = int(getattr(self.image_processor.cell_config, "blob_log_scale", 1) or 0) != 0
+        s0 = max(1e-3, float(min_sigma))
+        s1 = max(s0 + 1e-3, float(max_sigma))
+        if log_scale:
+            sigmas = np.geomspace(s0, s1, num_sigma)
+        else:
+            sigmas = np.linspace(s0, s1, num_sigma)
         log_max = np.full((h, w), -np.inf, dtype=np.float64)
         best_sigma = np.full((h, w), sigmas[0], dtype=np.float64)
         n = len(sigmas)
@@ -7781,6 +10976,243 @@ class PDFViewer:
             "median_radius": float(np.median(radii)) if len(radii) else 0.0,
         }
 
+    def _smart_suggest_error_audit(self, img, mask, peak_coords, scale, roi=None, typ_r=4.0):
+        """Classify the current mask like a visual review: worms, speckle, packed misses.
+
+        Returns a profile used to pick knobs (not a single canned tile recipe).
+        """
+        img = np.asarray(img, dtype=np.float64)
+        mask = np.asarray(mask, dtype=bool)
+        empty = {
+            "confident": False,
+            "n_det": 0,
+            "n_worm": 0,
+            "n_speckle": 0,
+            "worm_frac": 0.0,
+            "speckle_frac": 0.0,
+            "n_fn": 0,
+            "n_fn_packed": 0,
+            "n_fn_sparse": 0,
+            "recipe": "balanced",
+            "summary": "Not enough detections/peaks to diagnose error types.",
+            "flags": {},
+        }
+        if img.ndim != 2 or img.size == 0:
+            return empty
+        if mask.ndim != 2:
+            return empty
+        if mask.shape != img.shape:
+            try:
+                mask = np.array(
+                    Image.fromarray((mask.astype(np.uint8) * 255), mode="L").resize(
+                        (img.shape[1], img.shape[0]), Image.NEAREST
+                    )
+                ) > 0
+            except Exception:
+                return empty
+        if roi is not None:
+            roi = np.asarray(roi, dtype=bool)
+            if roi.shape == mask.shape:
+                mask = mask & roi
+
+        lab = measure.label(mask, connectivity=2)
+        try:
+            props = measure.regionprops(lab)
+        except Exception:
+            props = []
+        areas = []
+        n_worm = 0
+        n_speckle = 0
+        n_keep = 0
+        for p in props:
+            a = float(p.area)
+            if a < 3:
+                continue
+            n_keep += 1
+            areas.append(a)
+        med_a = float(np.median(areas)) if areas else 20.0
+        for p in props:
+            a = float(p.area)
+            if a < 3:
+                continue
+            try:
+                elong = float(p.major_axis_length) / max(float(p.minor_axis_length), 1e-6)
+            except Exception:
+                elong = 1.0
+            per = float(p.perimeter) if p.perimeter and p.perimeter > 0 else 1.0
+            circ = float(4.0 * np.pi * a / (per * per + 1e-8))
+            if a >= 1.7 * med_a and (elong >= 2.15 or circ < 0.48):
+                n_worm += 1
+            if a <= max(6.0, 0.32 * med_a):
+                n_speckle += 1
+
+        n_fn = n_fn_packed = n_fn_sparse = 0
+        pts = np.zeros((0, 2), dtype=float)
+        if peak_coords is not None and len(peak_coords):
+            pc = np.asarray(peak_coords, dtype=int)
+            h, w = mask.shape
+            ok = (pc[:, 0] >= 0) & (pc[:, 0] < h) & (pc[:, 1] >= 0) & (pc[:, 1] < w)
+            pc = pc[ok]
+            if roi is not None and roi.shape == mask.shape and len(pc):
+                pc = pc[roi[pc[:, 0], pc[:, 1]]]
+            if len(pc):
+                on = mask[pc[:, 0], pc[:, 1]]
+                fn_pts = pc[~on]
+                n_fn = int(len(fn_pts))
+                if n_fn >= 2:
+                    try:
+                        from scipy.spatial import cKDTree
+                        tree = cKDTree(fn_pts.astype(float))
+                        rad = max(6.0, float(typ_r) * 2.7)
+                        balls = tree.query_ball_tree(tree, r=rad)
+                        for nb in balls:
+                            if len(nb) >= 3:
+                                n_fn_packed += 1
+                            elif len(nb) <= 1:
+                                n_fn_sparse += 1
+                    except Exception:
+                        n_fn_sparse = n_fn
+                else:
+                    n_fn_sparse = n_fn
+                pts = fn_pts.astype(float)
+
+        # Field density from ALL peaks in the ROI (spacing), not nucleus size.
+        # Small Fos + large gaps is SPARSE, not packed — packed is nn ≲ 2.3 radii.
+        nn_ratio = 99.0
+        field_sparse = False
+        field_packed = False
+        try:
+            from scipy.spatial import cKDTree
+            dens_pts = None
+            if peak_coords is not None and len(peak_coords):
+                dens_pts = np.asarray(peak_coords, dtype=float)
+                if dens_pts.ndim == 2 and dens_pts.shape[0] >= 3:
+                    if roi is not None and roi.shape == mask.shape:
+                        yy = np.clip(dens_pts[:, 0].astype(int), 0, mask.shape[0] - 1)
+                        xx = np.clip(dens_pts[:, 1].astype(int), 0, mask.shape[1] - 1)
+                        dens_pts = dens_pts[roi[yy, xx]]
+            if dens_pts is None or len(dens_pts) < 3:
+                # fall back to detection centroids
+                cents = []
+                for p in props:
+                    if p.area >= 3:
+                        yy, xx = p.centroid
+                        cents.append((yy, xx))
+                dens_pts = np.asarray(cents, dtype=float) if len(cents) >= 3 else None
+            if dens_pts is not None and len(dens_pts) >= 3:
+                nn = cKDTree(dens_pts).query(dens_pts, k=2)[0][:, 1]
+                med_nn = float(np.median(nn[np.isfinite(nn)])) if np.any(np.isfinite(nn)) else 99.0
+                nn_ratio = med_nn / max(float(typ_r), 1.0)
+                field_sparse = nn_ratio >= 3.2
+                field_packed = nn_ratio <= 2.3
+        except Exception:
+            pass
+
+        n_det = int(n_keep)
+        worm_frac = n_worm / max(n_det, 1)
+        speckle_frac = n_speckle / max(n_det, 1)
+        packed_fn = n_fn_packed >= 5 and n_fn_packed >= 0.28 * max(n_fn, 1)
+        # A few local triplets in a sparse ROI are not a packed field
+        if field_sparse:
+            packed_fn = False
+        sparse_fn = n_fn_sparse >= 6
+        worms = worm_frac >= 0.07 or n_worm >= 5
+        speckle = speckle_frac >= 0.12 or n_speckle >= 8
+        confident = n_det >= 8 or n_fn >= 6 or field_sparse or field_packed
+
+        flags = {
+            "worms": bool(worms),
+            "speckle": bool(speckle),
+            "packed_fn": bool(packed_fn),
+            "sparse_fn": bool(sparse_fn and not packed_fn),
+            "sparse_fp": bool(speckle),
+            "field_sparse": bool(field_sparse),
+            "field_packed": bool(field_packed),
+        }
+        bits = []
+        bits.append(
+            f"spacing {nn_ratio:.1f}× cell-radius "
+            f"({'sparse field' if field_sparse else 'packed field' if field_packed else 'mixed spacing'})"
+        )
+        if worms:
+            bits.append(f"{n_worm} merged/worm-shaped objects ({100 * worm_frac:.0f}%)")
+        if speckle:
+            bits.append(f"{n_speckle} tiny speckle detections ({100 * speckle_frac:.0f}%)")
+        if packed_fn:
+            bits.append(f"{n_fn_packed} missed LoG peaks in packed clusters")
+        elif sparse_fn:
+            bits.append(f"{n_fn_sparse} isolated missed LoG peaks")
+
+        if field_sparse and speckle:
+            recipe = "sparse_fp"
+        elif field_sparse and sparse_fn:
+            recipe = "low_bg_fn"
+        elif field_sparse:
+            recipe = "sparse_field"
+        elif worms and packed_fn:
+            recipe = "merged_and_packed"
+        elif packed_fn and speckle:
+            recipe = "packed_fn_sparse_fp"
+        elif worms:
+            recipe = "merged_worms"
+        elif packed_fn:
+            recipe = "packed_fn"
+        elif speckle:
+            recipe = "sparse_fp"
+        elif sparse_fn:
+            recipe = "low_bg_fn"
+        else:
+            recipe = "balanced"
+
+        summary = (
+            "Looking at the current mask (not just bright/dark tiles): "
+            + "; ".join(bits)
+            + ". "
+        )
+        if field_sparse:
+            summary += (
+                "This ROI is spatially sparse (large gaps between nuclei). "
+                "Small LoG sigma means small cells, NOT packed tissue — "
+                "packing/free-space stay loose; use SNR/BG gates for grain."
+            )
+        elif packed_fn and speckle:
+            summary += (
+                "Will ease packing for clusters and raise size/BG gates for speckle — "
+                "not a global SNR hike, which would wipe packed nuclei."
+            )
+        elif worms and packed_fn:
+            summary += (
+                "Will split elongated merges (area/elongation) while keeping circularity mild "
+                "so packed nuclei are not deleted."
+            )
+        elif worms:
+            summary += "Will tighten max size and elongation so merged cells split."
+        elif packed_fn:
+            summary += "Will allow tighter packing and slightly easier SNR/threshold in clusters."
+        elif speckle:
+            summary += "Will drop tiny/high-BG grain with min-area and bg-relative, not packing."
+        elif sparse_fn:
+            summary += "Will slightly ease threshold/SNR to recover isolated missed cells."
+        else:
+            summary += "Tile stats will drive the remaining knobs."
+
+        return {
+            "confident": bool(confident),
+            "n_det": n_det,
+            "n_worm": int(n_worm),
+            "n_speckle": int(n_speckle),
+            "worm_frac": float(worm_frac),
+            "speckle_frac": float(speckle_frac),
+            "n_fn": int(n_fn),
+            "n_fn_packed": int(n_fn_packed),
+            "n_fn_sparse": int(n_fn_sparse),
+            "nn_ratio": float(nn_ratio),
+            "recipe": recipe,
+            "summary": summary,
+            "flags": flags,
+            "median_area": med_a,
+        }
+
     def _smart_suggest_regional_diagnosis(
         self,
         img,
@@ -7790,6 +11222,7 @@ class PDFViewer:
         mask_full,
         scale,
         typ_r_an=4.0,
+        roi_mask=None,
     ):
         """Tile-wise FP/FN proxies for bright vs dark regions.
 
@@ -7859,6 +11292,17 @@ class PDFViewer:
         tsy = max(24, h // n_ty)
         tsx = max(24, w // n_tx)
 
+        roi = None
+        if roi_mask is not None:
+            try:
+                rm = np.asarray(roi_mask)
+                if rm.ndim > 2:
+                    rm = rm.squeeze()
+                if rm.shape[:2] == (h, w):
+                    roi = rm > 0
+            except Exception:
+                roi = None
+
         tiles = []
         for y0 in range(0, h, tsy):
             for x0 in range(0, w, tsx):
@@ -7867,6 +11311,13 @@ class PDFViewer:
                 if (y1 - y0) < 16 or (x1 - x0) < 16:
                     continue
                 patch = img[y0:y1, x0:x1]
+                if roi is not None:
+                    rpatch = roi[y0:y1, x0:x1]
+                    if int(rpatch.sum()) < 48:
+                        continue
+                    patch = patch[rpatch]
+                    if patch.size < 48:
+                        continue
                 med = float(np.median(patch))
                 p90 = float(np.percentile(patch, 90))
                 # peaks in tile
@@ -7893,7 +11344,10 @@ class PDFViewer:
                         & (det_yx[:, 1] < x1)
                     )
                     n_dt = int(np.sum(in_d))
-                area_mp = ((y1 - y0) * (x1 - x0)) / 1e6
+                if roi is not None:
+                    area_mp = float(np.sum(roi[y0:y1, x0:x1])) / 1e6
+                else:
+                    area_mp = ((y1 - y0) * (x1 - x0)) / 1e6
                 mean_c = float(np.mean(contrasts)) if contrasts else 0.0
                 tiles.append(
                     {
@@ -8294,8 +11748,8 @@ class PDFViewer:
                 elif med_nn > 7 * med_r:
                     blob_overlap = 0.4
 
-        # Note: circularity is not applied in the current blob drawing path, but keep mild
-        blob_min_circularity = 0.4
+        # Mild default — Smart Suggest / edge tools can tighten later
+        blob_min_circularity = 0.30
 
         cell_keep = float(np.mean(cell_logs >= blob_threshold)) if cell_logs.size else 0.0
         bg_keep = float(np.mean(bg_logs >= blob_threshold)) if bg_logs.size else 0.0
@@ -8339,7 +11793,7 @@ class PDFViewer:
                 num_sigma=int(settings["blob_num_sigma"]),
                 threshold=float(settings["blob_threshold"]),
                 overlap=float(settings.get("blob_overlap", 0.5)),
-                log_scale=False,
+                log_scale=int(settings.get("blob_log_scale", 1) or 0) != 0,
             )
         except Exception as e:
             logger.debug(f"blob_log recovery check failed: {e}")
@@ -8456,13 +11910,14 @@ class PDFViewer:
         settings["_area_tune_preserved"] = True
         return settings
 
-    def _apply_blob_settings_dict(self, settings, preserve_area_tune=True):
+    def _apply_blob_settings_dict(self, settings, preserve_area_tune=True, config=None):
         """Apply a settings dict onto cell_config (ignores keys starting with _).
 
         preserve_area_tune: if True and Area Tune was completed this session,
         never overwrite blob_min_area / blob_max_area from that calibration.
+        config: optional CellDetectionConfig (Config B); default is Config A.
         """
-        cfg = self.image_processor.cell_config
+        cfg = config if config is not None else self.image_processor.cell_config
         settings = dict(settings or {})
         if preserve_area_tune:
             settings = self._preserve_area_tune_in_settings(settings)
@@ -8471,11 +11926,23 @@ class PDFViewer:
                 continue
             if not hasattr(cfg, k):
                 continue
-            if k in ("adaptive_enabled", "adaptive_dual_pass", "blob_reject_tissue_edge"):
+            if k in (
+                "adaptive_enabled",
+                "adaptive_dual_pass",
+                "adaptive_region_mode",
+                "blob_reject_tissue_edge",
+                "blob_tissue_margin",
+                "blob_exclude_border",
+            ):
                 try:
                     v = int(v)
                 except Exception:
                     v = 1 if v else 0
+            else:
+                try:
+                    v = _coerce_config_value(cfg, k, v)
+                except Exception:
+                    pass
             setattr(cfg, k, v)
         # If Adaptive was turned on via preset, ensure base method is blob/dog
         if int(getattr(cfg, "adaptive_enabled", 0) or 0):
@@ -8489,6 +11956,13 @@ class PDFViewer:
     # ==================================================================
 
     _MT_LABELS = {
+        "auto": {
+            "name": "Auto (smart click)",
+            "short": "AUTO",
+            "color": "#dddddd",
+            "hint": "Click a red ring = TP. Shift+click a ring = FP. "
+                    "Click a missed bright cell = FN. Click empty = TN.",
+        },
         "tp": {"name": "True Positive", "short": "TP", "color": "#00cc44",
                "hint": "Correct detection — real cell that is (or should be) counted"},
         "fp": {"name": "False Positive", "short": "FP", "color": "#ff6600",
@@ -8537,8 +12011,9 @@ class PDFViewer:
             return
 
         self.measure_tune_active = True
-        self.measure_tune_label = "tp"
+        self.measure_tune_label = "auto"
         self.measure_tune_samples = []
+        self._measure_tune_det_xy = self._detection_centroids_xy()
         self._clear_measure_tune_markers()
 
         # Keep / show the detection mask so TP/FP labels can be placed on red rings.
@@ -8570,22 +12045,6 @@ class PDFViewer:
 
         self._open_measure_tune_status_window()
         self._update_measure_tune_status()
-
-        messagebox.showinfo(
-            "Measure Tune (TP / FP / FN / TN)",
-            "Label the current detection to refine parameters.\n\n"
-            "Dual approach (recommended on mixed BG):\n"
-            "  Pass 1 — precision: mark FP + TN only, then Apply\n"
-            "  Pass 2 — recall: mark TP + FN on misses, then Apply again\n"
-            "  Or full: mark all four classes in one go\n\n"
-            "  • TP (green)  — real cell correctly detected\n"
-            "  • FP (orange) — false mark (high BG, edge, junk)\n"
-            "  • FN (blue)   — real cell that was missed\n"
-            "  • TN (gray)   — true empty background\n\n"
-            "Pick a class → click examples → Apply.\n"
-            "Minimum: ≥2 should-not (FP/TN) OR ≥2 should-detect (TP/FN).\n"
-            "Results are saved for Smart Suggest.",
-        )
 
     def _open_measure_tune_status_window(self):
         try:
@@ -8628,6 +12087,12 @@ class PDFViewer:
                 variable=self.measure_tune_label_var,
                 command=_set_label,
             ).pack(anchor="w", padx=8, pady=1)
+        ttk.Label(
+            cls_frame,
+            text="AUTO is recommended: the click is classified from the image.",
+            font=("Helvetica", 8),
+            wraplength=300,
+        ).pack(anchor="w", padx=8, pady=(4, 2))
 
         self.measure_tune_counts_var = tk.StringVar(value="TP:0  FP:0  FN:0  TN:0")
         ttk.Label(
@@ -8706,6 +12171,32 @@ class PDFViewer:
             except Exception:
                 pass
         self.measure_tune_markers = []
+        try:
+            self.output.delete("measure_tune_marker")
+        except Exception:
+            pass
+
+    def _redraw_measure_tune_markers(self):
+        """Rebuild TP/FP/FN/TN markers after zoom/show_page clears the canvas."""
+        if not getattr(self, "measure_tune_active", False):
+            return
+        self._clear_measure_tune_markers()
+        counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+        for s in getattr(self, "measure_tune_samples", []) or []:
+            lab = s.get("label") or "tp"
+            if lab not in counts:
+                lab = "tp"
+            counts[lab] += 1
+            try:
+                self._draw_measure_tune_marker(
+                    s["x"], s["y"], kind=lab, index=counts[lab]
+                )
+            except Exception:
+                pass
+        try:
+            self.output.tag_raise("measure_tune_marker")
+        except Exception:
+            pass
 
     def _draw_measure_tune_marker(self, ix, iy, kind="tp", index=None):
         try:
@@ -8746,6 +12237,100 @@ class PDFViewer:
         scale = float(getattr(self, "_measure_tune_scale", 1.0) or 1.0)
         return x / scale, y / scale
 
+    def _detection_centroids_xy(self):
+        """(N,2) array of detection centroids in native image x,y."""
+        lab = getattr(self, "auto_labels", None)
+        try:
+            if (
+                lab is not None
+                and not isinstance(lab, bool)
+                and np.issubdtype(np.asarray(lab).dtype, np.integer)
+                and int(np.max(lab)) > 1
+            ):
+                arr = np.asarray(lab, dtype=np.int32)
+                pts = []
+                for p in measure.regionprops(arr):
+                    if p.area < 3:
+                        continue
+                    yy, xx = p.centroid
+                    pts.append((float(xx), float(yy)))
+                if pts:
+                    return np.asarray(pts, dtype=np.float64)
+        except Exception:
+            pass
+        m = getattr(self, "auto_mask", None)
+        try:
+            if m is not None and not isinstance(m, bool):
+                bw = np.asarray(m) > 0
+                if bw.ndim > 2:
+                    bw = bw.squeeze()
+                lab2 = measure.label(bw, connectivity=1)
+                pts = []
+                for p in measure.regionprops(lab2):
+                    if p.area < 3:
+                        continue
+                    yy, xx = p.centroid
+                    pts.append((float(xx), float(yy)))
+                if pts:
+                    return np.asarray(pts, dtype=np.float64)
+        except Exception:
+            pass
+        return np.zeros((0, 2), dtype=np.float64)
+
+    def _snap_to_detection(self, x, y, max_dist=None):
+        """Nearest detection centroid. Returns (x, y, dist) or None."""
+        pts = getattr(self, "_measure_tune_det_xy", None)
+        if pts is None or len(pts) == 0:
+            pts = self._detection_centroids_xy()
+            self._measure_tune_det_xy = pts
+        if pts is None or len(pts) == 0:
+            return None
+        d2 = (pts[:, 0] - float(x)) ** 2 + (pts[:, 1] - float(y)) ** 2
+        i = int(np.argmin(d2))
+        dist = float(np.sqrt(d2[i]))
+        if max_dist is not None and dist > max_dist:
+            return None
+        return float(pts[i, 0]), float(pts[i, 1]), dist
+
+    def _measure_tune_hit_radius(self):
+        """Max native-pixel distance to count a click as 'on' a detection."""
+        scale = float(getattr(self, "view_scale", 1.0) or 1.0)
+        screen = 14.0
+        r = screen / max(scale, 0.05)
+        cfg = self.image_processor.cell_config
+        r_cell = float(getattr(cfg, "blob_min_sigma", 2.0) or 2.0) * 2.2
+        return max(8.0, r, r_cell)
+
+    def _infer_measure_tune_click(self, x, y, shift=False):
+        """Classify a click from the image: ring → TP (Shift=FP), bright miss → FN, else TN."""
+        hit_r = self._measure_tune_hit_radius()
+        snap = self._snap_to_detection(x, y, max_dist=hit_r)
+        if snap is not None:
+            sx, sy, _ = snap
+            return ("fp" if shift else "tp"), int(round(sx)), int(round(sy))
+        img = getattr(self, "_measure_tune_img", None)
+        if img is None:
+            return "tn", int(x), int(y)
+        ax, ay = self._orig_to_analysis_xy(x, y)
+        try:
+            r, peak, yy, xx = self._estimate_radius_at_point(img, ay, ax)
+            pad = int(max(8, min(28, r * 3)))
+            h, w = img.shape[:2]
+            y0, y1 = max(0, int(yy) - pad), min(h, int(yy) + pad + 1)
+            x0, x1 = max(0, int(xx) - pad), min(w, int(xx) + pad + 1)
+            loc = img[y0:y1, x0:x1]
+            floor = float(np.percentile(loc, 25)) if loc.size else 0.0
+            noise = float(np.std(loc)) if loc.size > 4 else 0.05
+            snr = (peak - floor) / (noise + 1e-6)
+            scale = float(getattr(self, "_measure_tune_scale", 1.0) or 1.0)
+            ox = int(round(xx * scale))
+            oy = int(round(yy * scale))
+            if (peak - floor) >= 0.035 and snr >= 0.9:
+                return "fn", ox, oy
+        except Exception:
+            pass
+        return "tn", int(x), int(y)
+
     def _measure_tune_click(self, event):
         if not getattr(self, "measure_tune_active", False):
             return
@@ -8761,6 +12346,25 @@ class PDFViewer:
         x, y = int(round(ix)), int(round(iy))
         if x < 0 or y < 0 or x >= w or y >= h:
             return
+
+        lab = getattr(self, "measure_tune_label", "auto") or "auto"
+        shift = bool(getattr(event, "state", 0) & 0x0001)
+        if lab == "auto":
+            lab, x, y = self._infer_measure_tune_click(x, y, shift=shift)
+        elif lab in ("tp", "fp"):
+            snap = self._snap_to_detection(x, y, max_dist=self._measure_tune_hit_radius() * 1.5)
+            if snap is not None:
+                x, y = int(round(snap[0])), int(round(snap[1]))
+        elif lab == "fn":
+            img0 = getattr(self, "_measure_tune_img", None)
+            if img0 is not None:
+                ax, ay = self._orig_to_analysis_xy(x, y)
+                try:
+                    _r, _p, yy, xx = self._estimate_radius_at_point(img0, ay, ax)
+                    sc = float(getattr(self, "_measure_tune_scale", 1.0) or 1.0)
+                    x, y = int(round(xx * sc)), int(round(yy * sc))
+                except Exception:
+                    pass
 
         img = getattr(self, "_measure_tune_img", None)
         if img is None:
@@ -8790,6 +12394,12 @@ class PDFViewer:
                 )
             except Exception:
                 feat["local_snr"] = float(feat.get("snr", 0))
+            try:
+                feat["circularity"] = float(
+                    self.image_processor._peak_local_circularity(img, ay_i, ax_i, r_an)
+                )
+            except Exception:
+                feat["circularity"] = 1.0
         except Exception as e:
             logger.warning(f"Measure tune sample failed: {e}")
             messagebox.showwarning("Measure Tune", f"Could not measure that point:\n{e}")
@@ -8894,37 +12504,70 @@ class PDFViewer:
         iso = float(getattr(cfg, "blob_min_isotropy", 0.0) or 0.0)
         circ = float(getattr(cfg, "blob_min_circularity", 0.0) or 0.0)
 
-        # False positives → stricter quality / SNR
+        # False positives → stricter quality / SNR from actual FP vs TP features
         if n_fp >= 2:
             fp_snr = np.array([f.get("local_snr", f.get("snr", 0)) for f in fp], dtype=float)
             tp_snr = np.array(
                 [f.get("local_snr", f.get("snr", 0)) for f in (tp or fn)], dtype=float
             )
             if tp_snr.size and fp_snr.size:
-                # Sit between FP median and TP median SNR
                 target = 0.5 * (float(np.median(fp_snr)) + float(np.percentile(tp_snr, 20)))
                 snr = max(snr, min(3.5, max(1.2, target)))
             else:
                 snr = max(snr, 1.8)
-            bgr = max(bgr, 0.10)
-            iso = max(iso, 0.42)
-            circ = max(circ, 0.32)
+            bgr = max(bgr, 0.06)
+            iso = max(iso, 0.30)
+            fp_c = np.array([f.get("circularity", 1.0) for f in fp], dtype=float)
+            tp_c = np.array([f.get("circularity", 1.0) for f in (tp or fn)], dtype=float)
+            if tp_c.size and fp_c.size and float(np.median(fp_c)) < float(np.median(tp_c)) - 0.06:
+                circ = float(np.clip(
+                    0.5 * (float(np.median(fp_c)) + float(np.percentile(tp_c, 25))),
+                    0.30, 0.75,
+                ))
+            elif n_fn == 0:
+                circ = max(circ, 0.30)
             settings["blob_reject_tissue_edge"] = 1
-            # Slight thr raise if many FPs
+            fp_area = np.array([f.get("area", 0) for f in fp], dtype=float)
+            tp_area = np.array([f.get("area", 0) for f in tp], dtype=float)
+            if tp_area.size >= 2 and fp_area.size >= 2 and float(np.median(fp_area)) > 1.4 * float(np.median(tp_area)):
+                # FPs are oversized (merged worms) — tighten overlap / max area
+                settings["blob_overlap"] = round(
+                    max(float(settings.get("blob_overlap", 0.5) or 0.5), 0.82), 2
+                )
+                if not settings.get("_area_tune_preserved"):
+                    settings["blob_max_area"] = int(
+                        max(settings.get("blob_min_area", 8) + 8, round(float(np.percentile(tp_area, 90)) * 1.4))
+                    )
             if n_fp >= n_tp + n_fn and n_fp >= 3:
                 settings["blob_threshold"] = float(
                     min(0.2, settings.get("blob_threshold", 0.05) * 1.1 + 0.005)
                 )
 
-        # False negatives → more sensitive / denser packing
+        # False negatives → more sensitive / more space-aware packing
         if n_fn >= 2:
             settings["blob_threshold"] = float(
                 max(0.01, settings.get("blob_threshold", 0.05) * 0.85)
             )
             if snr > 2.0:
                 snr = max(1.4, snr - 0.5)
-            pack = max(pack, 0.8)
-            free = min(free, 0.25)
+            pack = max(pack, 0.75)
+            # If FNs sit close to TPs, cells are packed — ease spacing.
+            # If FNs are isolated, do not slam free_space to 0.25.
+            try:
+                fn_xy = np.array([[f["x_orig"], f["y_orig"]] for f in fn], dtype=float)
+                tp_xy = np.array([[f["x_orig"], f["y_orig"]] for f in tp], dtype=float) if tp else fn_xy
+                if len(fn_xy) and len(tp_xy):
+                    from scipy.spatial import cKDTree
+                    dmin = cKDTree(tp_xy).query(fn_xy, k=1)[0]
+                    med_d = float(np.median(dmin))
+                    med_r = float(np.median([f.get("radius", 5) for f in (fn + tp)]))
+                    if med_d < 2.6 * max(med_r, 3.0):
+                        free = min(free, 0.28)
+                        pack = max(pack, 0.85)
+                    else:
+                        free = min(free, 0.45)
+            except Exception:
+                free = min(free, 0.30)
             settings["adaptive_enabled"] = 1
             settings["adaptive_dual_pass"] = 1
             settings["adaptive_sensitivity"] = min(
@@ -9163,15 +12806,22 @@ class PDFViewer:
                 snr = float(settings.get("blob_min_local_snr", 0) or 0)
                 settings["blob_min_local_snr"] = round(max(snr, 1.8), 2)
                 settings["blob_bg_relative"] = round(
-                    max(float(settings.get("blob_bg_relative", 0) or 0), 0.12), 3
+                    max(float(settings.get("blob_bg_relative", 0) or 0), 0.06), 3
                 )
                 settings["blob_min_isotropy"] = round(
-                    max(float(settings.get("blob_min_isotropy", 0) or 0), 0.42), 2
+                    max(float(settings.get("blob_min_isotropy", 0) or 0), 0.28), 2
                 )
                 settings["blob_min_circularity"] = round(
-                    max(float(settings.get("blob_min_circularity", 0) or 0), 0.32), 2
+                    max(float(settings.get("blob_min_circularity", 0) or 0), 0.25), 2
                 )
                 settings["blob_reject_tissue_edge"] = 1
+                # Cap / ease prior over-strict edge-line sessions
+                settings["blob_tissue_margin"] = min(
+                    int(settings.get("blob_tissue_margin", 0) or 0), 8
+                )
+                if float(settings.get("blob_max_elongation", 0) or 0) > 0:
+                    settings["blob_max_elongation"] = 0.0
+                # Do not force max_elongation — optional manual edge-line tool only
                 settings["adaptive_enabled"] = 1
                 settings["adaptive_dual_pass"] = 1
                 # Mild thr raise from current if not already raised
@@ -9194,6 +12844,19 @@ class PDFViewer:
                     settings["blob_min_local_snr"] = round(max(1.5, snr - 0.5), 2)
         except Exception as e:
             logger.warning(f"Measure tune confusion refine failed: {e}", exc_info=True)
+
+        try:
+            roi = self._labeled_region_bool_mask()
+            if roi is not None and samples:
+                n_in = 0
+                for s in samples:
+                    xx, yy = int(s.get("x", -1)), int(s.get("y", -1))
+                    if 0 <= yy < roi.shape[0] and 0 <= xx < roi.shape[1] and roi[yy, xx]:
+                        n_in += 1
+                if n_in >= max(2, int(0.6 * len(samples))):
+                    self.blob_labeled_regions_only.set(True)
+        except Exception:
+            pass
 
         # Area Tune wins for size bounds — Measure Tune must not overwrite them
         settings = self._preserve_area_tune_in_settings(settings)
@@ -9273,6 +12936,8 @@ class PDFViewer:
             f"Local SNR: {settings.get('blob_min_local_snr')}\n"
             f"BG relative: {settings.get('blob_bg_relative')}  "
             f"Isotropy: {settings.get('blob_min_isotropy')}\n"
+            f"Tissue margin: {settings.get('blob_tissue_margin')}  "
+            f"Max elongation: {settings.get('blob_max_elongation')}\n"
             f"Packing: {settings.get('adaptive_packing')}  "
             f"Free space: {settings.get('blob_free_space')}\n\n"
             f"Validation: pos LoG keep {100 * diag.get('cell_keep_frac', 0):.0f}%  |  "
@@ -9790,8 +13455,11 @@ class PDFViewer:
     # SMART SUGGEST — multi-scale LoG analysis of the whole image
     # ==================================================================
 
-    def _analyze_current_detection(self, progress=None):
+    def _analyze_current_detection(self, progress=None, target="A"):
         """Analyze image + current detection; propose coordinated blob settings.
+
+        target: "A" or "B" — which Dual Settings config to read/write.
+        Config B is fit only from regions assigned to B.
 
         Improvements:
         - Counts real objects (connected components), not mask pixels
@@ -9809,6 +13477,11 @@ class PDFViewer:
             except Exception:
                 pass
 
+        try:
+            self._commit_mask_settings_entries()
+        except Exception:
+            pass
+
         bg_src = self._working_background_pil()
         if bg_src is None:
             self._last_smart_suggest_error = (
@@ -9817,7 +13490,21 @@ class PDFViewer:
             )
             return None
 
-        cfg = self.image_processor.cell_config
+        target = "B" if str(target).upper().strip() == "B" else "A"
+        dual = False
+        try:
+            dual = bool(self.dual_settings_mode.get())
+        except Exception:
+            dual = False
+        if target == "B":
+            if not dual:
+                self._last_smart_suggest_error = (
+                    "Smart Suggest B requires Dual Settings Mode."
+                )
+                return None
+            cfg = self._ensure_cell_config_b()
+        else:
+            cfg = self.image_processor.cell_config
         pcfg = self.image_processor.preprocess_config
 
         _prog(5, "Preparing preprocessed image…")
@@ -9831,11 +13518,105 @@ class PDFViewer:
         mp = (h * w) / 1_000_000.0
         orig_mp = (bg_src.size[0] * bg_src.size[1]) / 1e6
 
+        labeled_only = False
+        try:
+            labeled_only = bool(self.smart_suggest_labeled_only.get())
+        except Exception:
+            labeled_only = False
+        # Dual: always scope B to B-regions; scope A to A-regions (and unlabeled
+        # unless Labeled regions only is checked).
+        group_scoped = bool(dual)
+        if target == "B":
+            labeled_only = True
+            group_scoped = True
+        roi_an = None
+        roi_native = None
+        labeled_px = 0
+        if labeled_only or group_scoped:
+            if dual or target == "B":
+                include_unlab = (target == "A") and not labeled_only
+                roi_native = self._criteria_region_bool_mask(
+                    which=target, include_unlabeled=include_unlab
+                )
+                if roi_native is None or int(roi_native.sum()) < 48:
+                    if target == "B":
+                        self._last_smart_suggest_error = (
+                            "Smart Suggest B: no labeled regions are assigned to Config B.\n\n"
+                            "In Atlas Manager, select a region and press B, then try again."
+                        )
+                    else:
+                        self._last_smart_suggest_error = (
+                            "Smart Suggest A: no Config A regions to fit "
+                            "(and Labeled regions only is on, so unlabeled tissue is ignored).\n\n"
+                            "Assign regions to A or uncheck Labeled regions only."
+                        )
+                    return None
+                labeled_px = int(roi_native.sum())
+                roi_an = self._criteria_region_bool_mask(
+                    which=target, target_hw=img.shape, include_unlabeled=include_unlab
+                )
+            else:
+                roi_native = self._labeled_region_bool_mask()
+                if roi_native is None or int(roi_native.sum()) < 48:
+                    self._last_smart_suggest_error = (
+                        "Labeled regions only is checked, but no painted or atlas "
+                        "regions are defined (or they are too small).\n\n"
+                        "Paint and name regions first, or uncheck Labeled regions only."
+                    )
+                    return None
+                labeled_px = int(roi_native.sum())
+                roi_an = self._labeled_region_bool_mask(img.shape)
+            if roi_an is None or int(roi_an.sum()) < 32:
+                self._last_smart_suggest_error = (
+                    "Could not map the Config %s regions onto the analysis image."
+                    % target
+                )
+                return None
+            try:
+                vals = img[roi_an]
+                p1, p99 = float(np.percentile(vals, 1)), float(np.percentile(vals, 99))
+                if p99 > p1:
+                    img = np.clip((img - p1) / (p99 - p1 + 1e-8), 0.0, 1.0)
+            except Exception:
+                pass
+
         _prog(15, "Running current cell detection…")
         try:
             bg = bg_src.convert("L")
-            _, auto_labels = binary_mask_cell_count(bg, processor=self.image_processor)
-            current_mask = np.asarray(auto_labels, dtype=bool).squeeze()
+            if dual:
+                arr = np.array(bg)
+                bh, bw = arr.shape[:2]
+                zm = self._labeled_region_id_mask(bh, bw)
+                zm_a = zm_b = b_pix = None
+                if zm is not None:
+                    zm_a, zm_b, b_pix = self._split_zone_masks_ab(zm)
+                if target == "B":
+                    zone_mask = zm_b
+                    clip = True
+                else:
+                    zone_mask = zm_a
+                    clip = bool(labeled_only)
+                auto_labels = self._run_config_detection_for_suggest(
+                    bg, cfg, zone_mask, clip
+                )
+                current_mask = np.asarray(auto_labels, dtype=bool).squeeze()
+                if target == "A" and b_pix is not None and not clip:
+                    current_mask = current_mask.copy()
+                    current_mask[b_pix] = False
+            else:
+                _, auto_labels = self._run_cell_detection(bg)
+                current_mask = np.asarray(auto_labels, dtype=bool).squeeze()
+            if roi_native is not None:
+                if roi_native.shape != current_mask.shape:
+                    roi_native = np.array(
+                        Image.fromarray(
+                            (roi_native.astype(np.uint8) * 255), mode="L"
+                        ).resize(
+                            (current_mask.shape[1], current_mask.shape[0]),
+                            Image.NEAREST,
+                        )
+                    ) > 0
+                current_mask = current_mask & roi_native
         except Exception as e:
             logger.error(f"Analysis failed during detection: {e}", exc_info=True)
             self._last_smart_suggest_error = (
@@ -9846,7 +13627,10 @@ class PDFViewer:
         _prog(35, "Measuring detected objects…")
         obj = self._count_mask_objects(current_mask)
         n_det = obj["n"]
-        density = n_det / max(orig_mp, 1e-6)
+        if labeled_px > 0:
+            density = n_det / max(float(labeled_px) / 1_000_000.0, 1e-6)
+        else:
+            density = n_det / max(orig_mp, 1e-6)
 
         smin = max(0.8, float(cfg.blob_min_sigma) / scale * 0.7)
         smax = max(smin + 1.0, float(cfg.blob_max_sigma) / scale * 1.2)
@@ -9858,8 +13642,9 @@ class PDFViewer:
         )
 
         _prog(78, "Finding LoG peaks…")
-        log_bg = float(np.median(log_max))
-        log_mad = float(np.median(np.abs(log_max - log_bg))) + 1e-8
+        log_for_stats = log_max[roi_an] if roi_an is not None else log_max
+        log_bg = float(np.median(log_for_stats))
+        log_mad = float(np.median(np.abs(log_for_stats - log_bg))) + 1e-8
         peak_thr_strict = log_bg + 6.0 * 1.4826 * log_mad
         peak_thr_loose = log_bg + 3.5 * 1.4826 * log_mad
 
@@ -9872,18 +13657,32 @@ class PDFViewer:
         coords_l, vals_l, _sigs_l = self._find_log_peaks(
             log_max, best_sigma, min_distance=min_dist, threshold=peak_thr_loose, max_peaks=6000
         )
+        if roi_an is not None:
+            if len(coords_s):
+                inside_s = roi_an[coords_s[:, 0], coords_s[:, 1]]
+                coords_s, vals_s, sigs_s = (
+                    coords_s[inside_s], vals_s[inside_s], sigs_s[inside_s]
+                )
+            if len(coords_l):
+                inside_l = roi_an[coords_l[:, 0], coords_l[:, 1]]
+                coords_l, vals_l = coords_l[inside_l], vals_l[inside_l]
         n_peaks_strict = len(coords_s)
         n_peaks_loose = len(coords_l)
 
         if n_peaks_strict > 0:
             cy, cx = coords_s[:, 0], coords_s[:, 1]
             cell_int = img[cy, cx]
-            flat = log_max.ravel()
+            if roi_an is not None:
+                flat = log_max[roi_an].ravel()
+                img_flat = img[roi_an].ravel()
+            else:
+                flat = log_max.ravel()
+                img_flat = img.ravel()
             thr_bg = float(np.percentile(flat, 40))
             bg_idx = np.where(flat <= thr_bg)[0]
             if len(bg_idx) > 2000:
                 bg_idx = np.random.choice(bg_idx, 2000, replace=False)
-            bg_vals = img.ravel()[bg_idx] if len(bg_idx) else np.array([0.0])
+            bg_vals = img_flat[bg_idx] if len(bg_idx) else np.array([0.0])
             mean_cell = float(np.mean(cell_int))
             mean_bg = float(np.mean(bg_vals))
             contrast = mean_cell - mean_bg
@@ -9977,7 +13776,7 @@ class PDFViewer:
             if n_peaks_loose > n_peaks_strict:
                 noise_like = float(np.percentile(vals_l, 30))
             else:
-                noise_like = float(np.percentile(log_max, 80))
+                noise_like = float(np.percentile(log_for_stats, 80))
             if weak_cell > noise_like:
                 prop_thr = noise_like + 0.3 * (weak_cell - noise_like)
             else:
@@ -9997,8 +13796,24 @@ class PDFViewer:
             current_mask,
             scale,
             typ_r_an=typ_r_an,
+            roi_mask=roi_an,
         )
         recipe = region.get("recipe") or "balanced"
+
+        _prog(90, "Auditing mask errors (worms / speckle / packed misses)…")
+        audit = {}
+        try:
+            audit = self._smart_suggest_error_audit(
+                img, current_mask, coords_s, scale, roi=roi_an, typ_r=typ_r_an
+            )
+        except Exception as e:
+            logger.debug(f"Smart Suggest error audit skipped: {e}")
+            audit = {"confident": False, "flags": {}, "summary": "", "recipe": recipe}
+        if audit.get("confident") and audit.get("recipe") not in (None, "balanced"):
+            recipe = audit.get("recipe") or recipe
+            if audit.get("summary"):
+                region["summary"] = audit["summary"]
+                region["recipe"] = recipe
 
         _prog(92, "Building suggestions…")
         suggestions = []
@@ -10038,7 +13853,198 @@ class PDFViewer:
                 "priority": priority,
             })
 
-        if blob_family and recipe in (
+        flags = (audit or {}).get("flags") or {}
+        audit_confident = bool((audit or {}).get("confident"))
+        used_error_audit = False
+        if blob_family and audit_confident and any(flags.values()):
+            used_error_audit = True
+            skip_global_thr = True
+            why = (audit or {}).get("summary") or "Mask error audit"
+            has_worms = bool(flags.get("worms"))
+            has_speckle = bool(flags.get("speckle") or flags.get("sparse_fp"))
+            field_sparse = bool(flags.get("field_sparse"))
+            has_packed_fn = bool(flags.get("packed_fn")) and not field_sparse
+            has_sparse_fn = bool(flags.get("sparse_fn"))
+            if field_sparse:
+                # Sparse ROI (e.g. yellow AHA): never apply packed packing knobs.
+                _sug(
+                    "adaptive_packing",
+                    cur_pack,
+                    round(min(cur_pack, 0.35), 2),
+                    why + " Spacing is sparse — keep packing loose (small sigma ≠ packed).",
+                    0,
+                )
+                _sug(
+                    "blob_free_space",
+                    cur_free,
+                    round(max(cur_free, 0.52), 2),
+                    why + " More free space so sparse nuclei do not share one disk.",
+                    0,
+                )
+                if cur_snr < 1.15:
+                    _sug(
+                        "blob_min_local_snr",
+                        cur_snr,
+                        1.35,
+                        why + " Sparse field: mild SNR against neuropil grain.",
+                        0,
+                    )
+            if not adaptive_on and (has_packed_fn or has_speckle or region.get("high_bg_over")):
+                _sug(
+                    "adaptive_enabled",
+                    int(getattr(cfg, "adaptive_enabled", 0) or 0),
+                    1,
+                    why + " Enable Adaptive so packed and sparse tissue can use local stats.",
+                    0,
+                )
+            if cur_dual == 0 and (has_packed_fn or has_speckle):
+                _sug("adaptive_dual_pass", cur_dual, 1, why + " Dual-pass for mixed density.", 0)
+            # SNR: never sledgehammer packed misses
+            if has_packed_fn and has_speckle:
+                if cur_snr > 1.7:
+                    _sug(
+                        "blob_min_local_snr",
+                        cur_snr,
+                        1.25,
+                        why + " Lower SNR so packed nuclei survive; speckle handled by size/BG gates.",
+                        0,
+                    )
+                elif cur_snr < 0.8:
+                    _sug(
+                        "blob_min_local_snr",
+                        cur_snr,
+                        1.15,
+                        why + " Mild SNR only — packed clusters cannot tolerate a high floor.",
+                        0,
+                    )
+            elif has_packed_fn and cur_snr > 1.6:
+                _sug(
+                    "blob_min_local_snr",
+                    cur_snr,
+                    round(max(1.0, min(1.35, cur_snr - 0.5)), 2),
+                    why + " Ease SNR to recover packed neighbors.",
+                    0,
+                )
+            elif has_speckle and not has_packed_fn and cur_snr < 1.3:
+                _sug(
+                    "blob_min_local_snr",
+                    cur_snr,
+                    1.45,
+                    why + " Mild SNR against sparse high-BG grain.",
+                    0,
+                )
+            if has_packed_fn:
+                _sug(
+                    "adaptive_packing",
+                    cur_pack,
+                    round(max(cur_pack, 0.82), 2),
+                    why + " Allow tighter placement in true clusters.",
+                    0,
+                )
+                if has_worms:
+                    free_t = float(np.clip(cur_free if cur_free > 0.2 else 0.35, 0.28, 0.42))
+                    _sug(
+                        "blob_free_space",
+                        cur_free,
+                        round(free_t, 2),
+                        why + " Keep some space so merged worms can split, without sparse-field packing.",
+                        0,
+                    )
+                else:
+                    _sug(
+                        "blob_free_space",
+                        cur_free,
+                        round(min(cur_free, 0.28), 2),
+                        why + " Lower free-space so packed cells can place.",
+                        0,
+                    )
+                _sug(
+                    "blob_cluster_recover",
+                    int(getattr(cfg, "blob_cluster_recover", 1) or 0),
+                    1,
+                    why + " Recover dim members next to a bright cluster seed.",
+                    1,
+                )
+            if has_worms:
+                cur_elon = float(getattr(cfg, "blob_max_elongation", 0.0) or 0.0)
+                elon_t = 2.3 if not has_packed_fn else 2.6
+                if cur_elon <= 0 or cur_elon > elon_t + 0.15:
+                    _sug(
+                        "blob_max_elongation",
+                        cur_elon,
+                        elon_t,
+                        why + " Cap elongation so fused worms split; packed nuclei stay under ~2.5.",
+                        0,
+                    )
+                cur_circ = float(getattr(cfg, "blob_min_circularity", 0.0) or 0.0)
+                circ_t = 0.32 if has_packed_fn else 0.38
+                if cur_circ < 0.22 or cur_circ > 0.5:
+                    _sug(
+                        "blob_min_circularity",
+                        cur_circ,
+                        circ_t,
+                        why + " Mild circularity (not 0.55+) so packed nuclei are not wiped.",
+                        0,
+                    )
+                med_a = float((audit or {}).get("median_area") or 0) or float(obj.get("median_area") or 0)
+                if med_a > 0 and not used_area_tune:
+                    max_t = int(max(cfg.blob_min_area + 12, round(med_a * 1.7)))
+                    if int(cfg.blob_max_area) > max_t * 1.15:
+                        _sug(
+                            "blob_max_area",
+                            cfg.blob_max_area,
+                            max_t,
+                            why + " Lower max area so merged doublets cannot stay one object.",
+                            0,
+                        )
+                ov = float(getattr(cfg, "blob_overlap", 0.5) or 0.5)
+                if ov < 0.72:
+                    _sug(
+                        "blob_overlap",
+                        ov,
+                        0.78,
+                        why + " Higher overlap keeps neighboring peaks from fusing into one oval.",
+                        1,
+                    )
+            if has_speckle:
+                cur_bgr = float(getattr(cfg, "blob_bg_relative", 0.0) or 0.0)
+                if cur_bgr < 0.07:
+                    _sug(
+                        "blob_bg_relative",
+                        cur_bgr,
+                        0.08 if not has_packed_fn else 0.06,
+                        why + " Require peak to beat local median (high-BG grain).",
+                        0,
+                    )
+                if not used_area_tune and int(cfg.blob_min_area) < max(8, int(round(prop_min_area * 0.9))):
+                    min_t = int(max(cfg.blob_min_area, min(prop_min_area, 18)))
+                    _sug(
+                        "blob_min_area",
+                        cfg.blob_min_area,
+                        min_t,
+                        why + " Raise min area to drop speckle without touching real nuclei.",
+                        0,
+                    )
+            if has_sparse_fn and not has_speckle:
+                thr_t = min(float(cfg.blob_threshold), max(0.02, min(prop_thr, float(cfg.blob_threshold) * 0.85)))
+                _sug(
+                    "blob_threshold",
+                    cfg.blob_threshold,
+                    round(float(thr_t), 4),
+                    why + " Slightly lower threshold for isolated missed cells.",
+                    1,
+                )
+            elif has_packed_fn:
+                thr_t = min(float(cfg.blob_threshold), max(0.02, float(cfg.blob_threshold) * 0.92))
+                _sug(
+                    "blob_threshold",
+                    cfg.blob_threshold,
+                    round(float(thr_t), 4),
+                    why + " Do not raise threshold — packed misses need sensitivity.",
+                    1,
+                )
+
+        if blob_family and not used_error_audit and recipe in (
             "mixed_both", "high_bg_fp", "low_bg_fn", "recover_clusters",
             "global_over", "global_under",
         ):
@@ -10046,34 +14052,46 @@ class PDFViewer:
             H = region.get("high") or {}
             L = region.get("low") or {}
 
-            # Quality gates that help high-BG FPs and tissue-edge junk
+            # Quality gates for high-BG FPs / edge junk — mild targets so recall survives
             def _sug_quality_for_fp():
                 cur_iso = float(getattr(cfg, "blob_min_isotropy", 0.0) or 0.0)
                 cur_circ = float(getattr(cfg, "blob_min_circularity", 0.0) or 0.0)
                 cur_bgr = float(getattr(cfg, "blob_bg_relative", 0.0) or 0.0)
                 cur_edge = int(getattr(cfg, "blob_reject_tissue_edge", 1) or 0)
-                if cur_iso < 0.4:
+                cur_margin = int(getattr(cfg, "blob_tissue_margin", 0) or 0)
+                # Edge-line tools stay optional — do not auto-raise margin/elongation
+                if cur_iso < 0.25:
                     _sug(
                         "blob_min_isotropy",
                         cur_iso,
-                        0.45,
-                        "Reject non-round peaks (tissue edges / fibers) via radial symmetry.",
-                        1,
+                        0.30,
+                        "Mild radial-symmetry gate against one-sided edge peaks.",
+                        2,
                     )
-                if cur_circ < 0.3:
+                if cur_circ < 0.22:
                     _sug(
                         "blob_min_circularity",
                         cur_circ,
-                        0.35,
-                        "Reject elongated edge-of-tissue detections.",
-                        1,
+                        0.28,
+                        "Mild shape gate against very elongated edge detections.",
+                        2,
                     )
-                if cur_bgr < 0.1:
+                if cur_bgr < 0.04:
                     _sug(
                         "blob_bg_relative",
                         cur_bgr,
-                        0.12,
-                        "Peak must exceed local median — kills high-BG texture false positives.",
+                        0.06,
+                        "Peak must exceed local median slightly — light high-BG clutter filter.",
+                        2,
+                    )
+                # If margin was previously cranked high, offer to ease it
+                if cur_margin > 10:
+                    _sug(
+                        "blob_tissue_margin",
+                        cur_margin,
+                        0,
+                        "Large tissue margin can erase real cells — reset to 0, then "
+                        "raise only if bright edge lines return (try 6–12).",
                         1,
                     )
                 if cur_edge == 0:
@@ -10097,19 +14115,19 @@ class PDFViewer:
                     )
                 if cur_dual == 0:
                     _sug("adaptive_dual_pass", cur_dual, 1, rsum + " Dual-pass required for mixed BG.", 0)
-                target_snr = 2.0
-                if cur_snr < 1.2:
-                    target_snr = 2.0
-                elif cur_snr > 2.8:
-                    target_snr = 2.0
+                # Mild mixed SNR — 2.0+ floors were wiping dim cluster cells
+                if cur_snr < 1.0:
+                    target_snr = 1.4
+                elif cur_snr > 2.5:
+                    target_snr = 1.6
                 else:
-                    target_snr = float(np.clip(cur_snr, 1.6, 2.4))
+                    target_snr = float(np.clip(cur_snr, 1.2, 1.9))
                 _sug(
                     "blob_min_local_snr",
                     cur_snr,
                     round(target_snr, 2),
                     (
-                        f"{rsum} Target local SNR≈{target_snr:.1f}: high enough for bright-tile "
+                        f"{rsum} Target local SNR≈{target_snr:.1f}: enough for bright-tile "
                         "clutter, low enough for real cluster cells."
                     ),
                     0,
@@ -10168,28 +14186,29 @@ class PDFViewer:
                     )
                 if cur_dual == 0:
                     _sug("adaptive_dual_pass", cur_dual, 1, rsum, 0)
-                target_snr = max(cur_snr, 2.2 if H.get("det_density", 0) > 150 else 1.9)
-                target_snr = float(np.clip(target_snr, 1.8, 3.2))
+                # Mild SNR only — prior 1.9–3.2 floors wiped real cells
+                target_snr = max(cur_snr, 1.5 if H.get("det_density", 0) > 150 else 1.3)
+                target_snr = float(np.clip(target_snr, 1.2, 2.2))
                 _sug(
                     "blob_min_local_snr",
                     cur_snr,
                     round(target_snr, 2),
-                    f"{rsum} Require local SNR≥{target_snr:.1f} so peaks must beat their surround.",
+                    f"{rsum} Mild local SNR≈{target_snr:.1f} (peaks beat surround without killing dim cells).",
                     0,
                 )
                 _sug_quality_for_fp()
-                thr_t = max(float(cfg.blob_threshold), min(0.10, max(prop_thr, float(cfg.blob_threshold) + 0.01)))
+                thr_t = max(float(cfg.blob_threshold), min(0.08, max(prop_thr, float(cfg.blob_threshold) + 0.005)))
                 _sug(
                     "blob_threshold",
                     cfg.blob_threshold,
                     round(float(thr_t), 4),
-                    "Mild thr raise; prefer isotropy/BG-relative gates over killing dark cells.",
+                    "Mild thr raise; prefer quality gates over killing dark cells.",
                     1,
                 )
                 _sug(
                     "adaptive_sensitivity",
                     cur_sens,
-                    round(min(3.0, max(cur_sens, 1.1)), 2),
+                    round(min(2.0, max(cur_sens, 1.05)), 2),
                     "Slightly stricter tile thresholds on bright background.",
                     1,
                 )
@@ -10244,15 +14263,52 @@ class PDFViewer:
                     "Allow much tighter cell placement in clusters.",
                     1,
                 )
-                # Slightly ease isotropy if over-filtering real irregular cells
+                # Ease over-strict quality gates that wipe detections (edge-line
+                # filters must not starve recall on dark/mid fields).
                 cur_iso = float(getattr(cfg, "blob_min_isotropy", 0.0) or 0.0)
-                if cur_iso > 0.55:
+                if cur_iso > 0.42:
                     _sug(
                         "blob_min_isotropy",
                         cur_iso,
-                        0.4,
-                        "Slightly ease isotropy so real cluster cells are not rejected.",
-                        2,
+                        0.32,
+                        "Ease isotropy so real cluster cells are not rejected.",
+                        1,
+                    )
+                cur_circ = float(getattr(cfg, "blob_min_circularity", 0.0) or 0.0)
+                if cur_circ > 0.38:
+                    _sug(
+                        "blob_min_circularity",
+                        cur_circ,
+                        0.28,
+                        "Ease circularity — over-strict shape filters hide true cells.",
+                        1,
+                    )
+                cur_bgr = float(getattr(cfg, "blob_bg_relative", 0.0) or 0.0)
+                if cur_bgr > 0.10:
+                    _sug(
+                        "blob_bg_relative",
+                        cur_bgr,
+                        0.06,
+                        "Ease BG-relative gate for dimmer real cells.",
+                        1,
+                    )
+                cur_margin = int(getattr(cfg, "blob_tissue_margin", 0) or 0)
+                if cur_margin > 8:
+                    _sug(
+                        "blob_tissue_margin",
+                        cur_margin,
+                        4,
+                        "Shrink tissue margin — large values can erase cells near the section edge.",
+                        1,
+                    )
+                cur_elon = float(getattr(cfg, "blob_max_elongation", 0.0) or 0.0)
+                if cur_elon > 0 and cur_elon < 3.5:
+                    _sug(
+                        "blob_max_elongation",
+                        cur_elon,
+                        0,
+                        "Turn off max-elongation for recall (re-enable ~3.0 only for edge-line FPs).",
+                        1,
                     )
                 if cur_peak_i > 0.05:
                     _sug(
@@ -10274,12 +14330,30 @@ class PDFViewer:
                 skip_global_thr = True
                 thr_t = min(float(cfg.blob_threshold), max(0.02, min(prop_thr, float(cfg.blob_threshold) * 0.8)))
                 _sug("blob_threshold", cfg.blob_threshold, round(float(thr_t), 4), rsum, 1)
-                if cur_snr > 2.5:
+                if cur_snr > 1.8:
                     _sug(
                         "blob_min_local_snr",
                         cur_snr,
-                        round(max(1.5, cur_snr - 0.8), 2),
-                        rsum + " SNR may be too strict globally.",
+                        round(max(0.0, cur_snr - 1.0), 2) if cur_snr > 2.5 else round(max(1.0, cur_snr - 0.6), 2),
+                        rsum + " SNR may be too strict — ease to recover cells.",
+                        0,
+                    )
+                cur_elon = float(getattr(cfg, "blob_max_elongation", 0.0) or 0.0)
+                if cur_elon > 0:
+                    _sug(
+                        "blob_max_elongation",
+                        cur_elon,
+                        0,
+                        "Turn off elongation gate while recovering under-detection.",
+                        1,
+                    )
+                cur_margin = int(getattr(cfg, "blob_tissue_margin", 0) or 0)
+                if cur_margin > 8:
+                    _sug(
+                        "blob_tissue_margin",
+                        cur_margin,
+                        4,
+                        "Shrink tissue margin while recovering under-detection.",
                         1,
                     )
 
@@ -10433,7 +14507,7 @@ class PDFViewer:
         # ------------------------------------------------------------------
         # Adaptive indicators (mixed background / density non-uniformity)
         # ------------------------------------------------------------------
-        def _tile_bg_stats(arr2d):
+        def _tile_bg_stats(arr2d, roi=None):
             """Return (bg_cv, bg_span, p90_span, half_contrast) for a 2D image."""
             ah, aw = arr2d.shape[:2]
             n_ty = max(3, min(8, ah // 80))
@@ -10443,7 +14517,14 @@ class PDFViewer:
             meds, p90s = [], []
             for y0 in range(0, ah, tsy):
                 for x0 in range(0, aw, tsx):
-                    patch = arr2d[y0:min(ah, y0 + tsy), x0:min(aw, x0 + tsx)]
+                    y1 = min(ah, y0 + tsy)
+                    x1 = min(aw, x0 + tsx)
+                    patch = arr2d[y0:y1, x0:x1]
+                    if roi is not None:
+                        rpatch = roi[y0:y1, x0:x1]
+                        if int(rpatch.sum()) < 64:
+                            continue
+                        patch = patch[rpatch]
                     if patch.size < 64:
                         continue
                     meds.append(float(np.median(patch)))
@@ -10457,27 +14538,47 @@ class PDFViewer:
             p90sp = float(np.max(p90s) - np.min(p90s))
             # Half-plane contrast (catches bright vs dark halves)
             mid_y, mid_x = ah // 2, aw // 2
-            halves = [
-                float(np.median(arr2d[:mid_y, :])),
-                float(np.median(arr2d[mid_y:, :])),
-                float(np.median(arr2d[:, :mid_x])),
-                float(np.median(arr2d[:, mid_x:])),
+            slices = [
+                (slice(None, mid_y), slice(None)),
+                (slice(mid_y, None), slice(None)),
+                (slice(None), slice(None, mid_x)),
+                (slice(None), slice(mid_x, None)),
             ]
-            half_c = float(max(halves) - min(halves))
+            halves = []
+            for sl in slices:
+                if roi is not None:
+                    m = roi[sl]
+                    if int(m.sum()) < 64:
+                        continue
+                    halves.append(float(np.median(arr2d[sl][m])))
+                else:
+                    halves.append(float(np.median(arr2d[sl])))
+            half_c = float(max(halves) - min(halves)) if halves else 0.0
             return cv, span, p90sp, half_c
 
         # Preprocessed analysis image
-        bg_cv, bg_span, p90_span, half_c = _tile_bg_stats(img)
+        bg_cv, bg_span, p90_span, half_c = _tile_bg_stats(img, roi=roi_an)
         # Raw TIFF (preprocess can flatten BG — raw often shows true non-uniformity)
         try:
             raw = np.asarray(bg_src.convert("L"), dtype=np.float64)
             if raw.size > 0 and raw.max() > raw.min():
                 raw_n = (raw - raw.min()) / (raw.max() - raw.min())
+                raw_roi = roi_native
                 # Downsample large raw for speed
                 step = max(1, int(round(max(raw_n.shape) / 1200.0)))
                 if step > 1:
                     raw_n = raw_n[::step, ::step]
-                r_cv, r_span, r_p90, r_half = _tile_bg_stats(raw_n)
+                    if raw_roi is not None and raw_roi.shape[:2] == tuple(
+                        np.asarray(bg_src.convert("L")).shape[:2]
+                    ):
+                        raw_roi = raw_roi[::step, ::step]
+                if raw_roi is not None and raw_roi.shape[:2] != raw_n.shape[:2]:
+                    raw_roi = np.array(
+                        Image.fromarray(
+                            (raw_roi.astype(np.uint8) * 255), mode="L"
+                        ).resize((raw_n.shape[1], raw_n.shape[0]), Image.NEAREST)
+                    ) > 0
+                r_cv, r_span, r_p90, r_half = _tile_bg_stats(raw_n, roi=raw_roi)
                 bg_cv = max(bg_cv, r_cv)
                 bg_span = max(bg_span, r_span)
                 p90_span = max(p90_span, r_p90)
@@ -10486,7 +14587,7 @@ class PDFViewer:
             pass
         # LoG response spatial variation (high when dim vs bright cells differ)
         try:
-            log_cv, log_span, _, log_half = _tile_bg_stats(log_max)
+            log_cv, log_span, _, log_half = _tile_bg_stats(log_max, roi=roi_an)
         except Exception:
             log_cv, log_span, log_half = 0.0, 0.0, 0.0
 
@@ -10817,7 +14918,18 @@ class PDFViewer:
                     "priority": 3,
                 })
 
-        if cfg.blob_min_circularity > 0.75 and obj["n"] > 0:
+        if cfg.blob_min_circularity > 0.55:
+            suggestions.append({
+                "param": "blob_min_circularity",
+                "current": cfg.blob_min_circularity,
+                "suggested": 0.35,
+                "reason": (
+                    "Circularity ≥ 0.6 drops packed nuclei (neighbors merge in the local "
+                    "patch). 0.35 still rejects fibers without wiping lcl/lcr clusters."
+                ),
+                "priority": 1,
+            })
+        elif cfg.blob_min_circularity > 0.75 and obj["n"] > 0:
             med_c = float(np.median(obj["circularities"])) if len(obj["circularities"]) else 1.0
             if med_c < cfg.blob_min_circularity:
                 suggestions.append({
@@ -10830,6 +14942,25 @@ class PDFViewer:
                     ),
                     "priority": 3,
                 })
+
+        try:
+            page = getattr(self, "current_page", 0)
+            zm = (getattr(self, "mask_images", None) or {}).get(page)
+            has_paint = zm is not None and int(np.array(zm).max()) > 0
+        except Exception:
+            has_paint = False
+        if has_paint and int(getattr(cfg, "adaptive_region_mode", 0) or 0) == 0:
+            suggestions.append({
+                "param": "adaptive_region_mode",
+                "current": int(getattr(cfg, "adaptive_region_mode", 0) or 0),
+                "suggested": 1,
+                "reason": (
+                    "Painted regions are defined. Region mode 1 detects only inside "
+                    "those ROIs (lcl vs lcr get their own thresholds) and skips "
+                    "dark-field grain outside the paint."
+                ),
+                "priority": 0,
+            })
 
         if n_det < 15 and n_peaks_loose < 20 and snr < 2 and not skip_global_thr:
             suggestions.append({
@@ -10893,6 +15024,9 @@ class PDFViewer:
             recommended_preset["adaptive_dual_pass"] = int(
                 recommended_preset.get("adaptive_dual_pass") or 1
             )
+        if labeled_only:
+            recommended_preset["adaptive_enabled"] = 1
+            recommended_preset["adaptive_region_mode"] = 1
 
         # Snapshot for trajectory on next Smart Suggest run
         try:
@@ -10968,10 +15102,23 @@ class PDFViewer:
             },
             "suggestions": suggestions,
             "recommended_preset": recommended_preset,
+            "labeled_only": bool(labeled_only),
+            "labeled_pixels": int(labeled_px),
+            "target": target,
+            "error_audit_summary": (audit or {}).get("summary") or "",
         }
 
-    def _show_smart_suggest_dialog(self):
-        """Show Smart Suggest analysis with optional apply + live mask refresh."""
+    def _show_smart_suggest_dialog(self, target="A"):
+        """Show Smart Suggest analysis with optional apply + live mask refresh.
+
+        target: "A" (Config A / default) or "B" (Config B regions only).
+        """
+        target = "B" if str(target).upper().strip() == "B" else "A"
+        cfg_target = (
+            self._ensure_cell_config_b()
+            if target == "B"
+            else self.image_processor.cell_config
+        )
         self._last_smart_suggest_error = None
         if self._working_background_pil() is None:
             messagebox.showerror(
@@ -10981,6 +15128,44 @@ class PDFViewer:
                 "Open a TIFF from the File Browser or File → Import TIFF, then try again.",
             )
             return
+        try:
+            if target == "B":
+                if not bool(self.dual_settings_mode.get()):
+                    messagebox.showinfo(
+                        "Smart Suggest B",
+                        "Turn on Dual Settings Mode first, assign regions to Config B "
+                        "(select a region and press B), then run Smart Suggest B.",
+                    )
+                    return
+                bmask = self._criteria_region_bool_mask(which="B", include_unlabeled=False)
+                if bmask is None or int(bmask.sum()) < 48:
+                    messagebox.showwarning(
+                        "Smart Suggest B",
+                        "No labeled regions are assigned to Config B.\n\n"
+                        "In Atlas Manager, select a region and press B, then try again.",
+                    )
+                    return
+            elif bool(self.smart_suggest_labeled_only.get()):
+                lab = self._labeled_region_bool_mask()
+                if lab is None or int(lab.sum()) < 48:
+                    messagebox.showwarning(
+                        "Smart Suggest",
+                        "Labeled regions only is checked, but no painted or atlas "
+                        "regions are defined.\n\n"
+                        "Paint and name regions (or load an atlas) first, or uncheck "
+                        "Labeled regions only to use the whole image.",
+                    )
+                    return
+        except Exception:
+            pass
+
+        # Commit typed Mask Settings values so the recipe is built from
+        # what is on screen, not a stale cell_config.
+        try:
+            self._commit_mask_settings_entries()
+            self.image_processor._detect_cache = None
+        except Exception:
+            pass
 
         # Visible progress so the UI does not look frozen during analysis
         progress = None
@@ -10991,7 +15176,9 @@ class PDFViewer:
                 self.master.config(cursor="watch")
             except Exception:
                 pass
-            progress = self._show_busy_dialog("Smart Suggest")
+            progress = self._show_busy_dialog(
+                "Smart Suggest B" if target == "B" else "Smart Suggest"
+            )
             progress.set_progress(2, "Starting analysis…")
             try:
                 # Force an immediate paint so the bar appears before heavy work
@@ -11000,7 +15187,7 @@ class PDFViewer:
             except Exception:
                 pass
 
-            analysis = self._analyze_current_detection(progress=progress)
+            analysis = self._analyze_current_detection(progress=progress, target=target)
 
             if progress and not getattr(progress, 'closed', False):
                 progress.set_progress(100, "Done")
@@ -11037,12 +15224,12 @@ class PDFViewer:
         suggestions = analysis["suggestions"]
 
         dialog = Toplevel(self.master)
-        dialog.title("Smart Suggest")
+        dialog.title("Smart Suggest — Config B" if target == "B" else "Smart Suggest — Config A")
         dialog.geometry("680x560")
         dialog.attributes('-topmost', 'true')
         self._register_transparent_window(dialog)
 
-        cfg_m = self.image_processor.cell_config
+        cfg_m = cfg_target
         method = (cfg_m.detection_method or "blob").lower().strip()
         adaptive_on = int(getattr(cfg_m, "adaptive_enabled", 0) or 0) != 0 or method == "adaptive"
         if method == "dog":
@@ -11058,7 +15245,9 @@ class PDFViewer:
             method_note = f"{method_note} + Adaptive"
         ttk.Label(
             dialog,
-            text=f"Smart Suggest — multi-scale analysis (active method: {method_note})",
+            text=(
+                f"Smart Suggest — Config {target}  (method: {method_note})"
+            ),
             font=("Helvetica", 11, "bold"),
         ).pack(pady=(10, 4))
 
@@ -11087,8 +15276,32 @@ class PDFViewer:
             "global_over": "Global over-detection",
             "global_under": "Global under-detection",
             "balanced": "Balanced",
+            "merged_worms": "Merged / worm-shaped cells",
+            "sparse_fp": "Tiny speckle / sparse false positives",
+            "packed_fn": "Missed cells in packed clusters",
+            "packed_fn_sparse_fp": "Packed misses + sparse false positives",
+            "merged_and_packed": "Merged cells and missed packed neighbors",
+            "sparse_field": "Sparse field (large gaps; small cells are not packed)",
         }
         recipe_line = f"Recipe: {recipe_labels.get(recipe, recipe)}"
+        if analysis.get("error_audit_summary"):
+            recipe_line = analysis["error_audit_summary"] + "\n" + recipe_line
+        lp = int(analysis.get("labeled_pixels") or 0)
+        if target == "B":
+            recipe_line = (
+                f"Scope: Config B regions only ({lp:,} px) — Config A ignored\n"
+                + recipe_line
+            )
+        elif analysis.get("labeled_only"):
+            recipe_line = (
+                f"Scope: Config A labeled regions ({lp:,} px) — unlabeled tissue ignored\n"
+                + recipe_line
+            )
+        elif lp > 0:
+            recipe_line = (
+                f"Scope: Config A regions + unlabeled ({lp:,} px) — Config B ignored\n"
+                + recipe_line
+            )
         if rd.get("summary"):
             recipe_line += f"\n{rd['summary']}"
         if rd.get("high_peaks") is not None:
@@ -11148,7 +15361,7 @@ class PDFViewer:
         button_frame.pack(fill='x', padx=10, pady=10)
 
         def apply_suggestion(sugg):
-            cfg = self.image_processor.cell_config
+            cfg = cfg_target
             pcfg = self.image_processor.preprocess_config
             param = sugg['param']
             value = sugg['suggested']
@@ -11175,26 +15388,57 @@ class PDFViewer:
                 if param in (
                     "adaptive_enabled",
                     "adaptive_dual_pass",
+                    "adaptive_region_mode",
                     "blob_reject_tissue_edge",
+                    "blob_tissue_margin",
+                    "blob_exclude_border",
                 ):
                     try:
                         value = int(value)
                     except Exception:
                         value = 1 if value else 0
+                else:
+                    try:
+                        value = _coerce_config_value(cfg, param, value)
+                    except Exception:
+                        pass
                 setattr(cfg, param, value)
 
         def _record_applied_recipe():
-            cfg = self.image_processor.cell_config
+            cfg = cfg_target
             try:
                 hist = list(getattr(self, "_smart_suggest_history", []) or [])
                 hist.append({
                     "recipe": recipe,
+                    "target": target,
                     "blob_min_local_snr": float(getattr(cfg, "blob_min_local_snr", 0) or 0),
                     "blob_threshold": float(getattr(cfg, "blob_threshold", 0) or 0),
                     "adaptive_enabled": int(getattr(cfg, "adaptive_enabled", 0) or 0),
                     "applied": True,
                 })
                 self._smart_suggest_history = hist[-8:]
+            except Exception:
+                pass
+
+        def _apply_and_refresh_mask():
+            """Write applied values into Mask Settings boxes, then re-detect."""
+            try:
+                self.image_processor._detect_cache = None
+            except Exception:
+                pass
+            try:
+                self._clear_manual_cell_edits()
+            except Exception:
+                pass
+            try:
+                self._reload_open_mask_settings()
+            except Exception:
+                try:
+                    self._sync_mask_settings_entries_from_config()
+                except Exception:
+                    pass
+            try:
+                self.show_cell_mask_threshold(calculate=True)
             except Exception:
                 pass
 
@@ -11208,13 +15452,11 @@ class PDFViewer:
                 _record_applied_recipe()
             dialog.destroy()
             if applied > 0:
-                try:
-                    self.show_cell_mask_threshold(calculate=True)
-                except Exception:
-                    pass
+                _apply_and_refresh_mask()
                 messagebox.showinfo(
                     "Smart Suggest",
-                    f"Applied {applied} change(s) and refreshed the mask.\n"
+                    f"Applied {applied} change(s) to Config {target} and refreshed the mask.\n"
+                    f"Manual Add/Remove Cell edits were cleared.\n"
                     f"(Recipe: {recipe_labels.get(recipe, recipe)})",
                 )
 
@@ -11223,28 +15465,23 @@ class PDFViewer:
                 apply_suggestion(sugg)
             _record_applied_recipe()
             dialog.destroy()
-            try:
-                self.show_cell_mask_threshold(calculate=True)
-            except Exception:
-                pass
+            _apply_and_refresh_mask()
             messagebox.showinfo(
                 "Smart Suggest",
-                f"Applied all suggestions and refreshed the mask.\n"
+                f"Applied all suggestions to Config {target} and refreshed the mask.\n"
+                f"Manual Add/Remove Cell edits were cleared.\n"
                 f"(Recipe: {recipe_labels.get(recipe, recipe)})",
             )
 
         def apply_recommended_preset():
             preset = analysis.get("recommended_preset") or {}
-            self._apply_blob_settings_dict(preset)
+            self._apply_blob_settings_dict(preset, config=cfg_target)
             _record_applied_recipe()
             dialog.destroy()
-            try:
-                self.show_cell_mask_threshold(calculate=True)
-            except Exception:
-                pass
+            _apply_and_refresh_mask()
             messagebox.showinfo(
                 "Smart Suggest",
-                "Applied the full regional + LoG recommended preset and refreshed the mask.\n\n"
+                f"Applied the full recommended preset to Config {target} and refreshed the mask.\n\n"
                 f"Recipe: {recipe_labels.get(recipe, recipe)}\n"
                 f"sigma {preset.get('blob_min_sigma')}–{preset.get('blob_max_sigma')}, "
                 f"thr={preset.get('blob_threshold')}, "
@@ -11438,7 +15675,7 @@ class PDFViewer:
 
         meta = {
             "format_version": 1,
-            "barcc_version": "8.09.000",
+            "barcc_version": "8.10.000",
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "purpose": "Parameters used to generate the cell mask and regional counts",
             "source": {
@@ -11457,6 +15694,9 @@ class PDFViewer:
             },
             "detection_method": cfg.detection_method,
             "cell_detection": dict(cfg.__dict__),
+            "cell_detection_B": dict(getattr(self.image_processor, "cell_config_b", cfg).__dict__),
+            "dual_settings_mode": bool(self.dual_settings_mode.get()) if hasattr(self, "dual_settings_mode") else False,
+            "zone_criteria": self._serialize_zone_criteria(page=self.current_page),
             "preprocessing": dict(pcfg.__dict__),
             "manual_mask_edits": {
                 "manual_add_cells": bool(has_manual_add),
@@ -11490,6 +15730,247 @@ class PDFViewer:
             logger.error(f"Failed to save mask metadata: {e}")
             return None
 
+    def _channel_neutral_stem(self, base_name):
+        stem = str(base_name or "")
+        for suffix in (
+            "_ch0", "_ch1", "_ch2", "_ch3", "_c0", "_c1", "_c2", "_c3",
+            "-ch0", "-ch1", "-ch2", "-ch3",
+        ):
+            if stem.lower().endswith(suffix):
+                return stem[: -len(suffix)]
+        return stem
+
+    def _newest_existing_file(self, paths):
+        existing = [p for p in paths if p and os.path.isfile(p)]
+        if not existing:
+            return None
+        existing.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return existing[0]
+
+    def _find_named_artifacts(self, directory, names):
+        """Newest existing file among ``names`` in image folder + output feature dirs."""
+        if not directory:
+            return None
+        candidates = []
+        search = [directory] + list(self._artifact_search_dirs(directory) or [])
+        seen = set()
+        for d in search:
+            if not d or not os.path.isdir(d):
+                continue
+            key = self._norm_path(d)
+            if key in seen:
+                continue
+            seen.add(key)
+            for n in names:
+                candidates.append(os.path.join(d, n))
+        return self._newest_existing_file(candidates)
+
+    def _find_last_count_artifacts(self, tiff_path):
+        """Locate paint / cell mask / metadata written by the last Count Cells for this TIFF."""
+        empty = {"paint": None, "mask": None, "metadata": None, "counts": None}
+        if not tiff_path:
+            return empty
+        directory = os.path.dirname(tiff_path)
+        base = os.path.splitext(os.path.basename(tiff_path))[0]
+        stem = self._channel_neutral_stem(base)
+        bases = [base] if stem == base else [base, stem]
+
+        paint_names = []
+        mask_names = []
+        meta_names = []
+        count_names = []
+        for b in bases:
+            paint_names.extend(
+                [
+                    f"{b}_paint_with_regions.barccpaint",
+                    f"{b}_paint.png",
+                ]
+            )
+            mask_names.extend(
+                [
+                    f"{b}_cellmask.barccmask",
+                    f"{b}_cellmask.png",
+                ]
+            )
+            meta_names.append(f"{b}_metadata.json")
+            count_names.extend([f"{b}.xlsx", f"{b}.csv", f"{b}_counts.xlsx", f"{b}_counts.csv"])
+
+        art = {
+            "paint": self._find_named_artifacts(directory, paint_names),
+            "mask": self._find_named_artifacts(directory, mask_names),
+            "metadata": self._find_named_artifacts(directory, meta_names),
+            "counts": self._find_named_artifacts(directory, count_names),
+        }
+
+        # Prefer explicit paths recorded in metadata.outputs
+        meta_path = art.get("metadata")
+        if meta_path:
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f) or {}
+                outputs = meta.get("outputs") or {}
+                for key, dest in (
+                    ("paint_file", "paint"),
+                    ("cell_mask_file", "mask"),
+                    ("counts_file", "counts"),
+                ):
+                    p = outputs.get(key)
+                    if p and os.path.isfile(p) and not art.get(dest):
+                        art[dest] = p
+                    elif p and os.path.isfile(p):
+                        # metadata pointer wins if newer or dest empty
+                        if dest != "mask" or not art.get(dest):
+                            art[dest] = p
+                # If count saved a cell mask path, prefer it
+                cm = outputs.get("cell_mask_file")
+                if cm and os.path.isfile(cm):
+                    art["mask"] = cm
+            except Exception as e:
+                logger.debug(f"Could not read count metadata {meta_path}: {e}")
+        return art
+
+    def _save_count_session_cell_mask(self, out_dir, base_name, final_cell_mask):
+        """Write a reloadable binary cell mask next to count outputs. Returns path or None."""
+        if not out_dir or not base_name or final_cell_mask is None:
+            return None
+        try:
+            arr = np.asarray(final_cell_mask)
+            if arr.ndim > 2:
+                arr = arr.squeeze()
+            binary = arr > 0
+            img = self._bool_mask_to_l_image(binary)
+            png_path = os.path.join(out_dir, f"{base_name}_cellmask.png")
+            img.save(png_path)
+            # Also under cell_masks/ for Cell → Load Cell Mask
+            try:
+                tiff_dir = self.tiff_dir or self.current_tiff_directory
+                cm_dir = self._get_output_directory(tiff_dir, feature="cell_masks") if tiff_dir else None
+                if cm_dir:
+                    img.save(os.path.join(cm_dir, f"{base_name}_cellmask.png"))
+            except Exception:
+                pass
+            logger.info(f"Count session cell mask saved: {png_path}")
+            return png_path
+        except Exception as e:
+            logger.error(f"Failed to save count session cell mask: {e}")
+            return None
+
+    def reload_last_count_session(self, tiff_path=None, show_messages=True):
+        """Restore paint, cell mask, and detection config from the last Count Cells save.
+
+        ``tiff_path`` defaults to the currently open TIFF (or the File Browser selection).
+        """
+        path = tiff_path or getattr(self, "current_tiff_path", None)
+        if not path:
+            try:
+                sel = self.tiff_tree.selection() if hasattr(self, "tiff_tree") else None
+                if sel:
+                    path = self._file_browser_row_path(sel[0])
+            except Exception:
+                path = None
+        if not path or not os.path.isfile(path):
+            if show_messages:
+                messagebox.showinfo(
+                    "Reload Last Count",
+                    "Open a TIFF (or right-click one in the File Browser) that has "
+                    "already been counted.",
+                )
+            return False
+
+        art = self._find_last_count_artifacts(path)
+        if not any(art.get(k) for k in ("paint", "mask", "metadata")):
+            if show_messages:
+                messagebox.showinfo(
+                    "Reload Last Count",
+                    "No saved count session found for this image.\n\n"
+                    "Run Cell → Counting → Count Cells first. BARCC writes paint, "
+                    "cell mask, and metadata under output/.",
+                )
+            return False
+
+        # Load the TIFF if it is not already the current image
+        try:
+            cur = getattr(self, "current_tiff_path", None)
+            if not cur or self._norm_path(cur) != self._norm_path(path):
+                self._load_tiff_file(path, preserve_atlas=False)
+        except Exception as e:
+            if show_messages:
+                messagebox.showerror("Reload Last Count", f"Could not load TIFF:\n{e}")
+            return False
+
+        loaded = []
+        errors = []
+
+        if art.get("metadata"):
+            try:
+                with open(art["metadata"], "r", encoding="utf-8") as f:
+                    meta = json.load(f) or {}
+                self._apply_detection_settings_data(meta)
+                loaded.append(f"Config: {os.path.basename(art['metadata'])}")
+                try:
+                    self._reload_open_mask_settings()
+                except Exception:
+                    pass
+            except Exception as e:
+                errors.append(f"Config: {e}")
+                logger.error(f"Reload config failed: {e}", exc_info=True)
+
+        if art.get("paint"):
+            try:
+                p = art["paint"]
+                if p.lower().endswith(".barccpaint"):
+                    self._load_barccpaint_bundle(p, show_messages=False)
+                else:
+                    self.img = Image.open(p)
+                    loaded_rgba = self.img.convert("RGBA") if self.img.mode != "RGBA" else self.img
+                    self.paint_layer = loaded_rgba
+                    self.atlas_filetype = "img"
+                    self.show_page()
+                loaded.append(f"Paint: {os.path.basename(p)}")
+            except Exception as e:
+                errors.append(f"Paint: {e}")
+                logger.error(f"Reload paint failed: {e}", exc_info=True)
+
+        if art.get("mask"):
+            try:
+                ok = self.load_cell_mask(path=art["mask"], show_messages=False)
+                if ok:
+                    loaded.append(f"Mask: {os.path.basename(art['mask'])}")
+                else:
+                    errors.append("Mask: failed to apply")
+            except Exception as e:
+                errors.append(f"Mask: {e}")
+                logger.error(f"Reload mask failed: {e}", exc_info=True)
+
+        if art.get("counts"):
+            try:
+                cp = art["counts"]
+                if cp.lower().endswith((".xlsx", ".xls")):
+                    self.last_df = pd.read_excel(cp, sheet_name=0)
+                else:
+                    self.last_df = pd.read_csv(cp)
+                try:
+                    self._refresh_zone_counts_table()
+                except Exception:
+                    pass
+                loaded.append(f"Counts: {os.path.basename(cp)}")
+            except Exception as e:
+                logger.debug(f"Reload counts table skipped: {e}")
+
+        if show_messages:
+            body = "Restored from last Count Cells save:\n\n" + (
+                "\n".join(f"  • {x}" for x in loaded) if loaded else "  (nothing applied)"
+            )
+            if errors:
+                body += "\n\nCould not restore:\n" + "\n".join(f"  • {x}" for x in errors)
+            if art.get("mask"):
+                body += (
+                    "\n\nCell mask is locked (Count Cells will not re-detect). "
+                    "Use Cell → Show Mask to re-detect if needed."
+                )
+            messagebox.showinfo("Reload Last Count", body)
+        return bool(loaded)
+
     def _binary_mask_to_boundary_ring(self, binary_mask, thickness=2):
         """Convert a filled binary mask into open 'donut' rings (boundary only).
 
@@ -11499,25 +15980,43 @@ class PDFViewer:
         binary = np.asarray(binary_mask)
         if binary.ndim > 2:
             binary = binary.squeeze()
-        binary = binary > 0
-        if binary.ndim != 2 or not binary.any():
-            return np.zeros_like(binary, dtype=bool)
+        if binary.ndim != 2:
+            return np.zeros((1, 1), dtype=bool)
 
         thickness = int(max(1, thickness))
         try:
-            # Label so each blob gets its own closed boundary
-            labels = measure.label(binary, connectivity=2)
+            # Integer label maps already have one id per cell — do not collapse
+            # touching disks into one component (that drew "worms").
+            if np.issubdtype(binary.dtype, np.integer) and int(np.max(binary)) > 1:
+                labels = binary
+                if not np.any(labels > 0):
+                    return np.zeros(labels.shape, dtype=bool)
+            else:
+                bw = binary > 0
+                if not bw.any():
+                    return np.zeros_like(bw, dtype=bool)
+                # 4-connected: diagonal contact is not a merge
+                labels = measure.label(bw, connectivity=1)
             # Inner boundaries of labeled regions (open hole in middle)
             ring = segmentation.find_boundaries(labels, mode='inner', background=0)
             if thickness > 1:
-                # Thicken the outline slightly for visibility
                 ring = morphology.binary_dilation(ring, footprint=disk(thickness - 1))
-            # Tiny objects that vanish under inner boundary: fall back to outer boundary
-            covered = measure.label(ring, connectivity=2)
-            for zid in range(1, labels.max() + 1):
-                blob = labels == zid
-                if not np.any(ring & blob):
-                    ring |= segmentation.find_boundaries(blob.astype(np.uint8), mode='outer')
+            # Only repair ids that have area but no ring pixels (tiny objects)
+            nlab = int(labels.max())
+            if nlab > 0:
+                counts = np.bincount(labels.ravel(), minlength=nlab + 1)
+                if np.any(ring):
+                    hits = np.bincount(labels[ring].ravel(), minlength=nlab + 1)
+                else:
+                    hits = np.zeros(nlab + 1, dtype=np.int64)
+                missing = np.flatnonzero((counts > 0) & (hits == 0))
+                for zid in missing:
+                    if zid == 0:
+                        continue
+                    blob = labels == zid
+                    ring |= segmentation.find_boundaries(
+                        blob.astype(np.uint8), mode="outer"
+                    )
             return ring.astype(bool)
         except Exception as e:
             logger.debug(f"Boundary ring fallback: {e}")
@@ -11621,9 +16120,13 @@ class PDFViewer:
             config_data = self._collect_mask_generation_metadata()
             # Keep portable settings export compatible with import_detection_settings
             config_data = {
-                "version": config_data.get("barcc_version", "8.09.000"),
+                "version": config_data.get("barcc_version", "8.10.000"),
                 "detection_method": self.image_processor.cell_config.detection_method,
                 "cell_detection": self.image_processor.cell_config.__dict__.copy(),
+                "cell_detection_B": getattr(
+                    self.image_processor, "cell_config_b", self.image_processor.cell_config
+                ).__dict__.copy(),
+                "dual_settings_mode": bool(self.dual_settings_mode.get()),
                 "preprocessing": self.image_processor.preprocess_config.__dict__.copy(),
             }
 
@@ -11634,6 +16137,64 @@ class PDFViewer:
 
         except Exception as e:
             messagebox.showerror("Export Failed", f"Could not export settings:\n{e}")
+
+    def _apply_detection_settings_data(self, data):
+        """Apply cell detection + preprocessing dict (export JSON or count metadata)."""
+        if not data:
+            return False
+        cell = data.get("cell_detection") or {}
+        if "detection_method" in data:
+            dm = data["detection_method"]
+            if str(dm).lower().strip() == "adaptive":
+                self.image_processor.cell_config.adaptive_enabled = 1
+                base = (
+                    cell.get("adaptive_base_method")
+                    or getattr(self.image_processor.cell_config, "adaptive_base_method", "blob")
+                )
+                base = str(base).lower().strip()
+                self.image_processor.cell_config.detection_method = (
+                    base if base in ("blob", "dog", "log") else "blob"
+                )
+            else:
+                self.image_processor.cell_config.detection_method = dm
+
+        _apply_cell_config_dict(self.image_processor.cell_config, cell)
+        if data.get("cell_detection_B"):
+            self._ensure_cell_config_b()
+            _apply_cell_config_dict(
+                self.image_processor.cell_config_b, data.get("cell_detection_B")
+            )
+            self.image_processor._cell_config_b_loaded = True
+        if "dual_settings_mode" in data:
+            try:
+                self.dual_settings_mode.set(bool(data.get("dual_settings_mode")))
+                self.image_processor.dual_settings_mode_pref = bool(
+                    data.get("dual_settings_mode")
+                )
+            except Exception:
+                pass
+
+        cfg_imp = self.image_processor.cell_config
+        if (cfg_imp.detection_method or "").lower().strip() == "adaptive":
+            cfg_imp.adaptive_enabled = 1
+            base = (getattr(cfg_imp, "adaptive_base_method", None) or "blob").lower().strip()
+            cfg_imp.detection_method = base if base in ("blob", "dog", "log") else "blob"
+
+        pcfg = self.image_processor.preprocess_config
+        for key, value in (data.get("preprocessing") or {}).items():
+            if hasattr(pcfg, key):
+                setattr(pcfg, key, value)
+        try:
+            zc = data.get("zone_criteria")
+            if zc:
+                self._ingest_zone_criteria(zc, page=self.current_page, merge=True)
+        except Exception:
+            pass
+        try:
+            clear_preprocess_cache()
+        except Exception:
+            pass
+        return True
 
     def import_detection_settings(self):
         """Load cell detection + preprocessing settings from a user-chosen JSON file."""
@@ -11649,38 +16210,11 @@ class PDFViewer:
             with open(file_path, "r") as f:
                 data = json.load(f)
 
-            # Apply detection method if present
-            if "detection_method" in data:
-                dm = data["detection_method"]
-                if str(dm).lower().strip() == "adaptive":
-                    self.image_processor.cell_config.adaptive_enabled = 1
-                    base = (
-                        data.get("cell_detection", {}).get("adaptive_base_method")
-                        or getattr(self.image_processor.cell_config, "adaptive_base_method", "blob")
-                    )
-                    base = str(base).lower().strip()
-                    self.image_processor.cell_config.detection_method = (
-                        base if base in ("blob", "dog", "log") else "blob"
-                    )
-                else:
-                    self.image_processor.cell_config.detection_method = dm
-
-            # Apply cell detection config
-            for key, value in data.get("cell_detection", {}).items():
-                if hasattr(self.image_processor.cell_config, key):
-                    setattr(self.image_processor.cell_config, key, value)
-
-            # Normalize legacy adaptive-as-method after full cell_detection apply
-            cfg_imp = self.image_processor.cell_config
-            if (cfg_imp.detection_method or "").lower().strip() == "adaptive":
-                cfg_imp.adaptive_enabled = 1
-                base = (getattr(cfg_imp, "adaptive_base_method", None) or "blob").lower().strip()
-                cfg_imp.detection_method = base if base in ("blob", "dog", "log") else "blob"
-
-            # Apply preprocessing config
-            for key, value in data.get("preprocessing", {}).items():
-                if hasattr(self.image_processor.preprocess_config, key):
-                    setattr(self.image_processor.preprocess_config, key, value)
+            self._apply_detection_settings_data(data)
+            try:
+                self._reload_open_mask_settings()
+            except Exception:
+                pass
 
             messagebox.showinfo("Import Successful", "Settings imported successfully.\n\nThe Mask Settings dialog will now close so the new values can be applied.")
             # Close the current Mask Settings window so the user sees the effect when they reopen it
@@ -11717,6 +16251,10 @@ class PDFViewer:
 
         preset_data = {
             "cell_detection": self.image_processor.cell_config.__dict__.copy(),
+            "cell_detection_B": getattr(
+                self.image_processor, "cell_config_b", self.image_processor.cell_config
+            ).__dict__.copy(),
+            "dual_settings_mode": bool(self.dual_settings_mode.get()),
             "preprocessing": self.image_processor.preprocess_config.__dict__.copy(),
         }
         presets[name] = preset_data
@@ -11734,6 +16272,20 @@ class PDFViewer:
             for key, value in data.get("cell_detection", {}).items():
                 if hasattr(self.image_processor.cell_config, key):
                     setattr(self.image_processor.cell_config, key, value)
+            if data.get("cell_detection_B"):
+                self._ensure_cell_config_b()
+                _apply_cell_config_dict(
+                    self.image_processor.cell_config_b, data.get("cell_detection_B")
+                )
+                self.image_processor._cell_config_b_loaded = True
+            if "dual_settings_mode" in data:
+                try:
+                    self.dual_settings_mode.set(bool(data.get("dual_settings_mode")))
+                    self.image_processor.dual_settings_mode_pref = bool(
+                        data.get("dual_settings_mode")
+                    )
+                except Exception:
+                    pass
 
             for key, value in data.get("preprocessing", {}).items():
                 if hasattr(self.image_processor.preprocess_config, key):
@@ -11826,12 +16378,24 @@ class PDFViewer:
         self.state_manager.save_state(self)
 
     def undo(self, event=None):
-        """Undo the last user action. Can be called repeatedly."""
-        self.state_manager.undo(self)
+        """Undo the last user action, including Add Cell / Remove Cell."""
+        was_editing = bool(getattr(self, "editing_mask", False))
+        add_mode = bool(getattr(self, "mask_edit_add", True))
+        splitting = bool(getattr(self, "splitting_cells", False))
+        ok = self.state_manager.undo(self)
+        if ok and was_editing and not splitting:
+            try:
+                self.mask_overlay_layer = None
+                self._add_cell_photos = []
+                self.start_mask_edit(add=add_mode)
+            except Exception as e:
+                logger.debug(f"mask-edit rebind after undo skipped: {e}")
+        return ok
 
     def _undo_event(self, event=None):
         """Keyboard handler (Ctrl+Z)."""
         self.undo(event)
+        return "break"
 
     # ------------------------------------------------------------------
     # ZOOM FEATURE
@@ -11887,21 +16451,23 @@ class PDFViewer:
         self.view_scale = new_scale
         self._invalidate_bg_display_cache()
 
-        # Redraw, but preserve any active mask overlay so it doesn't disappear on zoom
-        if self.editing_mask and self.current_mask is not None:
-            # Keep detection rings + add/remove paint visible while editing
-            if getattr(self, "splitting_cells", False):
-                try:
-                    self.show_cell_mask_threshold(calculate=False)
-                except Exception:
-                    self.show_page()
+        # Redraw at the new scale. The cell-mask overlay is a cached native-res
+        # layer (same idea as paint_layer), so zoom must NOT rebuild rings or
+        # re-run detection — that both stalled the UI and dropped the overlay.
+        try:
+            need_rebuild = (
+                getattr(self, "showing_auto_mask", False)
+                and getattr(self, "mask_overlay_layer", None) is None
+            )
+            if need_rebuild:
+                self.show_cell_mask_threshold(calculate=False)
             else:
-                self._refresh_mask_edit_display()
-        elif getattr(self, 'showing_auto_mask', False):
-            # Preserve the "Show Mask" / cell detection mask view
-            self.show_cell_mask_threshold(calculate=False)
-        else:
-            self.show_page()
+                self.show_page()
+        except Exception:
+            try:
+                self.show_page()
+            except Exception:
+                pass
 
         # Update scroll region
         self.output.config(scrollregion=self.output.bbox(tk.ALL))
@@ -11920,36 +16486,68 @@ class PDFViewer:
             pass
 
     # ------------------------------------------------------------------
-    # Alt + Drag Panning
+    # Pan (Alt + left-drag, or hold the scroll-wheel / middle button)
     # ------------------------------------------------------------------
+    def _bind_middle_button_pan(self):
+        """Scroll-wheel click-and-drag pans the image (Windows Button-2)."""
+        self.output.bind("<ButtonPress-2>", self._start_pan)
+        self.output.bind("<B2-Motion>", self._do_pan)
+        self.output.bind("<ButtonRelease-2>", self._end_pan)
+
     def _start_pan(self, event):
+        self._pan_active = True
         self._pan_start_x = event.x
         self._pan_start_y = event.y
-        self._pan_start_scrollx = self.output.xview()[0]
-        self._pan_start_scrolly = self.output.yview()[0]
-        self.output.config(cursor="fleur")
+        try:
+            self._pan_prev_cursor = str(self.output.cget("cursor") or "")
+        except Exception:
+            self._pan_prev_cursor = ""
+        try:
+            self.output.scan_mark(event.x, event.y)
+        except Exception:
+            self._pan_start_scrollx = self.output.xview()[0]
+            self._pan_start_scrolly = self.output.yview()[0]
+        try:
+            self.output.config(cursor="fleur")
+        except Exception:
+            pass
+        return "break"
 
     def _do_pan(self, event):
-        if self._pan_start_x is None:
+        if not getattr(self, "_pan_active", False) and self._pan_start_x is None:
             return
-        dx = event.x - self._pan_start_x
-        dy = event.y - self._pan_start_y
-
-        # Convert pixel delta to scroll fraction
-        total_width = self.output.winfo_width()
-        total_height = self.output.winfo_height()
-
-        if total_width > 0:
-            new_x = self._pan_start_scrollx - (dx / total_width)
-            self.output.xview_moveto(new_x)
-        if total_height > 0:
-            new_y = self._pan_start_scrolly - (dy / total_height)
-            self.output.yview_moveto(new_y)
+        try:
+            self.output.scan_dragto(event.x, event.y, gain=1)
+        except Exception:
+            if self._pan_start_x is None:
+                return
+            dx = event.x - self._pan_start_x
+            dy = event.y - self._pan_start_y
+            total_width = self.output.winfo_width()
+            total_height = self.output.winfo_height()
+            if total_width > 0:
+                new_x = getattr(self, "_pan_start_scrollx", 0) - (dx / total_width)
+                self.output.xview_moveto(new_x)
+            if total_height > 0:
+                new_y = getattr(self, "_pan_start_scrolly", 0) - (dy / total_height)
+                self.output.yview_moveto(new_y)
+        return "break"
 
     def _end_pan(self, event):
+        self._pan_active = False
         self._pan_start_x = None
         self._pan_start_y = None
-        self.output.config(cursor="")
+        try:
+            cur = getattr(self, "_pan_prev_cursor", "") or ""
+            if cur in ("fleur", "hand2"):
+                cur = ""
+            self.output.config(cursor=cur)
+        except Exception:
+            try:
+                self.output.config(cursor="")
+            except Exception:
+                pass
+        return "break"
 
     # ------------------------------------------------------------------
     # Coordinate conversion helpers (critical for correct drawing after zoom)
@@ -12172,9 +16770,81 @@ class PDFViewer:
         logger.debug(f"Loaded page image: mode={current_img.mode}, size={current_img.size}")
         return current_img
 
+    def _store_mask_overlay(self, overlay):
+        """Keep a native-res RGBA copy of the cell-mask overlay for zoom-safe redraws."""
+        if overlay is None:
+            return
+        try:
+            if getattr(overlay, "mode", None) != "RGBA":
+                overlay = overlay.convert("RGBA")
+        except Exception:
+            pass
+        self.mask_overlay_layer = overlay
+        self.showing_auto_mask = True
+
+    def _clear_mask_overlay(self):
+        """Drop the on-screen cell-mask overlay (image switch / reset)."""
+        self.showing_auto_mask = False
+        self.mask_overlay_layer = None
+
+    def _mask_overlay_for_view(self, overlay, scale):
+        """Scale the native-res overlay to the current view.
+
+        NEAREST at zoom-in keeps 1px rings crisp. BILINEAR at zoom-out keeps
+        thin rings from vanishing when they occupy less than one destination pixel.
+        """
+        if overlay is None:
+            return None
+        if scale == 1.0:
+            return overlay
+        mw = max(1, int(overlay.width * scale))
+        mh = max(1, int(overlay.height * scale))
+        resample = Image.NEAREST if scale >= 1.0 else Image.BILINEAR
+        return overlay.resize((mw, mh), resample)
+
+    def _on_show_cell_mask_toggled(self):
+        """Ribbon / View: show or hide cell rings without re-detecting."""
+        want = False
+        try:
+            want = bool(self.show_cell_mask.get())
+        except Exception:
+            want = True
+        if want:
+            overlay = getattr(self, "mask_overlay_layer", None)
+            auto = getattr(self, "auto_mask", None)
+            if overlay is None and auto is not None and not isinstance(auto, bool):
+                try:
+                    self.show_cell_mask_threshold(calculate=False)
+                    return
+                except Exception:
+                    pass
+        try:
+            self.show_page()
+        except Exception as e:
+            logger.debug(f"cell-mask toggle redraw skipped: {e}")
+
     def show_page(self, mask=None):
-        if mask is None:
-            self.showing_auto_mask = False
+        # Cell-mask overlay is a persistent layer. Passing an overlay caches it;
+        # a bare show_page() while the mask view is on must keep drawing it
+        # (zoom used to wipe showing_auto_mask and the rings vanished).
+        if mask is not None:
+            self._store_mask_overlay(mask)
+            try:
+                self.show_cell_mask.set(True)
+            except Exception:
+                pass
+        want_mask = True
+        try:
+            want_mask = bool(self.show_cell_mask.get())
+        except Exception:
+            want_mask = True
+        if want_mask:
+            if mask is None:
+                mask = getattr(self, "mask_overlay_layer", None)
+                if mask is None:
+                    self.showing_auto_mask = False
+        else:
+            mask = None
 
         # Deselect region transform target if we've switched pages
         if self.selected_page is not None and self.selected_page != self.current_page:
@@ -12251,21 +16921,17 @@ class PDFViewer:
                                                                tag='paint_layer')
 
             if mask is not None:
-                mask_display = mask
-                if scale != 1.0:
-                    mw = max(1, int(mask_display.width * scale))
-                    mh = max(1, int(mask_display.height * scale))
-                    mask_display = mask_display.resize((mw, mh), Image.NEAREST)
-                self.mask_photo = ImageTk.PhotoImage(mask_display)
-                offset_x = bg_display.width + 10
-                self.bg_mask_photo_id = self.output.create_image(offset_x, 0,
-                                                                image=self.background_photo,
-                                                                anchor='nw',
-                                                                tag='image')
-                self.mask_photo_id = self.output.create_image(0, 0,
-                                                             image=self.mask_photo,
-                                                             anchor='nw',
-                                                             tag='mask')
+                try:
+                    mask_display = self._mask_overlay_for_view(mask, scale)
+                    if mask_display is None:
+                        mask_display = mask
+                    self.mask_photo = ImageTk.PhotoImage(mask_display)
+                    self.mask_photo_id = self.output.create_image(0, 0,
+                                                                 image=self.mask_photo,
+                                                                 anchor='nw',
+                                                                 tag='mask')
+                except Exception as e:
+                    logger.warning(f"Could not draw cell-mask overlay: {e}")
 
         # Scale and place the atlas overlay at the (already scaled) self.img_x / self.img_y
         # Guard: if atlas is the paint content (set by save_paint in stop_paint etc.) and we have
@@ -12295,6 +16961,13 @@ class PDFViewer:
                                    image=self.photo,
                                    anchor='nw',
                                    tag='atlas')
+
+        # Keep cell-mask rings above the atlas so zoom/redraw cannot bury them
+        try:
+            if mask is not None:
+                self.output.tag_raise('mask')
+        except Exception:
+            pass
 
         # Label placement base: atlas overlay offset (or 0 when mask is image-sized)
         try:
@@ -12425,6 +17098,29 @@ class PDFViewer:
                 self._draw_crop_outline()
             except Exception:
                 pass
+
+        # Re-draw landmark alignment points after zoom/show_page (delete("all") clears them)
+        if getattr(self, "atlas_align_active", False):
+            try:
+                self._redraw_atlas_align_markers()
+            except Exception as e:
+                logger.debug(f"Redraw atlas align markers failed: {e}")
+
+        # Re-draw Edge Snap contour overlay after zoom/show_page
+        if getattr(self, "_edge_snap_preview", None):
+            try:
+                self._redraw_edge_snap_overlay()
+            except Exception as e:
+                logger.debug(f"Redraw edge-snap overlay failed: {e}")
+
+        # Re-draw Measure Tune TP/FP/FN/TN markers after zoom
+        if getattr(self, "measure_tune_active", False) and getattr(
+            self, "measure_tune_samples", None
+        ):
+            try:
+                self._redraw_measure_tune_markers()
+            except Exception as e:
+                logger.debug(f"Redraw measure-tune markers failed: {e}")
 
 
     def img_white_to_transparent(self, img):
@@ -13698,15 +18394,15 @@ class PDFViewer:
         return bg_RGBA.resize(new_size, Image.BILINEAR)
 
     def import_tiff(self):
-        """Import a TIFF. Keeps atlas/zones if an atlas is already loaded.
+        """Import a TIFF as a new image.
 
-        Use Atlas → Clear Atlas first if you want a blank session, or
-        File → Next Channel… when switching fluorescence channels deliberately.
+        Paint and atlas from the previous image are cleared. Use File → Next
+        Channel… to keep atlas/paint when switching fluorescence channels.
+        If an Allen/PDF plate is loaded with no TIFF yet, the plate is kept.
         """
         logger.info("Opening file dialog for TIFF selection")
         tiff_path = fd.askopenfilename(filetypes=[("TIFF files", "*.tiff *.tif")])
         if tiff_path:
-            # Auto-preserve when atlas is present (loading TIFF must not wipe a just-loaded Allen plate)
             self._load_tiff_file(tiff_path)
 
     # ------------------------------------------------------------------
@@ -13739,6 +18435,10 @@ class PDFViewer:
                 prefs["last_tiff_directory"] = self.current_tiff_directory
             if getattr(self, "current_tiff_path", None) and os.path.isfile(self.current_tiff_path):
                 prefs["last_tiff_path"] = self.current_tiff_path
+            if getattr(self, "project_output_directory", None):
+                prefs["project_output_directory"] = self.project_output_directory
+            if getattr(self, "project_name", None):
+                prefs["project_name"] = self.project_name
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(prefs, f, indent=2)
         except Exception as e:
@@ -13764,6 +18464,12 @@ class PDFViewer:
                 if last_path and os.path.isfile(last_path):
                     self.current_tiff_path = last_path
                     self._highlight_current_tiff_in_tree()
+            proj_dir = prefs.get("project_output_directory")
+            if proj_dir and os.path.isdir(proj_dir):
+                self.project_output_directory = proj_dir
+            proj_name = prefs.get("project_name")
+            if proj_name:
+                self.project_name = self._sanitize_project_name(str(proj_name))
         except Exception as e:
             logger.debug(f"Failed to restore UI prefs: {e}")
 
@@ -13781,6 +18487,110 @@ class PDFViewer:
             # Force wraplength update after the text is set
             self.file_browser_frame.after(50, self._update_folder_label_wraplength)
 
+    def _sanitize_project_name(self, name):
+        """Filesystem-safe project name without a trailing _Counts or spreadsheet suffix."""
+        name = str(name or "").strip()
+        lower = name.lower()
+        for ext in (".xlsx", ".xls", ".csv"):
+            if lower.endswith(ext):
+                name = name[: -len(ext)].rstrip()
+                lower = name.lower()
+                break
+        suffix = self.PROJECT_COUNTS_OUTPUT_SUFFIX
+        if lower.endswith(suffix.lower()):
+            name = name[: -len(suffix)].rstrip()
+        invalid = '<>:"/\\|?*'
+        name = "".join("_" if c in invalid else c for c in name)
+        return name.strip(" .")
+
+    def _configured_project_counts_path(self):
+        """``{dir}/{project_name}_Counts.xlsx`` when File → Select Project Output Directory was used."""
+        directory = getattr(self, "project_output_directory", None)
+        name = getattr(self, "project_name", None)
+        if not directory or not name:
+            return None
+        return os.path.join(directory, f"{name}{self.PROJECT_COUNTS_OUTPUT_SUFFIX}.xlsx")
+
+    def _is_combined_project_counts_file(self, path):
+        """True for the combined project workbook (legacy or user-named)."""
+        if _is_project_counts_filename(path):
+            return True
+        configured = self._configured_project_counts_path()
+        if not configured or not path:
+            return False
+        return self._norm_path(path) == self._norm_path(configured)
+
+    def select_project_output_directory(self):
+        """Choose where the combined project counts spreadsheet is written.
+
+        Prompts for a folder, then a project name. The file is
+        ``{project name}_Counts.xlsx`` in that folder.
+        """
+        initial = None
+        if self.project_output_directory and os.path.isdir(self.project_output_directory):
+            initial = self.project_output_directory
+        elif self.current_tiff_directory and os.path.isdir(self.current_tiff_directory):
+            initial = self.current_tiff_directory
+        elif self.tiff_dir and os.path.isdir(self.tiff_dir):
+            initial = self.tiff_dir
+
+        directory = fd.askdirectory(
+            title="Select project output directory",
+            initialdir=initial,
+            parent=self.master,
+        )
+        if not directory:
+            return
+
+        suggested = self.project_name or os.path.basename(os.path.normpath(directory))
+        name = simpledialog.askstring(
+            "Project Name",
+            "Enter a name for this project.\n\n"
+            "The combined counts spreadsheet will be saved as:\n"
+            "<project name>_Counts.xlsx\n"
+            f"in:\n{directory}",
+            initialvalue=suggested,
+            parent=self.master,
+        )
+        if name is None:
+            return
+        name = self._sanitize_project_name(name)
+        if not name:
+            messagebox.showerror(
+                "Project Name",
+                "Please enter a project name.",
+                parent=self.master,
+            )
+            return
+
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror(
+                "Project Output Directory",
+                f"Could not use that folder:\n{directory}\n\n{e}",
+                parent=self.master,
+            )
+            return
+
+        self.project_output_directory = directory
+        self.project_name = name
+        self._save_ui_prefs()
+
+        out_path = self._configured_project_counts_path()
+        exists = os.path.isfile(out_path) or os.path.isfile(os.path.splitext(out_path)[0] + ".csv")
+        extra = (
+            "\n\nThat file already exists. New Count Cells results will be added to it."
+            if exists
+            else "\n\nCount Cells will create this file and add each image as a new row."
+        )
+        messagebox.showinfo(
+            "Project Output",
+            f"Project: {name}\n\nCombined counts file:\n{out_path}{extra}",
+            parent=self.master,
+        )
+        logger.info(f"Project output set: {out_path}")
+
     def _is_source_tiff_name(self, filename):
         """True if filename is a source TIFF (exclude BARCC product derivatives)."""
         lower = filename.lower()
@@ -13791,6 +18601,82 @@ class PDFViewer:
             if base.endswith(suffix):
                 return False
         return True
+
+    def _excluded_list_paths(self, directory=None):
+        """Candidate JSON paths for the excluded-image list (read both)."""
+        d = directory or self.current_tiff_directory
+        if not d:
+            return []
+        paths = []
+        out = self._get_output_directory(d, feature=None, create=False)
+        if out:
+            paths.append(os.path.join(out, "barcc_excluded.json"))
+        paths.append(os.path.join(d, "barcc_excluded.json"))
+        return paths
+
+    def _excluded_key(self, tiff_path):
+        """Stable per-folder key: lowercase source filename."""
+        if not tiff_path:
+            return ""
+        return os.path.basename(tiff_path).lower()
+
+    def _is_image_excluded(self, tiff_path):
+        key = self._excluded_key(tiff_path)
+        if not key:
+            return False
+        return key in (getattr(self, "_excluded_images", None) or set())
+
+    def _load_excluded_images(self, directory=None):
+        """Load excluded filenames for the working folder into ``_excluded_images``."""
+        found = set()
+        for path in self._excluded_list_paths(directory):
+            if not path or not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+                names = data.get("excluded") if isinstance(data, dict) else data
+                if isinstance(names, list):
+                    for n in names:
+                        if n:
+                            found.add(os.path.basename(str(n)).lower())
+            except Exception as e:
+                logger.debug(f"Could not read excluded list {path}: {e}")
+        self._excluded_images = found
+        return found
+
+    def _save_excluded_images(self):
+        """Persist excluded filenames next to the working folder (output/barcc_excluded.json)."""
+        d = self.current_tiff_directory
+        if not d or not os.path.isdir(d):
+            return False
+        out_dir = self._get_output_directory(d, feature=None, create=True)
+        path = os.path.join(out_dir or d, "barcc_excluded.json")
+        names = sorted(getattr(self, "_excluded_images", set()) or [])
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"excluded": names}, f, indent=2)
+            return True
+        except Exception as e:
+            logger.warning(f"Could not save excluded list: {e}")
+            return False
+
+    def _set_image_excluded(self, tiff_path, excluded=True):
+        """Mark a source TIFF excluded (or included) and refresh the File Browser."""
+        key = self._excluded_key(tiff_path)
+        if not key:
+            return
+        cur = set(getattr(self, "_excluded_images", set()) or [])
+        if excluded:
+            cur.add(key)
+        else:
+            cur.discard(key)
+        self._excluded_images = cur
+        self._save_excluded_images()
+        try:
+            self.refresh_tiff_file_list()
+        except Exception:
+            pass
 
     def _norm_path(self, path):
         if not path:
@@ -13807,6 +18693,15 @@ class PDFViewer:
         "paint",        # paint layers / .barccpaint
         "flattened",    # flattened composites
     )
+    # Combined counts for every image in the working folder (rows=files, cols=structures)
+    PROJECT_COUNTS_BASENAME = "BARCC_project_counts"
+    PROJECT_COUNTS_SUFFIX = "_project_counts"
+    PROJECT_COUNTS_OUTPUT_SUFFIX = "_Counts"
+    PROJECT_COUNTS_FILE_COL = "File"
+    PROJECT_COUNTS_SHEET = "Project Counts"
+    BRIGHTNESS_MIN = -100
+    BRIGHTNESS_MAX = 400
+    BRIGHTNESS_DEFAULT = 400  # slider maximum; display opens fully boosted
 
     def _get_output_directory(self, base_dir=None, feature=None, create=True):
         """Return <image_dir>/output[/<feature>], optionally creating it.
@@ -13966,6 +18861,8 @@ class PDFViewer:
             for cand in self._counted_result_candidates(base_name):
                 real = files_lower_map.get(cand.lower())
                 if real and real.lower() not in seen:
+                    if self._is_combined_project_counts_file(os.path.join(search_dir, real)):
+                        continue
                     counted_files.append(rel_prefix + real)
                     seen.add(real.lower())
 
@@ -14061,8 +18958,11 @@ class PDFViewer:
         counted = len(counted_files) > 0
         painted = len(paint_files) > 0
         masked = len(masked_files) > 0
+        excluded = self._is_image_excluded(tiff_path)
 
-        if counted and masked:
+        if excluded:
+            label = "Exclude"
+        elif counted and masked:
             label = "Done"
         elif counted:
             label = "Count"
@@ -14075,6 +18975,7 @@ class PDFViewer:
             "counted": counted,
             "painted": painted,
             "masked": masked,
+            "excluded": excluded,
             "status_label": label,
             "counted_files": counted_files,
             "paint_files": paint_files,
@@ -14088,12 +18989,13 @@ class PDFViewer:
     def refresh_tiff_file_list(self):
         """Scan the current directory for source TIFFs and update the Treeview.
 
-        Shows multi-state status (Done / Count / Paint / —) and child artifacts.
+        Shows multi-state status (Done / Count / Paint / Exclude / —) and child artifacts.
         Highlights the currently open TIFF when present.
         """
         if not self.current_tiff_directory or not os.path.isdir(self.current_tiff_directory):
             self._update_folder_progress_summary(0, 0, 0)
             return
+        self._load_excluded_images()
 
         self.tiff_file_list = []
         self._tree_iid_to_path = {}
@@ -14108,6 +19010,7 @@ class PDFViewer:
 
             counted_n = 0
             painted_n = 0
+            excluded_n = 0
 
             if hasattr(self, "tiff_tree"):
                 for item in self.tiff_tree.get_children():
@@ -14116,13 +19019,17 @@ class PDFViewer:
                 for full_path in self.tiff_file_list:
                     filename = os.path.basename(full_path)
                     status = self._get_image_work_status(full_path)
-                    if status["counted"]:
+                    if status.get("excluded"):
+                        excluded_n += 1
+                    if status["counted"] and not status.get("excluded"):
                         counted_n += 1
-                    if status["painted"]:
+                    if status["painted"] and not status.get("excluded"):
                         painted_n += 1
 
                     tags = ()
-                    if status["status_label"] == "Done":
+                    if status["status_label"] == "Exclude":
+                        tags = ("status_exclude",)
+                    elif status["status_label"] == "Done":
                         tags = ("status_done",)
                     elif status["status_label"] == "Count":
                         tags = ("status_count",)
@@ -14156,22 +19063,25 @@ class PDFViewer:
                         self.tiff_tree.insert(iid, "end", text=cand, values=("",), tags=("child",))
 
             total = len(self.tiff_file_list)
-            self._update_folder_progress_summary(counted_n, painted_n, total)
+            self._update_folder_progress_summary(counted_n, painted_n, total, excluded_n=excluded_n)
             self._highlight_current_tiff_in_tree()
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to read directory:\n{e}")
 
-    def _update_folder_progress_summary(self, counted_n, painted_n, total):
-        """Update the progress line: Counted x/y · Painted z · Remaining r."""
+    def _update_folder_progress_summary(self, counted_n, painted_n, total, excluded_n=0):
+        """Update the progress line: Counted x/y · Painted z · Excluded e · Remaining r."""
         if not hasattr(self, "progress_summary_var"):
             return
         if total <= 0:
             self.progress_summary_var.set("No images in folder")
             return
-        remaining = max(0, total - counted_n)
+        excluded_n = int(excluded_n or 0)
+        active = max(0, total - excluded_n)
+        remaining = max(0, active - counted_n)
+        extra = f"  ·  Excluded {excluded_n}" if excluded_n else ""
         self.progress_summary_var.set(
-            f"Counted {counted_n}/{total}  ·  Painted {painted_n}  ·  Remaining {remaining}"
+            f"Counted {counted_n}/{active}  ·  Painted {painted_n}{extra}  ·  Remaining {remaining}"
         )
 
     def _update_folder_label_wraplength(self, event=None):
@@ -14237,6 +19147,77 @@ class PDFViewer:
             self._save_ui_prefs()
         else:
             self.current_tiff_path = tiff_path
+
+    def _file_browser_row_path(self, iid):
+        """Return source TIFF path for a tree row (parent row if a child artifact)."""
+        if not iid:
+            return None
+        parent = self.tiff_tree.parent(iid)
+        key = parent or iid
+        return (getattr(self, "_tree_iid_to_path", {}) or {}).get(key)
+
+    def _on_file_browser_right_click(self, event):
+        """Right-click an image in the File Browser → Exclude / Include."""
+        if not hasattr(self, "tiff_tree"):
+            return
+        try:
+            iid = self.tiff_tree.identify_row(event.y)
+        except Exception:
+            iid = None
+        if not iid:
+            return
+        try:
+            self.tiff_tree.selection_set(iid)
+            self.tiff_tree.focus(iid)
+        except Exception:
+            pass
+        path = self._file_browser_row_path(iid)
+        if not path:
+            return
+        self._file_browser_context_path = path
+        excluded = self._is_image_excluded(path)
+        menu = getattr(self, "_file_browser_context_menu", None)
+        if menu is None:
+            return
+        try:
+            menu.entryconfigure("Exclude", state="disabled" if excluded else "normal")
+            menu.entryconfigure("Include", state="normal" if excluded else "disabled")
+        except Exception:
+            pass
+        try:
+            art = self._find_last_count_artifacts(path)
+            has_session = bool(art.get("paint") or art.get("mask") or art.get("metadata"))
+            menu.entryconfigure(
+                "Reload last count (paint, mask, config)",
+                state="normal" if has_session else "disabled",
+            )
+        except Exception:
+            pass
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
+
+    def _file_browser_exclude_selected(self):
+        path = getattr(self, "_file_browser_context_path", None)
+        if not path:
+            return
+        self._set_image_excluded(path, True)
+
+    def _file_browser_include_selected(self):
+        path = getattr(self, "_file_browser_context_path", None)
+        if not path:
+            return
+        self._set_image_excluded(path, False)
+
+    def _file_browser_reload_last_count(self):
+        path = getattr(self, "_file_browser_context_path", None)
+        if not path:
+            return
+        self.reload_last_count_session(tiff_path=path, show_messages=True)
 
     def load_tiff_from_list(self, event=None):
         """Load the TIFF file that was double-clicked in the file browser Treeview.
@@ -14342,7 +19323,12 @@ class PDFViewer:
 
         if iid in self._tree_iid_to_path:
             full_path = self._tree_iid_to_path[iid]
-            # Preserve atlas if one is loaded (File Browser must not clear Reflect/stitch work)
+            # Already this image — don't wipe paint/atlas on a re-click
+            if getattr(self, "current_tiff_path", None) and self._norm_path(
+                self.current_tiff_path
+            ) == self._norm_path(full_path):
+                return
+            # Different image: drop previous paint + atlas
             self._load_tiff_file(full_path)
 
     def _build_file_browser(self, parent):
@@ -14402,6 +19388,7 @@ class PDFViewer:
             self.tiff_tree.tag_configure("status_done", foreground="#0a7a0a")
             self.tiff_tree.tag_configure("status_count", foreground="#0066aa")
             self.tiff_tree.tag_configure("status_paint", foreground="#b36b00")
+            self.tiff_tree.tag_configure("status_exclude", foreground="#888888")
             self.tiff_tree.tag_configure("child", foreground="#555555")
         except Exception:
             pass
@@ -14409,6 +19396,22 @@ class PDFViewer:
         self.tiff_tree.grid(row=3, column=0, sticky='nsew', padx=4, pady=2)
         self.tiff_tree.bind("<Double-Button-1>", self.load_tiff_from_list)
         self.tiff_tree.bind("<Return>", self.load_tiff_from_list)
+        self.tiff_tree.bind("<Button-3>", self._on_file_browser_right_click)
+        self.tiff_tree.bind("<Button-2>", self._on_file_browser_right_click)
+        self.tiff_tree.bind("<Control-Button-1>", self._on_file_browser_right_click)
+
+        self._file_browser_context_menu = tk.Menu(self.tiff_tree, tearoff=0)
+        self._file_browser_context_menu.add_command(
+            label="Reload last count (paint, mask, config)",
+            command=self._file_browser_reload_last_count,
+        )
+        self._file_browser_context_menu.add_separator()
+        self._file_browser_context_menu.add_command(
+            label="Exclude", command=self._file_browser_exclude_selected
+        )
+        self._file_browser_context_menu.add_command(
+            label="Include", command=self._file_browser_include_selected
+        )
 
         # Store mapping from iid to full path
         self._tree_iid_to_path = {}
@@ -14494,6 +19497,12 @@ class PDFViewer:
                 )
             else:
                 self.paint_layer = None
+            try:
+                if hasattr(self, "output"):
+                    self.output.delete("paint")
+                    self.output.delete("paint_layer")
+            except Exception:
+                pass
 
         # PDF/Allen document path for atlas only (keep TIFF path separate)
         if isinstance(getattr(self, "path", None), str) and (
@@ -14627,17 +19636,22 @@ class PDFViewer:
         """Core TIFF loading logic (shared between manual import and file browser).
 
         preserve_atlas:
-          - True: always keep drawings, zone mask, names, placement (Next Channel).
-          - False: clear atlas (explicit wipe).
-          - None (default): keep atlas if one is already loaded — critical so that
-            loading a TIFF after Import Allen / Reflect does not delete the plate.
+          - True: keep drawings, zone mask, names, placement (Next Channel).
+          - False: clear paint + atlas.
+          - None (default): clear paint + atlas when switching from an already
+            loaded TIFF. Keep atlas only when attaching the first TIFF onto a
+            plate that was loaded with no image yet (Import Allen, then TIFF).
         """
         if not tiff_path or not os.path.exists(tiff_path):
             messagebox.showerror("Error", "Selected file does not exist.")
             return False
 
         if preserve_atlas is None:
-            preserve_atlas = self._atlas_is_loaded()
+            attaching_first_tiff = (
+                getattr(self, "original_background", None) is None
+                and not getattr(self, "current_tiff_path", None)
+            )
+            preserve_atlas = bool(attaching_first_tiff and self._atlas_is_loaded())
 
         logger.info(
             f"Loading TIFF: {tiff_path} (preserve_atlas={preserve_atlas}, "
@@ -14737,7 +19751,7 @@ class PDFViewer:
         self.editing_mask = False
         self.current_mask = None
         self.auto_mask = None
-        self.showing_auto_mask = False
+        self._clear_mask_overlay()
         self.last_df = None
         self.last_cell_mask = None
         self.cell_mask_locked = False
@@ -15090,9 +20104,41 @@ class PDFViewer:
             self.output.bind("<ButtonRelease-1>", self.crop_end)
             self.output.bind("<Double-Button-1>", self._crop_double_click_apply)
             self.output.config(cursor="crosshair")
+            ar_txt = self._crop_aspect_status_text()
             self._set_crop_status(
-                "Crop: drag to outline · drag box to move · Enter/double-click to apply · Esc to clear"
+                f"Crop{ar_txt}: set ratio in Atlas Manager “Crop box shape” · "
+                "drag to outline · Enter to apply · Esc to clear"
             )
+            try:
+                self._on_crop_aspect_changed()
+            except Exception:
+                pass
+            # Expand ribbon so the aspect panel is visible
+            try:
+                if hasattr(self, "atlas_ribbon_expanded") and not self.atlas_ribbon_expanded:
+                    self._toggle_atlas_ribbon()
+            except Exception:
+                pass
+            # One-time tip (not every toggle)
+            if not getattr(self, "_crop_aspect_howto_shown", False):
+                self._crop_aspect_howto_shown = True
+                try:
+                    self.master.after(
+                        200,
+                        lambda: messagebox.showinfo(
+                            "Crop — set the box shape first",
+                            "In the Atlas Manager (expanded ribbon):\n\n"
+                            "  “Crop box shape (aspect ratio)”\n\n"
+                            "1. Check or uncheck “Lock aspect ratio while drawing”.\n"
+                            "2. Choose a Ratio from the dropdown "
+                            "(Match TIFF, Square, 16:9, Custom…).\n"
+                            "3. For Custom: type W and H, click Apply custom.\n"
+                            "4. Drag on the atlas to draw the crop window.\n\n"
+                            "Click How to… anytime in that panel for a reminder.",
+                        ),
+                    )
+                except Exception:
+                    pass
             # Focus canvas so Enter applies crop (not a focused ribbon checkbutton)
             try:
                 self.output.focus_set()
@@ -15249,7 +20295,10 @@ class PDFViewer:
             ids.append(self.output.create_line(x, y, x + dx, y + dy, **tick_kw))
 
         # Instruction label just above the box
-        label = "Crop window — drag to move · Enter to apply · Esc clear · click outside to re-draw"
+        ar_txt = self._crop_aspect_status_text()
+        label = (
+            f"Crop window{ar_txt} — drag to move · Enter to apply · Esc clear · click outside to re-draw"
+        )
         if self.crop_pending:
             # Shadow first, then light text on top
             ids.append(
@@ -15298,13 +20347,198 @@ class PDFViewer:
             return None
         return float(w) / float(h)
 
-    def _lock_crop_corner_to_image_aspect(self, start_x, start_y, cur_x, cur_y):
-        """Return (end_x, end_y) so the crop rect matches the brain-image aspect ratio.
+    def _normalize_crop_aspect_preset_key(self, text=None):
+        """Map UI label or short key → internal key: image|1:1|4:3|3:2|16:9|custom."""
+        raw = (text if text is not None else self.crop_aspect_preset_var.get()) or ""
+        s = raw.strip().lower()
+        if not s:
+            return "image"
+        # Full labels from combobox
+        if "match" in s or s == "image" or "tiff" in s:
+            return "image"
+        if "square" in s or s in ("1:1", "1/1"):
+            return "1:1"
+        if s in ("4:3", "4/3") or s.startswith("4:3"):
+            return "4:3"
+        if s in ("3:2", "3/2") or s.startswith("3:2"):
+            return "3:2"
+        if "16:9" in s or "widescreen" in s or s in ("16/9",):
+            return "16:9"
+        if "custom" in s:
+            return "custom"
+        if s in ("free", "none", "off"):
+            return "free"
+        return s
 
-        Anchor is (start_x, start_y); the free corner is adjusted toward (cur_x, cur_y)
-        while enforcing W/H = image aspect. If no image is loaded, returns the raw corner.
+    def _get_crop_aspect_ratio(self):
+        """Active crop aspect W/H, or None if unlocked / free."""
+        try:
+            if not bool(self.crop_aspect_lock_var.get()):
+                return None
+        except Exception:
+            return None
+
+        key = self._normalize_crop_aspect_preset_key()
+        if key in ("free", "none", "off"):
+            return None
+        if key == "image":
+            return self._brain_image_aspect_ratio()
+        fixed = {
+            "1:1": 1.0,
+            "4:3": 4.0 / 3.0,
+            "3:2": 3.0 / 2.0,
+            "16:9": 16.0 / 9.0,
+        }
+        if key in fixed:
+            return fixed[key]
+        if key == "custom":
+            try:
+                w = float(self.crop_aspect_w_var.get())
+                h = float(self.crop_aspect_h_var.get())
+                if w > 0 and h > 0:
+                    return w / h
+            except Exception:
+                return None
+            return None
+        try:
+            ar = float(key)
+            return ar if ar > 0 else None
+        except Exception:
+            return self._brain_image_aspect_ratio()
+
+    def _crop_aspect_status_text(self):
+        """Short suffix for status labels, e.g. ' [lock 16:9]' or ''."""
+        try:
+            if not bool(self.crop_aspect_lock_var.get()):
+                return " [free aspect]"
+        except Exception:
+            return ""
+        key = self._normalize_crop_aspect_preset_key()
+        ar = self._get_crop_aspect_ratio()
+        if ar is None:
+            return " [free aspect]"
+        if key == "image":
+            return f" [lock = TIFF {ar:.3f}:1]"
+        if key == "custom":
+            return f" [lock {self.crop_aspect_w_var.get()}:{self.crop_aspect_h_var.get()}]"
+        return f" [lock {key}]"
+
+    def _show_crop_aspect_help(self):
+        """Explain how to change crop aspect ratio."""
+        messagebox.showinfo(
+            "Crop aspect ratio — how to change it",
+            "The crop box shape is controlled in the Atlas Manager ribbon:\n\n"
+            "1. Expand the Atlas Manager (▶) if collapsed.\n"
+            "2. Turn ON Crop (Global row).\n"
+            "3. In “Crop box shape (aspect ratio)”:\n"
+            "   • Check “Lock aspect ratio while drawing” to force a ratio.\n"
+            "   • Uncheck it for free-form rectangles.\n"
+            "   • Open the Ratio dropdown and pick:\n"
+            "       – Match TIFF image (same shape as your slice)\n"
+            "       – Square (1:1), 4:3, 3:2, Widescreen (16:9)\n"
+            "       – Custom width × height… then type W and H and\n"
+            "         click Apply custom (or press Enter in the box).\n"
+            "4. Drag on the atlas to draw the crop window.\n\n"
+            "Changing the ratio while a box is pending re-shapes that box.\n"
+            "Then Enter / double-click / Apply Crop to commit.",
+        )
+
+    def _on_crop_aspect_changed(self, event=None):
+        """Update hint + enable custom W/H entries; re-draw pending box if locked."""
+        key = self._normalize_crop_aspect_preset_key()
+        locked = bool(self.crop_aspect_lock_var.get())
+        custom = key == "custom"
+        try:
+            state = "normal" if (locked and custom) else "disabled"
+            if hasattr(self, "crop_aspect_w_entry"):
+                self.crop_aspect_w_entry.configure(state=state)
+            if hasattr(self, "crop_aspect_h_entry"):
+                self.crop_aspect_h_entry.configure(state=state)
+        except Exception:
+            pass
+
+        ar = self._get_crop_aspect_ratio()
+        if not locked:
+            hint = (
+                "Aspect UNLOCKED — drag any rectangle. "
+                "Check “Lock aspect ratio” and pick a Ratio to constrain the box."
+            )
+        elif ar is None and key == "image":
+            hint = (
+                "Locked to TIFF, but no image is loaded yet — "
+                "load a TIFF or choose another Ratio."
+            )
+        elif ar is None:
+            hint = (
+                "Custom ratio needs W and H > 0. Example: W=5 H=4 then Apply custom."
+            )
+        elif key == "image":
+            hint = (
+                f"Locked to your TIFF shape (width÷height = {ar:.4f}). "
+                "Change the Ratio dropdown for square/16:9/custom."
+            )
+        elif key == "custom":
+            hint = (
+                f"Locked to custom {self.crop_aspect_w_var.get()}×"
+                f"{self.crop_aspect_h_var.get()} (W/H = {ar:.4f}). "
+                "Edit W/H and click Apply custom to update."
+            )
+        else:
+            hint = (
+                f"Locked to {key} (W/H = {ar:.4f}). "
+                "Drag on the atlas — the box keeps this shape."
+            )
+        try:
+            if hasattr(self, "crop_aspect_hint_var"):
+                self.crop_aspect_hint_var.set(hint)
+        except Exception:
+            pass
+
+        # If a pending crop exists and lock is on, re-fit the box to the new aspect
+        if (
+            locked
+            and ar is not None
+            and getattr(self, "crop_pending", False)
+            and getattr(self, "crop_box", None)
+        ):
+            try:
+                l, t, r, b = self.crop_box
+                cx = 0.5 * (l + r)
+                cy = 0.5 * (t + b)
+                w = abs(r - l)
+                h = abs(b - t)
+                if w / max(h, 1e-6) >= ar:
+                    nh = w / ar
+                    nw = w
+                else:
+                    nw = h * ar
+                    nh = h
+                self.crop_box = (
+                    cx - nw / 2.0,
+                    cy - nh / 2.0,
+                    cx + nw / 2.0,
+                    cy + nh / 2.0,
+                )
+                self._draw_crop_outline()
+            except Exception:
+                pass
+
+        if getattr(self, "crop_mode", False):
+            try:
+                self._set_crop_status(
+                    f"Crop{self._crop_aspect_status_text()}: drag to outline · "
+                    "drag box to move · Enter/double-click to apply · Esc to clear"
+                )
+            except Exception:
+                pass
+
+    def _lock_crop_corner_to_image_aspect(self, start_x, start_y, cur_x, cur_y):
+        """Return (end_x, end_y) with optional locked aspect (see _get_crop_aspect_ratio).
+
+        Anchor is (start_x, start_y); free corner is adjusted toward (cur_x, cur_y).
+        If aspect lock is off or ratio unavailable, returns the raw corner (free crop).
         """
-        ar = self._brain_image_aspect_ratio()
+        ar = self._get_crop_aspect_ratio()
         if ar is None or ar <= 0:
             return cur_x, cur_y
 
@@ -15313,21 +20547,16 @@ class PDFViewer:
         if abs(dx) < 1e-6 and abs(dy) < 1e-6:
             return cur_x, cur_y
 
-        # Choose width- or height-driven sizing so the rubber-band grows toward the cursor
-        # while keeping aspect = image W/H.
+        # Width- or height-driven so the rubber-band grows toward the cursor
         if abs(dy) < 1e-6 or abs(dx) >= abs(dy) * ar:
-            # Width-driven
             w = abs(dx) if abs(dx) >= 1e-6 else abs(dy) * ar
             h = w / ar
         else:
-            # Height-driven
             h = abs(dy)
             w = h * ar
 
-        # Preserve drag direction (which quadrant)
         sx = 1.0 if dx >= 0 else -1.0
         sy = 1.0 if dy >= 0 else -1.0
-        # If user only moved on one axis, still expand with positive sense on the other
         if abs(dx) < 1e-6:
             sx = 1.0
         if abs(dy) < 1e-6:
@@ -15394,7 +20623,8 @@ class PDFViewer:
                 self.crop_pending = True
                 self._draw_crop_outline()
                 self._set_crop_status(
-                    "Crop: drag box to move · Enter/double-click to apply · Esc to clear · click outside to re-draw"
+                    f"Crop{self._crop_aspect_status_text()}: drag box to move · "
+                    "Enter/double-click to apply · Esc to clear · click outside to re-draw"
                 )
                 try:
                     self.output.focus_set()
@@ -15418,7 +20648,8 @@ class PDFViewer:
             self.crop_box = None
             self._clear_crop_ui()
             self._set_crop_status(
-                "Crop: drag to outline · drag box to move · Enter/double-click to apply · Esc to clear"
+                f"Crop{self._crop_aspect_status_text()}: drag to outline · "
+                "drag box to move · Enter/double-click to apply · Esc to clear"
             )
             return
 
@@ -15426,7 +20657,8 @@ class PDFViewer:
         self.crop_pending = True
         self._draw_crop_outline()
         self._set_crop_status(
-            "Crop: drag box to move · Enter/double-click to apply · Esc to clear · click outside to re-draw"
+            f"Crop{self._crop_aspect_status_text()}: drag box to move · "
+            "Enter/double-click to apply · Esc to clear · click outside to re-draw"
         )
         try:
             self.output.focus_set()
@@ -16326,6 +21558,1685 @@ class PDFViewer:
             f"Top-left corners aligned.",
         )
 
+    # ==================================================================
+    # ATLAS ALIGNMENT STACK
+    # 1) Landmarks (similarity) → 2) Edge snap (outline pose) → 3) Local refine guide
+    # ==================================================================
+
+    @staticmethod
+    def _umeyama_similarity(src, dst, with_scale=True):
+        """Umeyama similarity: maps src (Nx2) → dst via p' = s R p + t.
+
+        Returns (scale, angle_deg_ccw, R 2x2, t 2, rmse).
+        """
+        src = np.asarray(src, dtype=np.float64)
+        dst = np.asarray(dst, dtype=np.float64)
+        if src.shape != dst.shape or src.ndim != 2 or src.shape[1] != 2:
+            raise ValueError("src/dst must be Nx2 with matching shape")
+        n = src.shape[0]
+        if n < 2:
+            raise ValueError("Need at least 2 point pairs")
+        mu_s = src.mean(axis=0)
+        mu_d = dst.mean(axis=0)
+        src_c = src - mu_s
+        dst_c = dst - mu_d
+        var_s = float(np.sum(src_c ** 2) / n)
+        if var_s < 1e-12:
+            raise ValueError("Source points are degenerate")
+        cov = (dst_c.T @ src_c) / n
+        U, D, Vt = np.linalg.svd(cov)
+        S = np.eye(2)
+        if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+            S[1, 1] = -1.0
+        R = U @ S @ Vt
+        if with_scale:
+            s = float(np.trace(np.diag(D) @ S) / var_s)
+            s = float(np.clip(s, 0.05, 20.0))
+        else:
+            s = 1.0
+        t = mu_d - s * (R @ mu_s)
+        pred = (s * (R @ src.T)).T + t
+        rmse = float(np.sqrt(np.mean(np.sum((pred - dst) ** 2, axis=1))))
+        angle = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
+        return s, angle, R, t, rmse
+
+    def _atlas_model_to_image_xy(self, mx, my):
+        """Atlas model pixel → background image coordinates (current placement)."""
+        return float(mx) + float(self.img_x), float(my) + float(self.img_y)
+
+    def _image_xy_to_atlas_model(self, ix, iy):
+        return float(ix) - float(self.img_x), float(iy) - float(self.img_y)
+
+    def _atlas_bbox_image_space(self):
+        """Return (x0, y0, x1, y1, w, h) of current atlas page in image coords."""
+        page = self.current_page
+        base = self.base_page_images.get(page)
+        if base is None:
+            return None
+        w, h = base.size
+        x0, y0 = float(self.img_x), float(self.img_y)
+        return x0, y0, x0 + w, y0 + h, w, h
+
+    def _point_hits_atlas(self, ix, iy, margin=2.0):
+        """True if image-space point is over the current atlas rectangle (rough hit)."""
+        bb = self._atlas_bbox_image_space()
+        if bb is None:
+            return False
+        x0, y0, x1, y1, _, _ = bb
+        return (x0 - margin) <= ix <= (x1 + margin) and (y0 - margin) <= iy <= (y1 + margin)
+
+    def _apply_global_atlas_similarity(self, scale, angle_deg, t_vec, pivot_image=None):
+        """Apply similarity p' = s R p + t to global atlas layers + placement.
+
+        Uses rotate+scale around atlas center then sets img_x/img_y so the
+        transformed center matches Umeyama (same form as landmark fit).
+        """
+        page = self.current_page
+        if page not in self.base_page_images or self.base_page_images[page] is None:
+            raise RuntimeError("No atlas page to transform")
+        base = self.base_page_images[page]
+        w, h = base.size
+        # Center of atlas in *image* coordinates before transform
+        cx = float(self.img_x) + w / 2.0
+        cy = float(self.img_y) + h / 2.0
+        s = float(scale)
+        ang = float(angle_deg)
+        t = np.asarray(t_vec, dtype=np.float64).reshape(2)
+        # New center under p' = s R p + t  (R is CCW, PIL rotate is also CCW for +deg)
+        th = np.radians(ang)
+        R = np.array(
+            [[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]], dtype=np.float64
+        )
+        # If full Umeyama form was p'=sRp+t, use that directly for center
+        c_new = s * (R @ np.array([cx, cy])) + t
+
+        # Physically rotate/scale PIL layers (expand=True for rotate)
+        is_allen = getattr(self, "atlas_filetype", None) == "allen"
+        base_rs = Image.NEAREST if is_allen else Image.BILINEAR
+        rotated = base.rotate(ang, expand=True, resample=base_rs, fillcolor=(0, 0, 0, 0) if base.mode == "RGBA" else None)
+        nw = max(1, int(round(rotated.width * s)))
+        nh = max(1, int(round(rotated.height * s)))
+        scaled = rotated.resize((nw, nh), base_rs)
+        self.base_page_images[page] = scaled
+
+        if page in self.mask_images and self.mask_images[page] is not None:
+            m = self.mask_images[page]
+            mr = m.rotate(ang, expand=True, resample=Image.NEAREST, fillcolor=0)
+            self.mask_images[page] = mr.resize((nw, nh), Image.NEAREST)
+
+        if page in self.page_images and self.page_images[page] is not None:
+            # Will rebuild overlays; keep size in sync if needed
+            pass
+
+        self._transform_allen_borders_pure(rotate_deg=ang, expand_rotate=True)
+        pure = getattr(self, "allen_borders_pure", None)
+        if pure is not None and getattr(self, "atlas_filetype", None) == "allen":
+            self.allen_borders_pure = pure.resize((nw, nh), Image.NEAREST)
+            if self.allen_borders_pure.mode != "RGBA":
+                self.allen_borders_pure = self.allen_borders_pure.convert("RGBA")
+
+        # Place so new image-space center is c_new
+        self.img_x = float(c_new[0] - nw / 2.0)
+        self.img_y = float(c_new[1] - nh / 2.0)
+
+        try:
+            self.img = self.base_page_images[page].copy()
+        except Exception:
+            pass
+
+        clear_preprocess_cache()
+        self._rebuild_page_overlays(page)
+        self._clear_edge_highlight()
+        self.edge_grab_active = False
+        self.border_drag_active = False
+        self.active_edge = None
+        self.current_edited_contour = None
+        self.selected_edge_full_contour = None
+
+    def start_atlas_landmark_align(self):
+        """Interactive landmark pairs: click atlas feature, then matching tissue point."""
+        if not self.atlas_filetype:
+            messagebox.showwarning("Align", "Load an atlas first (Atlas → Import…).")
+            return
+        if self.original_background is None and self.background_image is None:
+            messagebox.showwarning("Align", "Load a TIFF/image first.")
+            return
+        if self.current_page not in self.base_page_images or self.base_page_images[self.current_page] is None:
+            messagebox.showwarning("Align", "No atlas page image is available.")
+            return
+
+        # Exit conflicting modes
+        for flag in ("crop_mode", "edit_mode"):
+            try:
+                if getattr(self, flag, False):
+                    setattr(self, flag, False)
+            except Exception:
+                pass
+        try:
+            self.crop_mode_var.set(False)
+            self.edit_mode_var.set(False)
+        except Exception:
+            pass
+        if getattr(self, "measure_tune_active", False):
+            try:
+                self._cleanup_measure_tune_ui()
+            except Exception:
+                pass
+        if getattr(self, "area_tune_active", False):
+            try:
+                self._cleanup_area_tune_ui()
+            except Exception:
+                pass
+
+        self.atlas_align_active = True
+        self.atlas_align_mode = "landmarks"
+        self.atlas_align_pairs = []
+        self.atlas_align_pending_atlas = None
+        self._clear_atlas_align_markers()
+
+        self.output.unbind("<Button-1>")
+        self.output.unbind("<B1-Motion>")
+        self.output.unbind("<ButtonRelease-1>")
+        self.output.bind("<Button-1>", self._atlas_align_click)
+        self.master.bind("<Escape>", self._cancel_atlas_align)
+        try:
+            self.output.config(cursor="crosshair")
+        except Exception:
+            pass
+
+        self._open_atlas_align_status_window()
+        self._update_atlas_align_status()
+        try:
+            self.show_page()
+        except Exception:
+            pass
+
+        messagebox.showinfo(
+            "Landmark Align",
+            "Practical stack — step 1: landmarks (similarity fit)\n\n"
+            "For each pair:\n"
+            "  1. Click a point on the ATLAS (line/feature).\n"
+            "  2. Click the matching point on the TISSUE image.\n\n"
+            "Use 3–6 pairs (ventricle, midline, outer edge…).\n"
+            "Then click Apply Fit.\n\n"
+            "Next: optional Edge Snap, then Local Refine (border drag).\n"
+            "Esc cancels.",
+        )
+
+    def _open_atlas_align_status_window(self):
+        try:
+            if (
+                self.atlas_align_status_window is not None
+                and self.atlas_align_status_window.winfo_exists()
+            ):
+                self.atlas_align_status_window.destroy()
+        except Exception:
+            pass
+        win = Toplevel(self.master)
+        self.atlas_align_status_window = win
+        win.title("Landmark Align")
+        win.attributes("-topmost", "true")
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self._cancel_atlas_align)
+        self._register_transparent_window(win)
+
+        self.atlas_align_status_var = tk.StringVar(value="Click ATLAS point 1")
+        ttk.Label(
+            win, textvariable=self.atlas_align_status_var, font=("Helvetica", 11, "bold")
+        ).pack(padx=14, pady=(12, 4))
+        self.atlas_align_detail_var = tk.StringVar(
+            value="Pairs: 0  ·  Magenta=atlas  Cyan=tissue"
+        )
+        ttk.Label(
+            win, textvariable=self.atlas_align_detail_var, font=("Helvetica", 8), wraplength=300
+        ).pack(padx=14, pady=(0, 6))
+
+        btn = ttk.Frame(win)
+        btn.pack(pady=(0, 12))
+        ttk.Button(btn, text="Undo pair", command=self._atlas_align_undo_pair, width=10).pack(
+            side=tk.LEFT, padx=3
+        )
+        ttk.Button(btn, text="Apply Fit", command=self._apply_atlas_landmark_fit, width=10).pack(
+            side=tk.LEFT, padx=3
+        )
+        ttk.Button(btn, text="Cancel", command=self._cancel_atlas_align, width=10).pack(
+            side=tk.LEFT, padx=3
+        )
+        try:
+            win.update_idletasks()
+            mx = self.master.winfo_rootx() + max(40, self.master.winfo_width() - 320)
+            my = self.master.winfo_rooty() + 80
+            win.geometry(f"+{mx}+{my}")
+        except Exception:
+            pass
+
+    def _update_atlas_align_status(self):
+        if not getattr(self, "atlas_align_status_var", None):
+            return
+        n = len(self.atlas_align_pairs)
+        if self.atlas_align_pending_atlas is None:
+            self.atlas_align_status_var.set(f"Click ATLAS point (pair {n + 1})")
+            self.atlas_align_detail_var.set(
+                f"Pairs: {n}  ·  Next: atlas feature  ·  Magenta=atlas  Cyan=tissue"
+            )
+        else:
+            self.atlas_align_status_var.set(f"Click TISSUE match (pair {n + 1})")
+            self.atlas_align_detail_var.set(
+                f"Pairs: {n}  ·  Next: matching tissue location"
+            )
+
+    def _clear_atlas_align_markers(self):
+        for item in getattr(self, "atlas_align_markers", []) or []:
+            try:
+                self.output.delete(item)
+            except Exception:
+                pass
+        self.atlas_align_markers = []
+        try:
+            self.output.delete("atlas_align")
+        except Exception:
+            pass
+
+    def _redraw_atlas_align_markers(self):
+        """Re-place landmark markers after zoom/show_page (canvas was cleared).
+
+        Pairs are stored in image coordinates, so they survive zoom; only the
+        canvas graphics need rebuilding.
+        """
+        if not getattr(self, "atlas_align_active", False):
+            return
+        if (self.atlas_align_mode or "") != "landmarks":
+            return
+        self._clear_atlas_align_markers()
+        pairs = list(getattr(self, "atlas_align_pairs", []) or [])
+        for i, p in enumerate(pairs, 1):
+            try:
+                ax, ay = p["atlas"]
+                tx, ty = p["tissue"]
+                self._draw_atlas_align_marker(ax, ay, kind="atlas", index=i)
+                self._draw_atlas_align_marker(tx, ty, kind="tissue", index=i)
+                c0 = self._image_to_canvas(ax, ay)
+                c1 = self._image_to_canvas(tx, ty)
+                line = self.output.create_line(
+                    c0[0],
+                    c0[1],
+                    c1[0],
+                    c1[1],
+                    fill="#ffee58",
+                    width=1,
+                    dash=(3, 2),
+                    tags=("atlas_align",),
+                )
+                self.atlas_align_markers.append(line)
+            except Exception as e:
+                logger.debug(f"Redraw align pair {i} failed: {e}")
+        pending = getattr(self, "atlas_align_pending_atlas", None)
+        if pending is not None:
+            try:
+                self._draw_atlas_align_marker(
+                    pending[0],
+                    pending[1],
+                    kind="atlas",
+                    index=len(pairs) + 1,
+                )
+            except Exception:
+                pass
+        try:
+            self.output.tag_raise("atlas_align")
+        except Exception:
+            pass
+
+    def _draw_atlas_align_marker(self, ix, iy, kind="atlas", index=None):
+        try:
+            cx, cy = self._image_to_canvas(ix, iy)
+            color = "#e040fb" if kind == "atlas" else "#00e5ff"
+            r = 8
+            oval = self.output.create_oval(
+                cx - r, cy - r, cx + r, cy + r, outline=color, width=2, tags=("atlas_align",)
+            )
+            cross1 = self.output.create_line(
+                cx - 6, cy, cx + 6, cy, fill=color, width=2, tags=("atlas_align",)
+            )
+            cross2 = self.output.create_line(
+                cx, cy - 6, cx, cy + 6, fill=color, width=2, tags=("atlas_align",)
+            )
+            self.atlas_align_markers.extend([oval, cross1, cross2])
+            if index is not None:
+                txt = self.output.create_text(
+                    cx + 12,
+                    cy - 12,
+                    text=str(index),
+                    fill=color,
+                    font=("Helvetica", 9, "bold"),
+                    tags=("atlas_align",),
+                )
+                self.atlas_align_markers.append(txt)
+        except Exception as e:
+            logger.debug(f"Align marker failed: {e}")
+
+    def _atlas_align_click(self, event):
+        if not getattr(self, "atlas_align_active", False):
+            return
+        cx = self.output.canvasx(event.x)
+        cy = self.output.canvasy(event.y)
+        ix, iy = self._canvas_to_image(cx, cy)
+        if self.original_background is not None:
+            w, h = self.original_background.size
+        else:
+            w, h = self.background_image.size
+        ix = int(np.clip(ix, 0, w - 1))
+        iy = int(np.clip(iy, 0, h - 1))
+
+        if self.atlas_align_pending_atlas is None:
+            # Prefer treating click as atlas if over atlas bbox; still allow anywhere
+            self.atlas_align_pending_atlas = (float(ix), float(iy))
+            self._draw_atlas_align_marker(ix, iy, kind="atlas", index=len(self.atlas_align_pairs) + 1)
+        else:
+            ax, ay = self.atlas_align_pending_atlas
+            self.atlas_align_pairs.append(
+                {
+                    "atlas": (ax, ay),  # image-space location of atlas feature
+                    "tissue": (float(ix), float(iy)),
+                }
+            )
+            self._draw_atlas_align_marker(
+                ix, iy, kind="tissue", index=len(self.atlas_align_pairs)
+            )
+            # Connect pair with a thin line
+            try:
+                c0 = self._image_to_canvas(ax, ay)
+                c1 = self._image_to_canvas(ix, iy)
+                line = self.output.create_line(
+                    c0[0], c0[1], c1[0], c1[1], fill="#ffee58", width=1, dash=(3, 2), tags=("atlas_align",)
+                )
+                self.atlas_align_markers.append(line)
+            except Exception:
+                pass
+            self.atlas_align_pending_atlas = None
+        self._update_atlas_align_status()
+
+    def _atlas_align_undo_pair(self):
+        if not getattr(self, "atlas_align_active", False):
+            return
+        if self.atlas_align_pending_atlas is not None:
+            self.atlas_align_pending_atlas = None
+            self._clear_atlas_align_markers()
+            for i, p in enumerate(self.atlas_align_pairs, 1):
+                self._draw_atlas_align_marker(p["atlas"][0], p["atlas"][1], "atlas", i)
+                self._draw_atlas_align_marker(p["tissue"][0], p["tissue"][1], "tissue", i)
+            self._update_atlas_align_status()
+            return
+        if not self.atlas_align_pairs:
+            return
+        self.atlas_align_pairs.pop()
+        self._clear_atlas_align_markers()
+        for i, p in enumerate(self.atlas_align_pairs, 1):
+            self._draw_atlas_align_marker(p["atlas"][0], p["atlas"][1], "atlas", i)
+            self._draw_atlas_align_marker(p["tissue"][0], p["tissue"][1], "tissue", i)
+        self._update_atlas_align_status()
+
+    def _cancel_atlas_align(self, event=None):
+        if not getattr(self, "atlas_align_active", False):
+            return "break" if event else None
+        self._cleanup_atlas_align_ui()
+        messagebox.showinfo("Landmark Align", "Cancelled. Atlas placement unchanged.")
+        return "break" if event else None
+
+    def _cleanup_atlas_align_ui(self):
+        self.atlas_align_active = False
+        self.atlas_align_mode = None
+        self.atlas_align_pairs = []
+        self.atlas_align_pending_atlas = None
+        try:
+            self.master.unbind("<Escape>")
+        except Exception:
+            pass
+        try:
+            self.output.unbind("<Button-1>")
+            self.output.bind("<Button-1>", self.highlight_region)
+            self.output.bind("<B1-Motion>", self._handle_border_drag_motion, add=True)
+            self.output.config(cursor="")
+        except Exception:
+            pass
+        self._clear_atlas_align_markers()
+        try:
+            if (
+                self.atlas_align_status_window is not None
+                and self.atlas_align_status_window.winfo_exists()
+            ):
+                self.atlas_align_status_window.destroy()
+        except Exception:
+            pass
+        self.atlas_align_status_window = None
+
+    def _apply_atlas_landmark_fit(self):
+        """Compute similarity from landmark pairs and apply to atlas."""
+        pairs = list(getattr(self, "atlas_align_pairs", []) or [])
+        if len(pairs) < 2:
+            messagebox.showwarning(
+                "Landmark Align",
+                "Need at least 2 pairs (3–6 recommended).\n\n"
+                f"Current pairs: {len(pairs)}",
+            )
+            return
+        src = np.array([p["atlas"] for p in pairs], dtype=np.float64)
+        dst = np.array([p["tissue"] for p in pairs], dtype=np.float64)
+        try:
+            s, angle, R, t, rmse = self._umeyama_similarity(src, dst, with_scale=True)
+        except Exception as e:
+            messagebox.showerror("Landmark Align", f"Could not compute fit:\n{e}")
+            return
+
+        self.save_state()
+        try:
+            # Full Umeyama: p' = s R p + t applied via center mapping
+            self._apply_global_atlas_similarity(s, angle, t)
+        except Exception as e:
+            logger.error(f"Landmark apply failed: {e}", exc_info=True)
+            messagebox.showerror("Landmark Align", f"Apply failed:\n{e}")
+            return
+
+        # Keep tissue locations as a soft prior for the next Edge Snap
+        try:
+            self._last_landmark_pairs = [
+                {"atlas": tuple(p["atlas"]), "tissue": tuple(p["tissue"])} for p in pairs
+            ]
+        except Exception:
+            self._last_landmark_pairs = []
+
+        self._cleanup_atlas_align_ui()
+        self.show_page()
+        messagebox.showinfo(
+            "Landmark Align",
+            "Similarity fit applied.\n\n"
+            f"Pairs: {len(pairs)}\n"
+            f"Scale: {s:.4f}\n"
+            f"Rotation: {angle:.2f}°\n"
+            f"RMSE: {rmse:.1f} px\n"
+            f"Offset now: ({self.img_x:.1f}, {self.img_y:.1f})\n\n"
+            "Next (optional):\n"
+            "  • Align → Edge Snap… to refine outline pose (bounded, with preview)\n"
+            "  • Align → Local Refine for per-region border drag",
+        )
+
+    def _edge_snap_resample_polyline(self, pts, n_samples):
+        """Even arc-length resample of an (N,2) x,y polyline."""
+        pts = np.asarray(pts, dtype=np.float64)
+        if len(pts) < 2:
+            return pts
+        d = np.sqrt(np.sum(np.diff(pts, axis=0) ** 2, axis=1))
+        s = np.concatenate([[0.0], np.cumsum(d)])
+        total = float(s[-1])
+        if total < 1e-6:
+            return pts[:1]
+        n_samples = max(8, int(n_samples))
+        s_new = np.linspace(0.0, total, n_samples, endpoint=False)
+        return np.column_stack(
+            [np.interp(s_new, s, pts[:, 0]), np.interp(s_new, s, pts[:, 1])]
+        )
+
+    def _edge_snap_morph_open_close(self, mask, open_r=1, close_r=2):
+        m = np.asarray(mask, dtype=bool)
+        try:
+            if open_r > 0:
+                try:
+                    m = morphology.opening(m, footprint=disk(open_r))
+                except Exception:
+                    m = morphology.binary_opening(m, footprint=disk(open_r))
+            if close_r > 0:
+                try:
+                    m = morphology.closing(m, footprint=disk(close_r))
+                except Exception:
+                    m = morphology.binary_closing(m, footprint=disk(close_r))
+        except Exception:
+            pass
+        return m
+
+    def _edge_snap_largest_cc(self, mask):
+        m = np.asarray(mask, dtype=bool)
+        if not m.any():
+            return m
+        lab = measure.label(m, connectivity=2)
+        if lab.max() == 0:
+            return m
+        counts = np.bincount(lab.ravel())
+        counts[0] = 0
+        return lab == int(np.argmax(counts))
+
+    def _edge_snap_outer_contour_xy(self, binary2d, n_samples=360):
+        """Largest CC outer contour as Nx2 float (x, y), evenly resampled."""
+        binary2d = np.asarray(binary2d, dtype=bool)
+        if binary2d.ndim != 2 or not binary2d.any():
+            raise RuntimeError("Empty binary mask for contour")
+        mask = self._edge_snap_largest_cc(binary2d)
+        try:
+            from scipy.ndimage import binary_fill_holes
+            mask = binary_fill_holes(mask)
+        except Exception:
+            pass
+        try:
+            contours = measure.find_contours(mask.astype(np.float64), 0.5)
+        except Exception as e:
+            raise RuntimeError(f"find_contours failed: {e}")
+        if not contours:
+            raise RuntimeError("No contour found")
+        cont = max(contours, key=lambda c: c.shape[0])
+        pts = np.column_stack([cont[:, 1], cont[:, 0]]).astype(np.float64)
+        if len(pts) < 8:
+            raise RuntimeError("Contour too short")
+        return self._edge_snap_resample_polyline(pts, n_samples)
+
+    def _edge_snap_hole_contours_xy(self, binary2d, n_samples=120):
+        """Inner hole contours (ventricles / cavities) as stacked Nx2 points."""
+        mask = self._edge_snap_largest_cc(np.asarray(binary2d, dtype=bool))
+        try:
+            from scipy.ndimage import binary_fill_holes
+            filled = binary_fill_holes(mask)
+        except Exception:
+            return np.zeros((0, 2), dtype=np.float64)
+        holes = filled & ~mask
+        if int(holes.sum()) < 40:
+            return np.zeros((0, 2), dtype=np.float64)
+        try:
+            contours = measure.find_contours(holes.astype(np.float64), 0.5)
+        except Exception:
+            return np.zeros((0, 2), dtype=np.float64)
+        out = []
+        for cont in contours:
+            if cont.shape[0] < 12:
+                continue
+            pts = np.column_stack([cont[:, 1], cont[:, 0]]).astype(np.float64)
+            n = max(16, min(int(n_samples), max(16, cont.shape[0] // 2)))
+            out.append(self._edge_snap_resample_polyline(pts, n))
+        if not out:
+            return np.zeros((0, 2), dtype=np.float64)
+        return np.vstack(out)
+
+    def _edge_snap_contour_normals(self, pts):
+        """Unit normals for an ordered closed-ish contour (Nx2)."""
+        pts = np.asarray(pts, dtype=np.float64)
+        if len(pts) < 3:
+            return np.zeros_like(pts)
+        nxt = np.roll(pts, -1, axis=0)
+        prv = np.roll(pts, 1, axis=0)
+        tang = nxt - prv
+        nrm = np.column_stack([-tang[:, 1], tang[:, 0]])
+        ln = np.sqrt(np.sum(nrm * nrm, axis=1, keepdims=True)) + 1e-8
+        return nrm / ln
+
+    def _edge_snap_tissue_mask(self, gray2d, invert=None, tightness=20):
+        """Bulk tissue silhouette via large-scale envelope (not single cells).
+
+        invert: None = auto (try both), True = dark tissue, False = bright tissue.
+        tightness: percentile used as threshold (lower → more tissue when bright).
+        """
+        g = np.asarray(gray2d, dtype=np.float64)
+        if g.max() > g.min():
+            g = (g - g.min()) / (g.max() - g.min())
+        try:
+            gb = ndi.gaussian_filter(g, sigma=max(2.0, min(g.shape) / 160.0))
+        except Exception:
+            gb = g
+        tightness = float(np.clip(tightness, 5, 50))
+        polarities = [False, True] if invert is None else [bool(invert)]
+        candidates = []
+        for inv in polarities:
+            for pct in (tightness, tightness + 8, max(8, tightness - 6)):
+                thr = float(np.percentile(gb, pct if not inv else 100.0 - pct))
+                m = gb < thr if inv else gb > thr
+                open_r = max(1, min(g.shape) // 400)
+                close_r = max(3, min(g.shape) // 180)
+                m = self._edge_snap_morph_open_close(m, open_r, close_r)
+                try:
+                    m = ndi.binary_fill_holes(m)
+                except Exception:
+                    pass
+                m = self._edge_snap_largest_cc(m)
+                area = int(m.sum())
+                frac = area / float(m.size)
+                if 0.06 < frac < 0.94:
+                    # Prefer compact bulk (lower perimeter^2 / area is better)
+                    try:
+                        peri = float(np.sum(m ^ ndi.binary_erosion(m)))
+                        compact = area / (peri * peri + 1e-6)
+                    except Exception:
+                        compact = 1.0
+                    candidates.append((compact * area, area, m))
+        if not candidates:
+            thr = float(np.percentile(gb, 40))
+            m = self._edge_snap_largest_cc(gb > thr)
+            if not m.any():
+                raise RuntimeError("Could not segment tissue")
+            return m
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][2]
+
+    def _edge_snap_atlas_region_mask(self, page=None, zid=None):
+        """Filled silhouette from zone mask (union or one region)."""
+        page = self.current_page if page is None else page
+        mask_img = (getattr(self, "mask_images", {}) or {}).get(page)
+        if mask_img is None:
+            return None
+        arr = np.asarray(mask_img)
+        if arr.ndim != 2 or not np.any(arr):
+            return None
+        if zid is not None:
+            m = arr == int(zid)
+        else:
+            m = arr > 0
+        if not m.any():
+            return None
+        m = self._edge_snap_largest_cc(m) if zid is not None else m.astype(bool)
+        try:
+            m = ndi.binary_fill_holes(m)
+        except Exception:
+            pass
+        return m
+
+    def _edge_snap_atlas_ink_mask(self, base_pil):
+        """Filled silhouette of atlas drawing (not internal lines alone)."""
+        arr = np.asarray(base_pil.convert("RGBA"))
+        h, w = arr.shape[:2]
+        if arr.shape[2] == 4:
+            ink = arr[:, :, 3] > 15
+            rgb = arr[:, :, :3].astype(np.float64)
+            ink = ink | ((np.mean(rgb, axis=2) < 245) & (np.mean(rgb, axis=2) > 5))
+        else:
+            rgb = arr.astype(np.float64)
+            if rgb.ndim == 2:
+                ink = (rgb < 245) & (rgb > 5)
+            else:
+                m = np.mean(rgb[..., :3], axis=2)
+                ink = (m < 245) & (m > 5)
+        if not ink.any():
+            ink = np.ones((h, w), dtype=bool)
+        try:
+            ink = morphology.binary_dilation(ink, footprint=disk(1))
+            ink = ndi.binary_fill_holes(ink)
+            ink = self._edge_snap_morph_open_close(ink, open_r=0, close_r=2)
+        except Exception:
+            pass
+        return self._edge_snap_largest_cc(ink)
+
+    def _edge_snap_apply_sim(self, pts, s, ang_deg, tvec):
+        """p' = s R p + t  (R CCW)."""
+        pts = np.asarray(pts, dtype=np.float64)
+        th = np.radians(float(ang_deg))
+        R = np.array(
+            [[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]], dtype=np.float64
+        )
+        t = np.asarray(tvec, dtype=np.float64).reshape(2)
+        return (float(s) * (R @ pts.T)).T + t
+
+    def _edge_snap_compose_sim(self, s1, ang1, t1, s2, ang2, t2):
+        """Compose T2 ∘ T1 (apply T1 first). Returns s, ang, t."""
+        th1 = np.radians(float(ang1))
+        th2 = np.radians(float(ang2))
+        R1 = np.array(
+            [[np.cos(th1), -np.sin(th1)], [np.sin(th1), np.cos(th1)]], dtype=np.float64
+        )
+        R2 = np.array(
+            [[np.cos(th2), -np.sin(th2)], [np.sin(th2), np.cos(th2)]], dtype=np.float64
+        )
+        Rf = R2 @ R1
+        sf = float(s2) * float(s1)
+        tf = float(s2) * (R2 @ np.asarray(t1, dtype=np.float64).reshape(2)) + np.asarray(
+            t2, dtype=np.float64
+        ).reshape(2)
+        ang = float(np.degrees(np.arctan2(Rf[1, 0], Rf[0, 0])))
+        return sf, ang, tf
+
+    def _edge_snap_flip_lr(self, pts, cx):
+        out = np.asarray(pts, dtype=np.float64).copy()
+        out[:, 0] = 2.0 * float(cx) - out[:, 0]
+        return out
+
+    def _edge_snap_distance_map(self, pts, shape, pad=8):
+        """Distance-to-contour raster for Chamfer scoring. Returns (dist, ox, oy, step)."""
+        pts = np.asarray(pts, dtype=np.float64)
+        h, w = int(shape[0]), int(shape[1])
+        step = max(1, int(round(max(h, w) / 900.0)))
+        hs, ws = max(8, h // step), max(8, w // step)
+        canvas = np.ones((hs, ws), dtype=bool)
+        xs = np.clip(np.round(pts[:, 0] / step).astype(int), 0, ws - 1)
+        ys = np.clip(np.round(pts[:, 1] / step).astype(int), 0, hs - 1)
+        canvas[ys, xs] = False
+        dist = distance_transform_edt(canvas) * float(step)
+        return dist, 0, 0, step
+
+    def _edge_snap_chamfer(self, src, dist, step, robust=0.80):
+        """Mean distance of src points into a distance map (robust percentile)."""
+        src = np.asarray(src, dtype=np.float64)
+        if len(src) == 0:
+            return 1e9
+        hs, ws = dist.shape
+        xs = np.clip(np.round(src[:, 0] / step).astype(int), 0, ws - 1)
+        ys = np.clip(np.round(src[:, 1] / step).astype(int), 0, hs - 1)
+        d = dist[ys, xs]
+        if robust and 0 < robust < 1:
+            d = d[d <= np.percentile(d, 100.0 * robust)]
+            if d.size == 0:
+                return 1e9
+        return float(np.mean(d))
+
+    def _edge_snap_nn_rmse(self, src, dst, max_src=400, max_dst=4000):
+        """Mean NN distance (cKDTree); kept for diagnostics."""
+        src = np.asarray(src, dtype=np.float64)
+        dst = np.asarray(dst, dtype=np.float64)
+        if len(src) == 0 or len(dst) == 0:
+            return 1e9
+        rng = np.random.default_rng(0)
+        if len(src) > max_src:
+            src = src[rng.choice(len(src), max_src, replace=False)]
+        if len(dst) > max_dst:
+            dst = dst[rng.choice(len(dst), max_dst, replace=False)]
+        try:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(dst)
+            try:
+                d, _ = tree.query(src, k=1, workers=-1)
+            except TypeError:
+                d, _ = tree.query(src, k=1)
+            return float(np.mean(d))
+        except Exception:
+            dsum = 0.0
+            chunk = 80
+            for i in range(0, len(src), chunk):
+                p = src[i : i + chunk]
+                d2 = (p[:, None, 0] - dst[None, :, 0]) ** 2 + (
+                    p[:, None, 1] - dst[None, :, 1]
+                ) ** 2
+                dsum += float(np.sum(np.sqrt(np.min(d2, axis=1))))
+            return float(dsum / max(len(src), 1))
+
+    def _edge_snap_icp_similarity(
+        self,
+        src,
+        dst,
+        n_iter=12,
+        allow_scale=True,
+        allow_rotate=True,
+        allow_translate=True,
+        dst_normals=None,
+    ):
+        """Point-to-plane-aware ICP (normal filter + Umeyama). Returns s, ang, t, rmse, R."""
+        src = np.asarray(src, dtype=np.float64).copy()
+        dst = np.asarray(dst, dtype=np.float64)
+        if len(src) < 8 or len(dst) < 8:
+            raise RuntimeError("Not enough contour points for ICP")
+        try:
+            from scipy.spatial import cKDTree
+        except Exception:
+            cKDTree = None
+        rng = np.random.default_rng(1)
+        src0 = src if len(src) <= 360 else src[rng.choice(len(src), 360, replace=False)]
+        if len(dst) > 4000:
+            sel = rng.choice(len(dst), 4000, replace=False)
+            dst0 = dst[sel]
+            nrm0 = None if dst_normals is None else np.asarray(dst_normals)[sel]
+        else:
+            dst0 = dst
+            nrm0 = None if dst_normals is None else np.asarray(dst_normals)
+        tree = cKDTree(dst0) if cKDTree is not None else None
+        s_tot, R_tot, t_tot = 1.0, np.eye(2), np.zeros(2)
+        cur = src0.copy()
+        last_rmse = 1e18
+        for _it in range(n_iter):
+            j = None
+            if tree is not None:
+                try:
+                    d, j = tree.query(cur, k=1, workers=-1)
+                except TypeError:
+                    d, j = tree.query(cur, k=1)
+                nn = dst0[j]
+            else:
+                nn = np.empty_like(cur)
+                d = np.empty(len(cur))
+                j = np.empty(len(cur), dtype=int)
+                chunk = 80
+                for i in range(0, len(cur), chunk):
+                    p = cur[i : i + chunk]
+                    d2 = (p[:, None, 0] - dst0[None, :, 0]) ** 2 + (
+                        p[:, None, 1] - dst0[None, :, 1]
+                    ) ** 2
+                    jj = np.argmin(d2, axis=1)
+                    j[i : i + len(p)] = jj
+                    nn[i : i + len(p)] = dst0[jj]
+                    d[i : i + len(p)] = np.sqrt(np.min(d2, axis=1))
+            keep = d <= np.percentile(d, 80)
+            if nrm0 is not None and j is not None:
+                nrm = nrm0[j]
+                # Keep pairs whose offset has a normal component (reject sliding along edge)
+                delta = cur - nn
+                dn = np.sum(delta * nrm, axis=1)
+                keep = keep & (np.abs(dn) >= 0.25 * (d + 1e-6))
+            if int(keep.sum()) < 8:
+                keep = d <= np.percentile(d, 90)
+            try:
+                s, ang, R, t, rmse = self._umeyama_similarity(
+                    cur[keep], nn[keep], with_scale=bool(allow_scale)
+                )
+            except Exception:
+                break
+            if not allow_scale:
+                s = 1.0
+            if not allow_rotate:
+                ang, R = 0.0, np.eye(2)
+            if not allow_translate:
+                t = np.zeros(2)
+            cur = (s * (R @ cur.T)).T + t
+            R_tot = R @ R_tot
+            t_tot = s * (R @ t_tot) + t
+            s_tot = s * s_tot
+            last_rmse = rmse
+            if rmse < 1.2:
+                break
+        angle = float(np.degrees(np.arctan2(R_tot[1, 0], R_tot[0, 0])))
+        s_tot = float(np.clip(s_tot, 0.1, 10.0))
+        return s_tot, angle, t_tot, last_rmse, R_tot
+
+    def run_atlas_edge_snap(self):
+        """Open Edge Snap dialog (preview → apply). Does not bake rasters until Apply."""
+        if not self.atlas_filetype:
+            messagebox.showwarning("Edge Snap", "Load an atlas first.")
+            return
+        bg = getattr(self, "original_background", None) or getattr(
+            self, "background_image", None
+        )
+        if bg is None:
+            messagebox.showwarning("Edge Snap", "Load a TIFF/image first.")
+            return
+        page = self.current_page
+        if self.base_page_images.get(page) is None:
+            messagebox.showwarning("Edge Snap", "No atlas page image.")
+            return
+        self._open_edge_snap_dialog()
+
+    def _edge_snap_capture_layers(self):
+        page = self.current_page
+        return {
+            "page": page,
+            "img_x": float(self.img_x),
+            "img_y": float(self.img_y),
+            "base": self.base_page_images[page].copy(),
+            "mask": (
+                self.mask_images[page].copy()
+                if page in self.mask_images and self.mask_images[page] is not None
+                else None
+            ),
+            "pure": (
+                self.allen_borders_pure.copy()
+                if getattr(self, "allen_borders_pure", None) is not None
+                else None
+            ),
+            "img": self.img.copy() if getattr(self, "img", None) is not None else None,
+        }
+
+    def _edge_snap_restore_layers(self, snap, rebuild=True):
+        if not snap:
+            return
+        page = snap["page"]
+        self.img_x = float(snap["img_x"])
+        self.img_y = float(snap["img_y"])
+        self.base_page_images[page] = snap["base"].copy()
+        if snap.get("mask") is not None:
+            self.mask_images[page] = snap["mask"].copy()
+        if snap.get("pure") is not None:
+            self.allen_borders_pure = snap["pure"].copy()
+        if snap.get("img") is not None:
+            self.img = snap["img"].copy()
+        if rebuild:
+            try:
+                clear_preprocess_cache()
+            except Exception:
+                pass
+            self._rebuild_page_overlays(page)
+
+    def _open_edge_snap_dialog(self):
+        try:
+            win0 = getattr(self, "_edge_snap_dialog", None)
+            if win0 is not None and win0.winfo_exists():
+                win0.lift()
+                return
+        except Exception:
+            pass
+
+        # Pose-only session: all previews/applies start from this snapshot
+        self._edge_snap_snapshot = self._edge_snap_capture_layers()
+        self._edge_snap_preview = None
+
+        has_landmarks = len(getattr(self, "_last_landmark_pairs", []) or []) >= 2
+        has_zones = False
+        try:
+            mi = (getattr(self, "mask_images", {}) or {}).get(self.current_page)
+            has_zones = mi is not None and np.any(np.asarray(mi) > 0)
+        except Exception:
+            has_zones = False
+        has_sel = (
+            getattr(self, "selected_zone_id", None) is not None
+            and getattr(self, "selected_page", None) == self.current_page
+        )
+
+        win = Toplevel(self.master)
+        self._edge_snap_dialog = win
+        win.title("Edge Snap")
+        win.attributes("-topmost", "true")
+        win.resizable(False, False)
+        try:
+            self._register_transparent_window(win)
+        except Exception:
+            pass
+
+        def _on_close():
+            self._close_edge_snap_dialog(restore=False)
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+        ttk.Label(
+            win,
+            text="Snap atlas outline to tissue  ·  Preview first, then Apply",
+            font=("Helvetica", 10, "bold"),
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+
+        opts = ttk.LabelFrame(win, text="Search")
+        opts.pack(fill="x", padx=12, pady=4)
+        self._es_mode = tk.StringVar(value="refine" if has_landmarks else "refine")
+        ttk.Radiobutton(
+            opts,
+            text="Refine current pose  (±12°, scale ±8%, small shift)  — use after Landmarks",
+            variable=self._es_mode,
+            value="refine",
+        ).pack(anchor="w", padx=8, pady=(4, 0))
+        ttk.Radiobutton(
+            opts,
+            text="From scratch  (full rotation search + translation)  — atlas still far off",
+            variable=self._es_mode,
+            value="scratch",
+        ).pack(anchor="w", padx=8, pady=(0, 4))
+
+        cons = ttk.LabelFrame(win, text="Allow")
+        cons.pack(fill="x", padx=12, pady=4)
+        row = ttk.Frame(cons)
+        row.pack(anchor="w", padx=8, pady=4)
+        self._es_allow_t = tk.BooleanVar(value=True)
+        self._es_allow_r = tk.BooleanVar(value=True)
+        self._es_allow_s = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row, text="Translate", variable=self._es_allow_t).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(row, text="Rotate", variable=self._es_allow_r).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(row, text="Scale", variable=self._es_allow_s).pack(side=tk.LEFT)
+
+        extra = ttk.LabelFrame(win, text="Matching")
+        extra.pack(fill="x", padx=12, pady=4)
+        self._es_partial = tk.BooleanVar(value=True)
+        self._es_flip = tk.BooleanVar(value=False)
+        self._es_use_zones = tk.BooleanVar(value=has_zones)
+        self._es_per_region = tk.BooleanVar(value=False)
+        self._es_prior = tk.BooleanVar(value=has_landmarks)
+        self._es_holes = tk.BooleanVar(value=True)
+        self._es_invert = tk.BooleanVar(value=False)
+        self._es_auto_polarity = tk.BooleanVar(value=True)
+        for txt, var, en in (
+            ("Partial overlap (hemi / torn / cropped section)", self._es_partial, True),
+            ("Also try left–right flip", self._es_flip, True),
+            ("Use region-mask silhouette (cleaner than atlas ink)", self._es_use_zones, has_zones),
+            ("Per-region only (selected zone — does not move whole atlas)", self._es_per_region, has_sel),
+            ("Landmark prior (keep last landmark points nearly fixed)", self._es_prior, has_landmarks),
+            ("Match ventricles / holes as extra contours", self._es_holes, True),
+        ):
+            cb = ttk.Checkbutton(extra, text=txt, variable=var)
+            cb.pack(anchor="w", padx=8, pady=1)
+            if not en:
+                try:
+                    cb.state(["disabled"])
+                except Exception:
+                    pass
+        pol = ttk.Frame(extra)
+        pol.pack(fill="x", padx=8, pady=(2, 4))
+        ttk.Checkbutton(
+            pol, text="Auto tissue polarity", variable=self._es_auto_polarity
+        ).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            pol, text="Force invert (dark tissue)", variable=self._es_invert
+        ).pack(side=tk.LEFT, padx=10)
+        thr_row = ttk.Frame(extra)
+        thr_row.pack(fill="x", padx=8, pady=(0, 6))
+        ttk.Label(thr_row, text="Tissue tightness").pack(side=tk.LEFT)
+        self._es_tight = tk.IntVar(value=20)
+        ttk.Scale(thr_row, from_=8, to=40, variable=self._es_tight, orient=tk.HORIZONTAL, length=160).pack(
+            side=tk.LEFT, padx=6
+        )
+
+        self._es_quality = tk.StringVar(
+            value="Click Preview to score the current outlines (cyan=tissue, magenta=atlas)."
+        )
+        ttk.Label(
+            win, textvariable=self._es_quality, wraplength=520, font=("Helvetica", 8)
+        ).pack(anchor="w", padx=14, pady=(4, 2))
+
+        btn = ttk.Frame(win)
+        btn.pack(pady=(6, 12))
+        ttk.Button(btn, text="Preview", command=self._edge_snap_preview_clicked, width=11).pack(
+            side=tk.LEFT, padx=3
+        )
+        ttk.Button(btn, text="Apply", command=self._edge_snap_apply_clicked, width=11).pack(
+            side=tk.LEFT, padx=3
+        )
+        ttk.Button(btn, text="Restore", command=self._edge_snap_restore_clicked, width=11).pack(
+            side=tk.LEFT, padx=3
+        )
+        ttk.Button(btn, text="Close", command=_on_close, width=11).pack(side=tk.LEFT, padx=3)
+
+        try:
+            win.update_idletasks()
+            mx = self.master.winfo_rootx() + max(20, self.master.winfo_width() - 560)
+            my = self.master.winfo_rooty() + 70
+            win.geometry(f"+{mx}+{my}")
+        except Exception:
+            pass
+
+    def _close_edge_snap_dialog(self, restore=False):
+        if restore:
+            try:
+                self._edge_snap_restore_layers(self._edge_snap_snapshot)
+            except Exception:
+                pass
+        self._edge_snap_preview = None
+        self._clear_edge_snap_overlay()
+        try:
+            if self._edge_snap_dialog is not None and self._edge_snap_dialog.winfo_exists():
+                self._edge_snap_dialog.destroy()
+        except Exception:
+            pass
+        self._edge_snap_dialog = None
+        try:
+            self.show_page()
+        except Exception:
+            pass
+
+    def _edge_snap_options_from_ui(self):
+        invert = None
+        if not bool(self._es_auto_polarity.get()):
+            invert = bool(self._es_invert.get())
+        per_region = bool(self._es_per_region.get())
+        zid = None
+        if per_region and getattr(self, "selected_zone_id", None) is not None:
+            zid = int(self.selected_zone_id)
+        return {
+            "mode": (self._es_mode.get() or "refine"),
+            "allow_t": bool(self._es_allow_t.get()),
+            "allow_r": bool(self._es_allow_r.get()),
+            "allow_s": bool(self._es_allow_s.get()),
+            "partial": bool(self._es_partial.get()),
+            "flip": bool(self._es_flip.get()),
+            "use_zones": bool(self._es_use_zones.get()),
+            "per_region": per_region,
+            "zid": zid,
+            "prior": bool(self._es_prior.get()),
+            "holes": bool(self._es_holes.get()),
+            "invert": invert,
+            "tightness": int(self._es_tight.get()),
+        }
+
+    def _edge_snap_collect_contours(self, opts, progress=None):
+        """Build tissue + atlas point clouds in image space from the snapshot pose."""
+        self._edge_snap_restore_layers(self._edge_snap_snapshot, rebuild=False)
+        bg = getattr(self, "original_background", None) or getattr(
+            self, "background_image", None
+        )
+        page = self.current_page
+        base = self.base_page_images.get(page)
+        gray = np.asarray(bg.convert("L"), dtype=np.float64)
+        step = max(1, int(round(max(gray.shape) / 1400.0)))
+        gray_s = gray[::step, ::step] if step > 1 else gray
+        if progress:
+            progress.set_progress(12, "Segmenting tissue…")
+        tissue = self._edge_snap_tissue_mask(
+            gray_s, invert=opts["invert"], tightness=opts["tightness"]
+        )
+        t_outer = self._edge_snap_outer_contour_xy(tissue, n_samples=420)
+        if step > 1:
+            t_outer = t_outer * float(step)
+        t_pts = t_outer
+        if opts.get("holes"):
+            holes = self._edge_snap_hole_contours_xy(tissue, n_samples=80)
+            if step > 1 and len(holes):
+                holes = holes * float(step)
+            if len(holes):
+                t_pts = np.vstack([t_pts, holes])
+
+        if progress:
+            progress.set_progress(32, "Atlas silhouette…")
+        atlas_mask = None
+        if opts.get("zid") is not None:
+            atlas_mask = self._edge_snap_atlas_region_mask(page, zid=opts["zid"])
+        elif opts.get("use_zones"):
+            atlas_mask = self._edge_snap_atlas_region_mask(page, zid=None)
+        if atlas_mask is None:
+            atlas_mask = self._edge_snap_atlas_ink_mask(base)
+        a_model = self._edge_snap_outer_contour_xy(atlas_mask, n_samples=420)
+        a_pts = a_model + np.array([float(self.img_x), float(self.img_y)], dtype=np.float64)
+        if opts.get("holes"):
+            a_holes = self._edge_snap_hole_contours_xy(atlas_mask, n_samples=80)
+            if len(a_holes):
+                a_pts = np.vstack(
+                    [
+                        a_pts,
+                        a_holes
+                        + np.array([float(self.img_x), float(self.img_y)], dtype=np.float64),
+                    ]
+                )
+
+        # Partial overlap: keep atlas points near the tissue bbox
+        if opts.get("partial"):
+            tb = [
+                float(t_outer[:, 0].min()),
+                float(t_outer[:, 1].min()),
+                float(t_outer[:, 0].max()),
+                float(t_outer[:, 1].max()),
+            ]
+            pad = 0.12 * max(tb[2] - tb[0], tb[3] - tb[1], 20.0)
+            sel = (
+                (a_pts[:, 0] >= tb[0] - pad)
+                & (a_pts[:, 0] <= tb[2] + pad)
+                & (a_pts[:, 1] >= tb[1] - pad)
+                & (a_pts[:, 1] <= tb[3] + pad)
+            )
+            if int(sel.sum()) >= 16:
+                a_pts = a_pts[sel]
+            # And tissue points near atlas bbox (hemi atlas vs larger tissue)
+            ab = [
+                float(a_pts[:, 0].min()),
+                float(a_pts[:, 1].min()),
+                float(a_pts[:, 0].max()),
+                float(a_pts[:, 1].max()),
+            ]
+            pad_t = 0.12 * max(ab[2] - ab[0], ab[3] - ab[1], 20.0)
+            tsel = (
+                (t_pts[:, 0] >= ab[0] - pad_t)
+                & (t_pts[:, 0] <= ab[2] + pad_t)
+                & (t_pts[:, 1] >= ab[1] - pad_t)
+                & (t_pts[:, 1] <= ab[3] + pad_t)
+            )
+            if int(tsel.sum()) >= 16:
+                t_pts = t_pts[tsel]
+
+        bg_h, bg_w = gray.shape[:2]
+        return {
+            "t_outer": t_outer,
+            "t_pts": t_pts,
+            "a_pts": a_pts,
+            "a_outer": a_model + np.array([float(self.img_x), float(self.img_y)]),
+            "tissue_mask": tissue,
+            "atlas_mask": atlas_mask,
+            "step": step,
+            "bg_shape": (bg_h, bg_w),
+            "t_frac": float(np.mean(tissue)),
+            "a_frac": float(np.mean(atlas_mask)) if atlas_mask is not None else 0.0,
+        }
+
+    def _edge_snap_score(self, a_pts, s, ang, tvec, t_dist, t_step, t_pts, a_dist, a_step, landmark_xy, prior_w):
+        pred = self._edge_snap_apply_sim(a_pts, s, ang, tvec)
+        fwd = self._edge_snap_chamfer(pred, t_dist, t_step, robust=0.80)
+        # Inverse: map tissue onto atlas distance
+        th = np.radians(float(ang))
+        R = np.array(
+            [[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]], dtype=np.float64
+        )
+        s = float(s) if abs(float(s)) > 1e-8 else 1.0
+        Rinv = R.T
+        t = np.asarray(tvec, dtype=np.float64).reshape(2)
+        t_back = (Rinv @ ((np.asarray(t_pts) - t).T / s)).T
+        back = self._edge_snap_chamfer(t_back, a_dist, a_step, robust=0.80)
+        rmse = 0.5 * (fwd + back)
+        if landmark_xy is not None and prior_w > 0 and len(landmark_xy):
+            moved = self._edge_snap_apply_sim(landmark_xy, s, ang, tvec)
+            prior = float(np.mean(np.sqrt(np.sum((moved - landmark_xy) ** 2, axis=1))))
+            rmse = rmse + float(prior_w) * prior
+        return rmse, pred, fwd, back
+
+    def _edge_snap_search_pose(self, clouds, opts, progress=None):
+        """Coarse-to-fine similarity search. Returns dict of best pose."""
+        a_pts = clouds["a_pts"]
+        t_pts = clouds["t_pts"]
+        bg_shape = clouds["bg_shape"]
+        t_dist, _, _, t_step = self._edge_snap_distance_map(t_pts, bg_shape)
+        a_dist, _, _, a_step = self._edge_snap_distance_map(a_pts, bg_shape)
+        landmark_xy = None
+        prior_w = 0.0
+        if opts.get("prior"):
+            pairs = list(getattr(self, "_last_landmark_pairs", []) or [])
+            if len(pairs) >= 2:
+                landmark_xy = np.array([p["tissue"] for p in pairs], dtype=np.float64)
+                prior_w = 0.35
+
+        allow_t, allow_r, allow_s = opts["allow_t"], opts["allow_r"], opts["allow_s"]
+        mode = opts.get("mode") or "refine"
+        t_mu = t_pts.mean(axis=0)
+        a_mu = a_pts.mean(axis=0)
+        t_rad = float(np.sqrt(np.mean(np.sum((t_pts - t_mu) ** 2, axis=1))))
+        a_rad = float(np.sqrt(np.mean(np.sum((a_pts - a_mu) ** 2, axis=1))))
+        if a_rad < 1e-3:
+            raise RuntimeError("Atlas contour radius degenerate")
+        s_hint = float(np.clip(t_rad / a_rad, 0.2, 6.0))
+
+        def _eval(s, ang, tvec):
+            if not allow_s:
+                s = 1.0
+            if not allow_r:
+                ang = 0.0
+            if not allow_t:
+                tvec = np.zeros(2)
+            return self._edge_snap_score(
+                a_pts, s, ang, tvec, t_dist, t_step, t_pts, a_dist, a_step, landmark_xy, prior_w
+            )
+
+        # Identity (current pose) is always a candidate
+        best_rmse, best_pred, best_fwd, best_back = _eval(1.0, 0.0, np.zeros(2))
+        best = (best_rmse, 1.0, 0.0, np.zeros(2), False)
+
+        flips = [False, True] if opts.get("flip") else [False]
+
+        if mode == "scratch":
+            angs = np.linspace(-180, 180, 37, endpoint=False) if allow_r else [0.0]
+            scales = (
+                [s_hint * m for m in (0.80, 0.90, 1.00, 1.10, 1.22)]
+                if allow_s
+                else [1.0]
+            )
+            # Coarse translation offsets around centroid-align
+            off = [0.0]
+            if allow_t:
+                span = 0.12 * max(t_rad, 20.0)
+                off = [-span, 0.0, span]
+        else:
+            angs = np.linspace(-12, 12, 13) if allow_r else [0.0]
+            scales = [0.92, 0.96, 1.0, 1.04, 1.08] if allow_s else [1.0]
+            off = [0.0]
+            if allow_t:
+                span = 0.06 * max(t_rad, 20.0)
+                off = [-span, 0.0, span]
+
+        if progress:
+            progress.set_progress(50, "Pose search…")
+        n_done = 0
+        n_tot = max(1, len(flips) * len(angs) * len(scales) * len(off) * len(off))
+        for flip in flips:
+            src = self._edge_snap_flip_lr(a_pts, a_mu[0]) if flip else a_pts
+            src_mu = src.mean(axis=0)
+            # temporarily swap a_pts used inside _eval by local loop
+            for s in scales:
+                for ang in angs:
+                    th = np.radians(float(ang))
+                    R = np.array(
+                        [[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]],
+                        dtype=np.float64,
+                    )
+                    t0 = t_mu - float(s) * (R @ src_mu) if mode == "scratch" else np.zeros(2)
+                    for dx in off:
+                        for dy in off:
+                            tvec = np.array([t0[0] + dx, t0[1] + dy], dtype=np.float64)
+                            if not allow_t:
+                                tvec = t0 if mode == "scratch" else np.zeros(2)
+                            # score against possibly flipped source
+                            pred = self._edge_snap_apply_sim(src, s, ang, tvec)
+                            fwd = self._edge_snap_chamfer(pred, t_dist, t_step, robust=0.80)
+                            th_i = np.radians(float(ang))
+                            Ri = np.array(
+                                [
+                                    [np.cos(th_i), -np.sin(th_i)],
+                                    [np.sin(th_i), np.cos(th_i)],
+                                ],
+                                dtype=np.float64,
+                            )
+                            ss = float(s) if abs(float(s)) > 1e-8 else 1.0
+                            t_back = (Ri.T @ ((t_pts - tvec).T / ss)).T
+                            # atlas dist is for unflipped a_pts; rebuild cheaply if flipped
+                            if flip:
+                                a_dist_f, _, _, a_step_f = self._edge_snap_distance_map(src, bg_shape)
+                                back = self._edge_snap_chamfer(t_back, a_dist_f, a_step_f, robust=0.80)
+                            else:
+                                back = self._edge_snap_chamfer(t_back, a_dist, a_step, robust=0.80)
+                            rmse = 0.5 * (fwd + back)
+                            if (not flip) and landmark_xy is not None and prior_w > 0:
+                                moved = self._edge_snap_apply_sim(landmark_xy, s, ang, tvec)
+                                rmse += prior_w * float(
+                                    np.mean(np.sqrt(np.sum((moved - landmark_xy) ** 2, axis=1)))
+                                )
+                            if rmse < best[0]:
+                                best = (rmse, float(s), float(ang), tvec.copy(), bool(flip))
+                                best_fwd, best_back = fwd, back
+                            n_done += 1
+            if progress:
+                progress.set_progress(50 + int(35 * n_done / n_tot), "Pose search…")
+
+        rmse, s, ang, tvec, flip = best
+
+        # Fine local polish around best (half-step)
+        if progress:
+            progress.set_progress(86, "Fine polish…")
+        src = self._edge_snap_flip_lr(a_pts, a_mu[0]) if flip else a_pts
+        fine_s = [s] if not allow_s else [s * 0.97, s, s * 1.03]
+        fine_a = [ang] if not allow_r else [ang - 2, ang, ang + 2]
+        fine_d = [0.0] if not allow_t else [-0.025 * t_rad, 0.0, 0.025 * t_rad]
+        for ss in fine_s:
+            for aa in fine_a:
+                for dx in fine_d:
+                    for dy in fine_d:
+                        tv = np.array([tvec[0] + dx, tvec[1] + dy], dtype=np.float64)
+                        pred = self._edge_snap_apply_sim(src, ss, aa, tv)
+                        fwd = self._edge_snap_chamfer(pred, t_dist, t_step, robust=0.80)
+                        if fwd < rmse:
+                            rmse, s, ang, tvec = fwd, float(ss), float(aa), tv
+
+        # ICP on the winning pose
+        if progress:
+            progress.set_progress(90, "ICP…")
+        src = self._edge_snap_flip_lr(a_pts, a_mu[0]) if flip else a_pts
+        pred0 = self._edge_snap_apply_sim(src, s, ang, tvec)
+        nrm = self._edge_snap_contour_normals(clouds["t_outer"])
+        # Map outer normals onto t_pts by using outer only for ICP dest
+        try:
+            s_i, ang_i, t_i, rmse_i, _ = self._edge_snap_icp_similarity(
+                pred0,
+                clouds["t_outer"],
+                n_iter=14,
+                allow_scale=allow_s,
+                allow_rotate=allow_r,
+                allow_translate=allow_t,
+                dst_normals=nrm,
+            )
+            s, ang, tvec = self._edge_snap_compose_sim(s, ang, tvec, s_i, ang_i, t_i)
+            rmse = float(rmse_i)
+        except Exception as e:
+            logger.warning(f"ICP refine skipped: {e}")
+
+        pred = self._edge_snap_apply_sim(src, s, ang, tvec)
+        fwd = self._edge_snap_chamfer(pred, t_dist, t_step, robust=0.80)
+        cover = float(np.mean(self._edge_snap_chamfer_hits(pred, t_dist, t_step, thresh=10.0)))
+        # Current (identity) score for comparison
+        cur_pred = a_pts
+        cur_rmse = self._edge_snap_chamfer(cur_pred, t_dist, t_step, robust=0.80)
+        return {
+            "s": float(s),
+            "ang": float(ang),
+            "t": np.asarray(tvec, dtype=np.float64),
+            "flip": bool(flip),
+            "rmse": float(fwd),
+            "rmse_before": float(cur_rmse),
+            "coverage": cover,
+            "pred": pred,
+            "a_pts": a_pts,
+            "t_outer": clouds["t_outer"],
+            "t_frac": clouds["t_frac"],
+            "a_frac": clouds["a_frac"],
+            "per_region": bool(opts.get("per_region") and opts.get("zid") is not None),
+            "zid": opts.get("zid"),
+        }
+
+    def _edge_snap_chamfer_hits(self, src, dist, step, thresh=10.0):
+        src = np.asarray(src, dtype=np.float64)
+        hs, ws = dist.shape
+        xs = np.clip(np.round(src[:, 0] / step).astype(int), 0, ws - 1)
+        ys = np.clip(np.round(src[:, 1] / step).astype(int), 0, hs - 1)
+        return dist[ys, xs] <= float(thresh)
+
+    def _edge_snap_quality_text(self, result):
+        notes = []
+        tf, af = result.get("t_frac", 0), result.get("a_frac", 0)
+        if tf > 0 and af > 0 and tf < 0.45 * af:
+            notes.append("tissue much smaller than atlas — likely hemi / torn (partial overlap helps)")
+        if result["coverage"] < 0.55:
+            notes.append("low overlap — try From scratch, invert polarity, or Landmarks")
+        if result["rmse"] > result["rmse_before"] * 1.05 + 1.5:
+            notes.append("proposed pose is WORSE than current — Apply will warn")
+        elif result["rmse"] < result["rmse_before"] - 1.0:
+            notes.append("improvement over current pose")
+        extra = ("; ".join(notes)) if notes else "ok"
+        flip = "  ·  FLIP" if result.get("flip") else ""
+        return (
+            f"Before {result['rmse_before']:.1f} px   →   After {result['rmse']:.1f} px"
+            f"   ·  coverage {100 * result['coverage']:.0f}%"
+            f"   ·  scale {result['s']:.3f}   rot {result['ang']:.2f}°{flip}\n"
+            f"{extra}"
+        )
+
+    def _clear_edge_snap_overlay(self):
+        for item in getattr(self, "_edge_snap_overlay_ids", []) or []:
+            try:
+                self.output.delete(item)
+            except Exception:
+                pass
+        self._edge_snap_overlay_ids = []
+        try:
+            self.output.delete("edge_snap")
+        except Exception:
+            pass
+
+    def _redraw_edge_snap_overlay(self):
+        self._clear_edge_snap_overlay()
+        prev = getattr(self, "_edge_snap_preview", None)
+        if not prev:
+            return
+        ids = []
+
+        def _poly(pts, color, width=2, dash=None):
+            if pts is None or len(pts) < 2:
+                return
+            coords = []
+            for x, y in pts:
+                cx, cy = self._image_to_canvas(float(x), float(y))
+                coords.extend([cx, cy])
+            kw = dict(fill=color, width=width, tags=("edge_snap",))
+            if dash:
+                kw["dash"] = dash
+            ids.append(self.output.create_line(*coords, **kw))
+
+        _poly(prev.get("t_outer"), "#00e5ff", width=2)
+        _poly(prev.get("a_pts"), "#ab47bc", width=1, dash=(3, 2))
+        _poly(prev.get("pred"), "#e040fb", width=2)
+        try:
+            self.output.tag_raise("edge_snap")
+        except Exception:
+            pass
+        self._edge_snap_overlay_ids = ids
+
+    def _edge_snap_preview_clicked(self):
+        if self._edge_snap_snapshot is None:
+            self._edge_snap_snapshot = self._edge_snap_capture_layers()
+        opts = self._edge_snap_options_from_ui()
+        progress = None
+        try:
+            progress = self._show_busy_dialog("Edge Snap preview")
+            progress.set_progress(5, "Collecting outlines…")
+        except Exception:
+            progress = None
+        try:
+            clouds = self._edge_snap_collect_contours(opts, progress=progress)
+            result = self._edge_snap_search_pose(clouds, opts, progress=progress)
+            self._edge_snap_preview = result
+            if hasattr(self, "_es_quality"):
+                self._es_quality.set(self._edge_snap_quality_text(result))
+            # Restore rasters (preview is overlay-only)
+            self._edge_snap_restore_layers(self._edge_snap_snapshot, rebuild=True)
+            self.show_page()
+            if progress:
+                try:
+                    progress.set_progress(100, "Done")
+                    progress.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            if progress:
+                try:
+                    progress.close()
+                except Exception:
+                    pass
+            logger.error(f"Edge snap preview failed: {e}", exc_info=True)
+            messagebox.showerror(
+                "Edge Snap",
+                f"Could not preview snap:\n{e}\n\n"
+                "Check that the TIFF shows a clear tissue mass.\n"
+                "Try Auto polarity, invert, or Landmarks first.",
+            )
+
+    def _edge_snap_restore_clicked(self):
+        self._edge_snap_preview = None
+        self._clear_edge_snap_overlay()
+        try:
+            self._edge_snap_restore_layers(self._edge_snap_snapshot, rebuild=True)
+            self.show_page()
+        except Exception as e:
+            messagebox.showerror("Edge Snap", f"Restore failed:\n{e}")
+        if hasattr(self, "_es_quality"):
+            self._es_quality.set("Restored session snapshot. Click Preview again.")
+
+    def _edge_snap_apply_clicked(self):
+        prev = getattr(self, "_edge_snap_preview", None)
+        if not prev:
+            messagebox.showinfo("Edge Snap", "Click Preview first, then Apply.")
+            return
+        if prev["rmse"] > prev["rmse_before"] * 1.05 + 1.5:
+            if not messagebox.askyesno(
+                "Edge Snap",
+                f"Proposed pose is worse than current "
+                f"({prev['rmse']:.1f} vs {prev['rmse_before']:.1f} px).\n\n"
+                "Apply anyway?",
+            ):
+                return
+        try:
+            self.save_state()
+            self._edge_snap_restore_layers(self._edge_snap_snapshot, rebuild=False)
+            if prev.get("flip"):
+                self._edge_snap_flip_atlas_layers()
+            if prev.get("per_region") and prev.get("zid") is not None:
+                self._apply_similarity_to_region_image(
+                    self.current_page, int(prev["zid"]), prev["s"], prev["ang"], prev["t"]
+                )
+            else:
+                self._apply_global_atlas_similarity(prev["s"], prev["ang"], prev["t"])
+            # New snapshot = applied result (next preview starts here, one rasterization)
+            self._edge_snap_snapshot = self._edge_snap_capture_layers()
+            self._edge_snap_preview = None
+            self._clear_edge_snap_overlay()
+            self.show_page()
+            if hasattr(self, "_es_quality"):
+                self._es_quality.set(
+                    f"Applied.  RMSE {prev['rmse']:.1f} px  ·  "
+                    f"scale {prev['s']:.3f}  ·  rot {prev['ang']:.2f}°"
+                    + ("  ·  flip" if prev.get("flip") else "")
+                    + "\nClick Preview to refine again from this pose (no extra raster until Apply)."
+                )
+        except Exception as e:
+            logger.error(f"Edge snap apply failed: {e}", exc_info=True)
+            messagebox.showerror("Edge Snap", f"Apply failed:\n{e}")
+
+    def _edge_snap_flip_atlas_layers(self):
+        page = self.current_page
+        def _flip(im):
+            if im is None:
+                return None
+            try:
+                return im.transpose(Image.FLIP_LEFT_RIGHT)
+            except Exception:
+                return im.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        if page in self.base_page_images and self.base_page_images[page] is not None:
+            self.base_page_images[page] = _flip(self.base_page_images[page])
+        if page in self.mask_images and self.mask_images[page] is not None:
+            self.mask_images[page] = _flip(self.mask_images[page])
+        if getattr(self, "allen_borders_pure", None) is not None:
+            self.allen_borders_pure = _flip(self.allen_borders_pure)
+        if getattr(self, "img", None) is not None:
+            self.img = _flip(self.img)
+
+    def _apply_similarity_to_region_image(self, page, zone_id, s, ang_deg, tvec):
+        """Apply p' = s R p + t in image space to one zone of the label mask."""
+        if page not in self.mask_images or zone_id is None:
+            return False
+        mask_img = self.mask_images[page]
+        m = np.array(mask_img)
+        region = m == int(zone_id)
+        if not region.any():
+            return False
+        ys, xs = np.where(region)
+        # Image-space coords of mask pixels
+        ox, oy = float(self.img_x), float(self.img_y)
+        pts = np.column_stack([xs.astype(np.float64) + ox, ys.astype(np.float64) + oy])
+        pred = self._edge_snap_apply_sim(pts, s, ang_deg, tvec)
+        new_xy = np.column_stack([pred[:, 0] - ox, pred[:, 1] - oy])
+        new_m = m.copy()
+        new_m[region] = 0
+        h, w = new_m.shape
+        ix = np.clip(np.round(new_xy[:, 0]).astype(int), 0, w - 1)
+        iy = np.clip(np.round(new_xy[:, 1]).astype(int), 0, h - 1)
+        new_m[iy, ix] = int(zone_id)
+        try:
+            zbin = new_m == int(zone_id)
+            zbin = ndi.binary_dilation(zbin, iterations=1)
+            zbin = ndi.binary_fill_holes(zbin)
+            zbin = ndi.binary_erosion(zbin, iterations=1)
+            new_m[m == int(zone_id)] = 0
+            new_m[zbin] = int(zone_id)
+        except Exception:
+            pass
+        self.mask_images[page] = Image.fromarray(new_m.astype(np.uint8), mode="L")
+        try:
+            clear_preprocess_cache()
+        except Exception:
+            pass
+        self._rebuild_page_overlays(page)
+        return True
+
+    def start_atlas_local_refine_guide(self):
+        """Step 3: enable tools for local non-rigid-ish cleanup via border drag."""
+        if not self.atlas_filetype:
+            messagebox.showwarning("Local Refine", "Load an atlas first.")
+            return
+
+        # Enable border drag + prompt user
+        try:
+            if hasattr(self, "border_mode_var"):
+                self.border_mode_var.set(True)
+        except Exception:
+            pass
+        try:
+            self.region_move_mode.set(False)
+            self.edit_mode_var.set(False)
+            self.edit_mode = False
+            self.crop_mode_var.set(False)
+            self.crop_mode = False
+        except Exception:
+            pass
+
+        # Expand atlas ribbon if present
+        try:
+            if hasattr(self, "atlas_ribbon_expanded") and not self.atlas_ribbon_expanded:
+                self._toggle_atlas_ribbon()
+        except Exception:
+            pass
+
+        messagebox.showinfo(
+            "Local Refine",
+            "Practical stack — step 3: local refine\n\n"
+            "Global pose should already be close (Landmarks or Edge Snap).\n\n"
+            "Now refine individual structures:\n"
+            "  1. Atlas Manager → click a labeled region (or Select Region).\n"
+            "  2. Optional: Edge Snap… with “Per-region only” to ICP this zone.\n"
+            "  3. Enable “Border drag resize” if not already on.\n"
+            "  4. Grab the border (red segment) and drag to match tissue.\n"
+            "  5. Or use Move Selected Region to translate one zone.\n"
+            "  6. Paint custom zones for anatomy atlas cannot match.\n\n"
+            "Border drag mode has been turned ON for you.\n"
+            "Save Atlas Schematic (.catlas) when done.",
+        )
+        try:
+            self._update_ribbon_selection()
+        except Exception:
+            pass
+        try:
+            self.show_page()
+        except Exception:
+            pass
+
     def resize_custom(self):
         self.save_state()
         try:
@@ -16841,6 +23752,12 @@ class PDFViewer:
         # Prominent Undo button (works for paint, atlas edits, mask edits, etc.)
         # Placed in the always-visible ribbon header so it's easy to reach.
         ttk.Button(header, text="↶ Undo", command=self.undo, width=7).pack(side=tk.RIGHT, padx=4)
+        ttk.Checkbutton(
+            header,
+            text="Cell Mask",
+            variable=self.show_cell_mask,
+            command=self._on_show_cell_mask_toggled,
+        ).pack(side=tk.RIGHT, padx=6)
 
         # Expandable content
         self.ribbon_content = ttk.Frame(self.atlas_ribbon)
@@ -16865,6 +23782,83 @@ class PDFViewer:
         ttk.Button(global_frame, text="Clear Atlas", command=self.clear_atlas, width=11).pack(side=tk.LEFT, padx=6)
         ttk.Button(global_frame, text="Next Channel…", command=self.next_channel, width=13).pack(side=tk.LEFT, padx=2)
 
+        # Crop aspect ratio — clear LabelFrame so users see how to change it
+        crop_asp = ttk.LabelFrame(
+            self.ribbon_content,
+            text="Crop box shape (aspect ratio) — set this before dragging",
+        )
+        crop_asp.pack(fill="x", padx=4, pady=4)
+        self._crop_aspect_panel = crop_asp
+
+        row1 = ttk.Frame(crop_asp)
+        row1.pack(fill="x", padx=4, pady=2)
+        ttk.Checkbutton(
+            row1,
+            text="Lock aspect ratio while drawing",
+            variable=self.crop_aspect_lock_var,
+            command=self._on_crop_aspect_changed,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            row1,
+            text="How to…",
+            width=8,
+            command=self._show_crop_aspect_help,
+        ).pack(side=tk.LEFT, padx=8)
+
+        row2 = ttk.Frame(crop_asp)
+        row2.pack(fill="x", padx=4, pady=2)
+        ttk.Label(row2, text="Ratio:").pack(side=tk.LEFT)
+        self.crop_aspect_combo = ttk.Combobox(
+            row2,
+            textvariable=self.crop_aspect_preset_var,
+            values=(
+                "Match TIFF image",
+                "Square (1:1)",
+                "4:3",
+                "3:2",
+                "Widescreen (16:9)",
+                "Custom width × height…",
+            ),
+            width=24,
+            state="readonly",
+        )
+        self.crop_aspect_combo.pack(side=tk.LEFT, padx=4)
+        self.crop_aspect_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self._on_crop_aspect_changed()
+        )
+        ttk.Label(row2, text="Custom W").pack(side=tk.LEFT, padx=(10, 2))
+        self.crop_aspect_w_entry = ttk.Entry(
+            row2, textvariable=self.crop_aspect_w_var, width=5
+        )
+        self.crop_aspect_w_entry.pack(side=tk.LEFT)
+        ttk.Label(row2, text="× H").pack(side=tk.LEFT, padx=2)
+        self.crop_aspect_h_entry = ttk.Entry(
+            row2, textvariable=self.crop_aspect_h_var, width=5
+        )
+        self.crop_aspect_h_entry.pack(side=tk.LEFT)
+        ttk.Button(
+            row2,
+            text="Apply custom",
+            width=12,
+            command=self._on_crop_aspect_changed,
+        ).pack(side=tk.LEFT, padx=6)
+        for ent in (self.crop_aspect_w_entry, self.crop_aspect_h_entry):
+            ent.bind("<FocusOut>", lambda e: self._on_crop_aspect_changed())
+            ent.bind("<Return>", lambda e: self._on_crop_aspect_changed())
+
+        self.crop_aspect_hint_var = tk.StringVar(value="")
+        ttk.Label(
+            crop_asp,
+            textvariable=self.crop_aspect_hint_var,
+            foreground="#333",
+            wraplength=720,
+            font=("Helvetica", 9),
+        ).pack(anchor="w", padx=6, pady=(0, 4))
+        try:
+            self._on_crop_aspect_changed()
+        except Exception:
+            pass
+
         # Global quick adjust (mirrors the selected-region quick adjust below)
         global_manip_frame = ttk.Frame(self.ribbon_content)
         global_manip_frame.pack(fill='x', padx=4, pady=2)
@@ -16874,6 +23868,20 @@ class PDFViewer:
         ttk.Button(global_manip_frame, text="Scale +5%", command=lambda: self._quick_scale_global(1.05), width=9).pack(side=tk.LEFT, padx=1)
         ttk.Button(global_manip_frame, text="Scale -5%", command=lambda: self._quick_scale_global(0.95), width=9).pack(side=tk.LEFT, padx=1)
         ttk.Button(global_manip_frame, text="Dialogs...", command=self.show_rotate_settings, width=9).pack(side=tk.LEFT, padx=4)
+
+        # Alignment stack: landmarks → edge snap → local refine
+        align_frame = ttk.Frame(self.ribbon_content)
+        align_frame.pack(fill='x', padx=4, pady=2)
+        ttk.Label(align_frame, text="Align:").pack(side=tk.LEFT)
+        ttk.Button(
+            align_frame, text="Landmarks…", command=self.start_atlas_landmark_align, width=11
+        ).pack(side=tk.LEFT, padx=1)
+        ttk.Button(
+            align_frame, text="Edge Snap…", command=self.run_atlas_edge_snap, width=11
+        ).pack(side=tk.LEFT, padx=1)
+        ttk.Button(
+            align_frame, text="Local Refine…", command=self.start_atlas_local_refine_guide, width=12
+        ).pack(side=tk.LEFT, padx=1)
 
         # Move selected region (translate only this zone's area in the mask; underlying atlas stays fixed)
         move_frame = ttk.Frame(self.ribbon_content)
@@ -16893,10 +23901,15 @@ class PDFViewer:
         # Selectable list of all labeled regions for current page
         list_frame = ttk.Frame(self.ribbon_content)
         list_frame.pack(fill='both', expand=True, padx=4, pady=2)
-        ttk.Label(
+        self._region_list_hint = ttk.Label(
             list_frame,
             text="Labeled Regions (current page) — click to select; right-click for Rename / Delete:",
-        ).pack(anchor='w')
+        )
+        self._region_list_hint.pack(anchor='w')
+        try:
+            self._update_region_list_hint()
+        except Exception:
+            pass
         lb_container = ttk.Frame(list_frame)
         lb_container.pack(fill='both', expand=True)
         self.region_listbox = tk.Listbox(lb_container, height=5, exportselection=False)
@@ -16910,6 +23923,8 @@ class PDFViewer:
         # macOS often uses Button-2 for secondary click
         self.region_listbox.bind('<Button-2>', self._on_region_list_right_click)
         self.region_listbox.bind('<Control-Button-1>', self._on_region_list_right_click)
+        for _key in ("<KeyPress-a>", "<KeyPress-A>", "<KeyPress-b>", "<KeyPress-B>"):
+            self.region_listbox.bind(_key, self._on_zone_criteria_key)
 
         self._region_list_context_menu = tk.Menu(self.region_listbox, tearoff=0)
         self._region_list_context_menu.add_command(
@@ -16917,6 +23932,13 @@ class PDFViewer:
         )
         self._region_list_context_menu.add_command(
             label="Delete", command=self._context_delete_region
+        )
+        self._region_list_context_menu.add_separator()
+        self._region_list_context_menu.add_command(
+            label="Use Config A", command=lambda: self._context_assign_zone_criteria("A")
+        )
+        self._region_list_context_menu.add_command(
+            label="Use Config B", command=lambda: self._context_assign_zone_criteria("B")
         )
         self._context_menu_zone_id = None
 
@@ -17035,7 +24057,16 @@ class PDFViewer:
             return
         if self.selected_zone_id is not None and self.selected_page == self.current_page:
             zname = self.zone_names.get(self.current_page, {}).get(self.selected_zone_id, f"Zone{self.selected_zone_id}")
-            display = f"{zname} (#{self.selected_zone_id})"
+            dual = False
+            try:
+                dual = bool(self.dual_settings_mode.get())
+            except Exception:
+                dual = False
+            if dual:
+                cfg_ab = self._zone_criteria_for(self.selected_zone_id)
+                display = f"{zname} (#{self.selected_zone_id}, Config {cfg_ab})"
+            else:
+                display = f"{zname} (#{self.selected_zone_id})"
             self.ribbon_sel_name_var.set(display)
             self.ribbon_selected_var.set(f"Selected: {zname}")
         else:
@@ -17082,8 +24113,17 @@ class PDFViewer:
             sorted_items = sorted((int(k), v) for k, v in names.items())
         except Exception:
             sorted_items = sorted(names.items())
+        dual = False
+        try:
+            dual = bool(self.dual_settings_mode.get())
+        except Exception:
+            dual = False
         for i, (zid, zname) in enumerate(sorted_items):
-            display = f"{zname} (ID={zid})"
+            if dual:
+                cfg_ab = self._zone_criteria_for(zid, page=page)
+                display = f"{zname} (ID={zid}, Config {cfg_ab})"
+            else:
+                display = f"{zname} (ID={zid})"
             self.region_listbox.insert(tk.END, display)
             self.region_list_id_map[i] = zid
 
@@ -17112,6 +24152,10 @@ class PDFViewer:
         zid = self.region_list_id_map.get(idx)
         if zid is None:
             return
+        try:
+            self.region_listbox.focus_set()
+        except Exception:
+            pass
         self._select_zone_for_edit(zid)
 
     def _select_zone_for_edit(self, zid):
@@ -17131,6 +24175,11 @@ class PDFViewer:
         self.region_translate_active = False
         self.region_translate_original_mask = None
         self.region_translate_zid = None
+        try:
+            if hasattr(self, "region_listbox") and self.region_listbox is not None:
+                self.region_listbox.focus_set()
+        except Exception:
+            pass
         # Update visual: orange fill tint + yellow boundary (was black)
         if self.current_page in self.base_page_images:
             self._rebuild_page_overlays(self.current_page)
@@ -17175,6 +24224,29 @@ class PDFViewer:
                 menu.grab_release()
             except Exception:
                 pass
+
+    def _context_assign_zone_criteria(self, which):
+        """Context menu: assign the right-clicked region to Config A or B."""
+        zid = getattr(self, "_context_menu_zone_id", None)
+        if zid is None:
+            sel = self.region_listbox.curselection() if hasattr(self, "region_listbox") else ()
+            if sel:
+                zid = getattr(self, "region_list_id_map", {}).get(sel[0])
+        if zid is None:
+            zid = getattr(self, "selected_zone_id", None)
+        if zid is None:
+            messagebox.showinfo(
+                "Dual Settings",
+                "Select a labeled region first, then press A or B (or use this menu).",
+            )
+            return
+        if not bool(self.dual_settings_mode.get()):
+            self.dual_settings_mode.set(True)
+            try:
+                self._on_dual_settings_toggled()
+            except Exception:
+                pass
+        self._assign_zone_criteria(zid, which)
 
     def _context_rename_region(self):
         """Context menu: Rename the region that was right-clicked."""
@@ -17279,6 +24351,12 @@ class PDFViewer:
         if page in self.zone_names:
             self.zone_names[page] = {int(k): v for k, v in self.zone_names[page].items()}
             self.zone_names[page].pop(zid, None)
+        try:
+            if page in (getattr(self, "zone_criteria", None) or {}):
+                self.zone_criteria[page].pop(zid, None)
+                self.zone_criteria[page].pop(str(zid), None)
+        except Exception:
+            pass
 
         # Clear zone pixels from the mask
         if page in self.mask_images and self.mask_images[page] is not None:
@@ -19377,6 +26455,8 @@ class PDFViewer:
         for path, fmt in candidates:
             if not os.path.exists(path):
                 continue
+            if self._is_combined_project_counts_file(path):
+                continue
             try:
                 if fmt == 'xlsx':
                     df = pd.read_excel(path, sheet_name='Cell Counts')
@@ -19747,6 +26827,154 @@ class PDFViewer:
             self._commit_canvas_paint_to_layer()
         self.output.delete('paint')
 
+    def _project_counts_file_label(self):
+        """Filename stored as the row label in the combined project spreadsheet."""
+        path = getattr(self, "current_tiff_path", None)
+        if path:
+            return os.path.basename(path)
+        name = self.tiff_filename or "untitled"
+        if str(name).lower().endswith((".tif", ".tiff")):
+            return name
+        return f"{name}.tif"
+
+    def _resolve_project_counts_path(self, fallback_out_dir=None):
+        """Path of the combined project counts workbook.
+
+        Uses File → Select Project Output Directory when set
+        (``{project_name}_Counts.xlsx``). Otherwise falls back to
+        ``output/counts/{folder}_project_counts.xlsx``.
+        """
+        configured = self._configured_project_counts_path()
+        if configured:
+            directory = os.path.dirname(configured)
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except Exception as e:
+                logger.warning(f"Could not create project output directory {directory}: {e}")
+            else:
+                csv_alt = os.path.splitext(configured)[0] + ".csv"
+                if not os.path.isfile(configured) and os.path.isfile(csv_alt):
+                    return csv_alt
+                return configured
+
+        out_dir = fallback_out_dir
+        if not out_dir:
+            return None
+        folder = os.path.basename(os.path.normpath(
+            self.tiff_dir or self.current_tiff_directory or ""
+        ))
+        preferred = os.path.join(
+            out_dir,
+            f"{folder}{self.PROJECT_COUNTS_SUFFIX}.xlsx" if folder else f"{self.PROJECT_COUNTS_BASENAME}.xlsx",
+        )
+        fallback = os.path.join(out_dir, f"{self.PROJECT_COUNTS_BASENAME}.xlsx")
+        try:
+            names = os.listdir(out_dir)
+        except Exception:
+            names = []
+
+        existing = [n for n in names if _is_project_counts_filename(n)]
+
+        def _score(name):
+            nl = name.lower()
+            pref = os.path.basename(preferred).lower()
+            if nl == pref:
+                return 0
+            if os.path.splitext(nl)[0] == self.PROJECT_COUNTS_BASENAME.lower() and nl.endswith(".xlsx"):
+                return 1
+            if nl.endswith(".xlsx"):
+                return 2
+            if nl.endswith(".xls"):
+                return 3
+            return 4
+
+        if existing:
+            existing.sort(key=_score)
+            return os.path.join(out_dir, existing[0])
+        return preferred or fallback
+
+    def _load_project_counts_df(self, path):
+        """Load the project-wide counts table, unioning sibling .xlsx/.csv copies.
+
+        When Excel has the .xlsx open, Count falls back to CSV. The next Count
+        used to reload the stale .xlsx and overwrite that CSV, dropping rows.
+        Loading every sidecar and letting the newer file win keeps those rows.
+        """
+        sidecars = _project_counts_sidecar_paths(path)
+        if not sidecars:
+            return None
+        tables = []
+        for sidecar in sidecars:
+            df = _read_project_counts_table(sidecar, self.PROJECT_COUNTS_SHEET)
+            if df is not None:
+                tables.append(df)
+        return _union_project_counts_tables(tables)
+
+    def _write_project_counts_df(self, xlsx_path, df):
+        """Write the wide project table to .xlsx and a durable .csv sidecar.
+
+        Returns (path, format) of the preferred copy. CSV is always attempted so
+        a locked Excel workbook cannot erase rows that only lived in the CSV.
+        """
+        csv_path = os.path.splitext(xlsx_path)[0] + ".csv"
+        last_error = None
+        xlsx_written = False
+        for engine in ("openpyxl", "xlsxwriter"):
+            try:
+                with pd.ExcelWriter(xlsx_path, engine=engine) as writer:
+                    df.to_excel(writer, sheet_name=self.PROJECT_COUNTS_SHEET, index=False)
+                xlsx_written = True
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Project counts Excel ({engine}): {e}")
+        csv_written = False
+        try:
+            df.to_csv(csv_path, index=False)
+            csv_written = True
+        except Exception as e:
+            logger.error(f"Project counts CSV failed: {e}")
+            if not xlsx_written:
+                raise last_error or e
+        if xlsx_written:
+            return xlsx_path, "xlsx"
+        if csv_written:
+            logger.warning(
+                "Project counts Excel is locked or unwritable; saved CSV instead: %s",
+                csv_path,
+            )
+            return csv_path, "csv"
+        raise last_error or RuntimeError("Project counts write failed")
+
+    def _append_counts_to_project_spreadsheet(self, fallback_out_dir, zone_df):
+        """Append or update this image's counts in the combined project spreadsheet.
+
+        Layout: row 1 = File + unique structure names; later rows = one image each.
+        Existing structure columns are reused (never duplicated). Re-counting the
+        same file replaces that row.
+        """
+        if zone_df is None:
+            return None
+        structure_counts = _structure_counts_from_zone_df(zone_df)
+        if not structure_counts:
+            logger.info("Project counts: no structure counts to append")
+            return None
+        path = self._resolve_project_counts_path(fallback_out_dir)
+        if not path:
+            return None
+        existing = self._load_project_counts_df(path)
+        merged = _merge_project_counts_table(
+            existing,
+            self._project_counts_file_label(),
+            structure_counts,
+        )
+        # Always write .xlsx next to a csv-only legacy file
+        if path.lower().endswith(".csv"):
+            path = os.path.splitext(path)[0] + ".xlsx"
+        written, _fmt = self._write_project_counts_df(path, merged)
+        logger.info(f"Project counts updated: {written}")
+        return written
+
     def count_cells(self):
         logger.info("Starting cell counting process")
         if self.background_image is None:
@@ -19847,10 +27075,10 @@ class PDFViewer:
                 logger.info("Count Cells: using locked/loaded cell mask (no re-detection)")
             else:
                 progress.set_progress(25, "Running cell detection...")
-                _, auto_labels = binary_mask_cell_count(
-                    background, processor=self.image_processor
-                )
-                auto_mask = np.asarray(auto_labels, dtype=bool).squeeze()
+                _, auto_labels = self._run_cell_detection(background)
+                auto_labels = np.asarray(auto_labels).squeeze()
+                self.auto_labels = auto_labels
+                auto_mask = auto_labels > 0
                 if auto_mask.ndim != 2:
                     raise ValueError(f"Cell detection mask must be 2D, got shape {auto_mask.shape}")
                 self.auto_mask = auto_mask
@@ -19885,9 +27113,33 @@ class PDFViewer:
                     )
                 ) > 0
 
-            final_cell_mask = (auto_mask | add_mask) & ~remove_mask
-            self.last_cell_mask = final_cell_mask
-            cell_mask_pil = Image.fromarray((final_cell_mask * 255).astype(np.uint8))
+            labels_out = getattr(self, "auto_labels", None)
+            try:
+                labels_out = None if labels_out is None else np.asarray(labels_out)
+                if (
+                    labels_out is not None
+                    and labels_out.shape[:2] == auto_mask.shape[:2]
+                    and np.issubdtype(labels_out.dtype, np.integer)
+                    and int(np.max(labels_out)) > 1
+                ):
+                    labels_out = labels_out.copy()
+                    if remove_mask.any():
+                        labels_out[remove_mask] = 0
+                    if add_mask.any():
+                        add_lab = measure.label(add_mask, connectivity=1)
+                        add_lab[add_lab > 0] += int(labels_out.max())
+                        labels_out = np.where(labels_out > 0, labels_out, add_lab)
+                    final_cell_mask = labels_out > 0
+                    self.last_cell_mask = labels_out
+                    cell_mask_pil = labels_out
+                else:
+                    final_cell_mask = (auto_mask | add_mask) & ~remove_mask
+                    self.last_cell_mask = final_cell_mask
+                    cell_mask_pil = Image.fromarray((final_cell_mask.astype(np.uint8) * 255))
+            except Exception:
+                final_cell_mask = (auto_mask | add_mask) & ~remove_mask
+                self.last_cell_mask = final_cell_mask
+                cell_mask_pil = Image.fromarray((final_cell_mask.astype(np.uint8) * 255))
 
             region_mask_pil = self.mask_images[self.current_page]
             # img_x/img_y are model-space offsets (native image pixels)
@@ -19929,6 +27181,7 @@ class PDFViewer:
             masked_path = None
             counts_path = None
             paint_path = None
+            project_counts_path = None
 
             if out_dir and base_name and self.original_background is not None and final_cell_mask is not None:
                 try:
@@ -19989,6 +27242,26 @@ class PDFViewer:
                     except Exception as e:
                         logger.error(f"CSV fallback also failed: {e}")
 
+            # Combined project spreadsheet: one row per image, unique structure columns.
+            # Uses File → Select Project Output Directory when set ({name}_Counts.xlsx).
+            if df is not None:
+                try:
+                    project_counts_path = self._append_counts_to_project_spreadsheet(out_dir, df)
+                    if project_counts_path:
+                        saved_paths.append(f"Project counts: {project_counts_path}")
+                except Exception as e:
+                    logger.error(f"Failed to update project counts spreadsheet: {e}", exc_info=True)
+                    try:
+                        messagebox.showwarning(
+                            "Project Counts",
+                            "Could not update the combined project spreadsheet "
+                            "(it may be open in Excel).\n"
+                            "This image's individual count file was still saved.\n\n"
+                            f"{e}",
+                        )
+                    except Exception:
+                        pass
+
             # Per-cell measurements: centroid x,y and pixel area for every detected cell
             cells_csv_path = None
             if out_dir and base_name and final_cell_mask is not None:
@@ -20012,6 +27285,18 @@ class PDFViewer:
                 except Exception as e:
                     logger.error(f"Failed to auto-save paint layer on count: {e}")
 
+            # Reloadable binary cell mask (Count → Reload Last Count Session)
+            cell_mask_path = None
+            if out_dir and base_name and final_cell_mask is not None:
+                try:
+                    cell_mask_path = self._save_count_session_cell_mask(
+                        out_dir, base_name, final_cell_mask
+                    )
+                    if cell_mask_path:
+                        saved_paths.append(f"Cell mask: {cell_mask_path}")
+                except Exception as e:
+                    logger.error(f"Failed to save count session cell mask: {e}")
+
             # Metadata file: full mask/detection parameters for reproducibility
             if out_dir and base_name:
                 try:
@@ -20020,8 +27305,10 @@ class PDFViewer:
                         base_name,
                         extra={
                             "counts_file": counts_path,
+                            "project_counts_file": project_counts_path,
                             "masked_image": masked_path,
                             "paint_file": paint_path,
+                            "cell_mask_file": cell_mask_path,
                             "cell_centroids_file": cells_csv_path,
                             "output_directory": out_dir,
                         },
@@ -20080,6 +27367,21 @@ class PDFViewer:
             messagebox.showwarning("Show Mask", "Load a TIFF image first.")
             return
 
+        try:
+            if bool(self.blob_labeled_regions_only.get()):
+                lab = self._labeled_region_bool_mask()
+                if lab is None or int(lab.sum()) < 48:
+                    messagebox.showwarning(
+                        "Show Mask",
+                        "Blob Detection → Labeled regions only is checked, but no "
+                        "painted or atlas regions are defined.\n\n"
+                        "Paint and name regions (or load an atlas), or uncheck "
+                        "Labeled regions only to mask the whole image.",
+                    )
+                    return
+        except Exception:
+            pass
+
         # Explicit re-detect unlocks any loaded mask from another channel
         if calculate:
             self.cell_mask_locked = False
@@ -20092,7 +27394,9 @@ class PDFViewer:
         # Run automatic detection
         if calculate:
             progress.set_progress(15, "Running cell detection...")
-            _, auto_labels = binary_mask_cell_count(background, processor=self.image_processor)
+            _, auto_labels = self._run_cell_detection(background)
+            auto_labels = np.asarray(auto_labels)
+            self.auto_labels = auto_labels
             auto_mask = auto_labels > 0
             self.auto_mask = auto_mask
             progress.set_progress(55, "Building mask visualization...")
@@ -20104,7 +27408,9 @@ class PDFViewer:
                 if progress is None:
                     progress2 = self._show_busy_dialog("Detecting Cells")
                     progress2.set_progress(5, "Preparing image...")
-                _, auto_labels = binary_mask_cell_count(background, processor=self.image_processor)
+                _, auto_labels = self._run_cell_detection(background)
+                auto_labels = np.asarray(auto_labels)
+                self.auto_labels = auto_labels
                 auto_mask = auto_labels > 0
                 self.auto_mask = auto_mask
                 self.cell_mask_locked = False
@@ -20142,8 +27448,23 @@ class PDFViewer:
         if progress and not getattr(progress, 'closed', False):
             progress.set_progress(85, "Generating ring visualization...")
         target_size = self.original_background.size  # (w, h)
+        vis = getattr(self, "auto_labels", None)
+        try:
+            vis = None if vis is None else np.asarray(vis)
+            if vis is not None and vis.shape[:2] == auto_mask.shape[:2] and int(np.max(vis)) > 1:
+                vis = vis.copy()
+                if remove_mask.any():
+                    vis[remove_mask] = 0
+                if add_mask.any():
+                    add_lab = measure.label(add_mask, connectivity=1)
+                    add_lab[add_lab > 0] += int(vis.max())
+                    vis = np.where(vis > 0, vis, add_lab)
+            else:
+                vis = combined_mask
+        except Exception:
+            vis = combined_mask
         mask_img = self._cell_detection_ring_overlay(
-            combined_mask,
+            vis,
             size=target_size,
             color=(255, 0, 0),
             alpha=230,
@@ -20169,6 +27490,10 @@ class PDFViewer:
 
         if progress and not getattr(progress, 'closed', False):
             progress.set_progress(95, "Displaying mask...")
+        try:
+            self.show_cell_mask.set(True)
+        except Exception:
+            pass
         self.show_page(mask=mask_img)
 
         if progress and not getattr(progress, 'closed', False):
@@ -20261,11 +27586,24 @@ class PDFViewer:
                 self.refresh_tiff_file_list()
             except Exception:
                 pass
-        # Keep atlas across Prev/Next when present (same as Next Channel for multi-section work)
-        self._load_tiff_file(target)
+        # Next/Prev/new image: drop paint and atlas. Use Next Channel to keep them.
+        self._load_tiff_file(target, preserve_atlas=False)
         if announce:
             logger.info(f"Navigated to image {index + 1}/{len(self.tiff_file_list)}: {target}")
         return True
+
+    def _next_included_index(self, start, direction):
+        """Next list index that is not excluded, stepping +1 or -1 from start (exclusive)."""
+        n = len(self.tiff_file_list or [])
+        if n == 0:
+            return None
+        step = 1 if direction >= 0 else -1
+        i = start + step
+        while 0 <= i < n:
+            if not self._is_image_excluded(self.tiff_file_list[i]):
+                return i
+            i += step
+        return None
 
     def previous_image(self):
         """Load the previous source TIFF in the File Browser list (Ctrl+Left)."""
@@ -20280,13 +27618,17 @@ class PDFViewer:
                 return
         idx = self._current_list_index()
         if idx < 0:
-            # Nothing open yet — load first
-            self._load_list_image_at(0)
+            nxt = self._next_included_index(-1, 1)
+            if nxt is None:
+                messagebox.showinfo("Previous Image", "All images in this folder are excluded.")
+                return
+            self._load_list_image_at(nxt)
             return
-        if idx <= 0:
-            messagebox.showinfo("Previous Image", "Already at the first image in this folder.")
+        prev = self._next_included_index(idx, -1)
+        if prev is None:
+            messagebox.showinfo("Previous Image", "Already at the first included image in this folder.")
             return
-        self._load_list_image_at(idx - 1)
+        self._load_list_image_at(prev)
 
     def next_image(self):
         """Load the next source TIFF in the File Browser list (Ctrl+Right).
@@ -20304,12 +27646,17 @@ class PDFViewer:
                 return
         idx = self._current_list_index()
         if idx < 0:
-            self._load_list_image_at(0)
+            nxt = self._next_included_index(-1, 1)
+            if nxt is None:
+                messagebox.showinfo("Next Image", "All images in this folder are excluded.")
+                return
+            self._load_list_image_at(nxt)
             return
-        if idx >= len(self.tiff_file_list) - 1:
-            messagebox.showinfo("Next Image", "Already at the last image in this folder.")
+        nxt = self._next_included_index(idx, 1)
+        if nxt is None:
+            messagebox.showinfo("Next Image", "Already at the last included image in this folder.")
             return
-        self._load_list_image_at(idx + 1)
+        self._load_list_image_at(nxt)
 
     def next_uncounted_image(self):
         """Load the next source TIFF that does not yet have count results (Ctrl+Shift+Right)."""
@@ -20327,7 +27674,10 @@ class PDFViewer:
         # Search after current (or from beginning if none open)
         search_from = start + 1 if start >= 0 else 0
         for i in range(search_from, len(self.tiff_file_list)):
-            if not self._get_image_work_status(self.tiff_file_list[i]).get("counted", False):
+            path = self.tiff_file_list[i]
+            if self._is_image_excluded(path):
+                continue
+            if not self._get_image_work_status(path).get("counted", False):
                 self._load_list_image_at(i)
                 return
 
@@ -20406,7 +27756,7 @@ class PDFViewer:
         self.img_y = 0
         self.view_scale = 1.0
         self.zoom = 1.0
-        self.brightness = 0.0
+        self.brightness = float(self.BRIGHTNESS_DEFAULT)
         self.current_state = None
         self.current_tiff_path = None
 
@@ -20418,7 +27768,7 @@ class PDFViewer:
         self.mask_photo_id = False
         self.current_mask = None
         self.auto_mask = None
-        self.showing_auto_mask = False
+        self._clear_mask_overlay()
 
         try:
             self.state_manager.undo_stack.clear()
@@ -20467,6 +27817,184 @@ class PDFViewer:
                 "App state cleared. Ready to load a new image from the File Browser.",
             )
 
+
+def _is_project_counts_filename(filename):
+    """True for the combined project counts workbook (not a per-image results file)."""
+    if not filename:
+        return False
+    stem = os.path.splitext(os.path.basename(str(filename)))[0].lower()
+    return stem == "barcc_project_counts" or stem.endswith("_project_counts")
+
+
+def _project_counts_sidecar_paths(path):
+    """Existing .xlsx/.xls/.csv copies of the project table, oldest first."""
+    if not path:
+        return []
+    stem = os.path.splitext(path)[0]
+    seen = set()
+    found = []
+    for ext in (".xlsx", ".xls", ".csv"):
+        candidate = stem + ext
+        key = os.path.normcase(os.path.abspath(candidate))
+        if key in seen:
+            continue
+        seen.add(key)
+        if os.path.isfile(candidate):
+            found.append(candidate)
+    found.sort(key=lambda p: os.path.getmtime(p))
+    return found
+
+
+def _read_project_counts_table(path, sheet_name="Project Counts"):
+    """Load one project-wide counts file, or None if missing/unusable."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        lower = path.lower()
+        if lower.endswith((".xlsx", ".xls")):
+            try:
+                df = pd.read_excel(path, sheet_name=sheet_name)
+            except Exception:
+                df = pd.read_excel(path, sheet_name=0)
+        else:
+            df = pd.read_csv(path)
+    except Exception as e:
+        logger.warning(f"Could not read project counts file {path}: {e}")
+        return None
+    if df is None:
+        return None
+    drop = [c for c in df.columns if str(c).startswith("Unnamed")]
+    if drop:
+        df = df.drop(columns=drop)
+    if "File" not in df.columns:
+        return None
+    # Per-image Cell Counts sheets are not the project table
+    if "Zone" in df.columns and "Cell_Count" in df.columns:
+        return None
+    return df
+
+
+def _union_project_counts_tables(tables):
+    """Combine wide project tables. Later frames replace matching File rows."""
+    result = None
+    for df in tables:
+        if df is None or getattr(df, "empty", True):
+            continue
+        if "File" not in getattr(df, "columns", []):
+            continue
+        for _, row in df.iterrows():
+            fname = row.get("File")
+            if fname is None or (isinstance(fname, float) and np.isnan(fname)):
+                continue
+            fname = str(fname).strip()
+            if not fname or fname.lower() == "nan":
+                continue
+            counts = {}
+            for col in df.columns:
+                if col == "File":
+                    continue
+                raw = row[col]
+                if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+                    continue
+                try:
+                    counts[str(col)] = int(round(float(raw)))
+                except (TypeError, ValueError):
+                    continue
+            result = _merge_project_counts_table(result, fname, counts)
+    return result
+
+
+def _project_counts_row_key(file_name):
+    """Match image rows by stem so foo.tif and foo.tiff update the same row."""
+    return os.path.splitext(str(file_name or "").strip())[0].lower()
+
+
+def _structure_counts_from_zone_df(df):
+    """Map unique structure (zone) names to summed Cell_Count from a per-image table."""
+    out = {}
+    if df is None or getattr(df, "empty", True):
+        return out
+    if "Zone" not in df.columns or "Cell_Count" not in df.columns:
+        return out
+    for _, row in df.iterrows():
+        name = row.get("Zone")
+        if name is None or (isinstance(name, float) and np.isnan(name)):
+            continue
+        name = str(name).strip()
+        if not name or name.lower() == "nan":
+            continue
+        raw = row.get("Cell_Count")
+        try:
+            if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+                continue
+            n = int(round(float(raw)))
+        except (TypeError, ValueError):
+            continue
+        out[name] = out.get(name, 0) + n
+    return out
+
+
+def _merge_project_counts_table(existing_df, file_name, structure_counts):
+    """Wide project table: one row per image file, one column per unique structure.
+
+    Re-counting the same file replaces that row. New structures are appended as
+    columns (existing header names are never duplicated). Cells for structures
+    not present on an image stay blank.
+    """
+    file_col = "File"
+    file_name = str(file_name or "").strip() or "untitled"
+    structure_counts = {
+        str(k).strip(): int(v)
+        for k, v in (structure_counts or {}).items()
+        if str(k).strip()
+    }
+
+    if (
+        existing_df is None
+        or getattr(existing_df, "empty", True)
+        or file_col not in getattr(existing_df, "columns", [])
+    ):
+        cols = [file_col] + list(structure_counts.keys())
+        row = {file_col: file_name, **structure_counts}
+        df = pd.DataFrame([row], columns=cols)
+    else:
+        df = existing_df.copy()
+        drop = [c for c in df.columns if str(c).startswith("Unnamed")]
+        if drop:
+            df = df.drop(columns=drop)
+        struct_cols = [c for c in df.columns if c != file_col]
+        for name in structure_counts:
+            if name not in df.columns:
+                struct_cols.append(name)
+                df[name] = np.nan
+        new_row = {file_col: file_name}
+        for c in struct_cols:
+            new_row[c] = structure_counts[c] if c in structure_counts else np.nan
+        key = _project_counts_row_key(file_name)
+        mask = df[file_col].map(_project_counts_row_key) == key
+        if mask.any():
+            idx = df.index[mask][0]
+            for c, v in new_row.items():
+                df.at[idx, c] = v
+            extras = list(df.index[mask][1:])
+            if extras:
+                df = df.drop(extras)
+        else:
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        df = df[[file_col] + struct_cols]
+
+    for c in df.columns:
+        if c == file_col:
+            df[c] = df[c].astype(str)
+            continue
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+        try:
+            df[c] = df[c].astype("Int64")
+        except Exception:
+            pass
+    return df.reset_index(drop=True)
+
+
 def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_counters, zone_names):
     """Enhanced cell counting with improved visualization"""
     logger.info("Starting cell counting in zones")
@@ -20486,12 +28014,16 @@ def count_cells_in_zones(background_pil, mask_pil, page_pil, img_x, img_y, zone_
     if page_pil is not None:
         # Caller already ran detection and merged manual edits — avoid a second
         # detect + watershed pass (crashes/OOM on large microscopy frames).
-        binary = np.asarray(page_pil)
-        if binary.ndim > 2:
-            binary = binary.squeeze()
-        binary = binary > 0
-        labels = measure.label(binary)
-        props = measure.regionprops(labels)
+        raw = np.asarray(page_pil)
+        if raw.ndim > 2:
+            raw = raw.squeeze()
+        if np.issubdtype(raw.dtype, np.integer) and int(np.max(raw)) > 1:
+            labels = raw.astype(np.int32)
+            props = measure.regionprops(labels)
+        else:
+            binary = raw > 0
+            labels = measure.label(binary, connectivity=1)
+            props = measure.regionprops(labels)
     else:
         # Legacy path when no precomputed mask is supplied.
         _, binary = binary_mask_cell_count(Image.fromarray((background_norm * 255).astype(np.uint8)))
@@ -20701,6 +28233,7 @@ class StateManager:
                 # Core editable data
                 "zone_counters": copy.deepcopy(getattr(viewer, 'zone_counters', {})),
                 "zone_names": copy.deepcopy(getattr(viewer, 'zone_names', {})),
+                "zone_criteria": copy.deepcopy(getattr(viewer, 'zone_criteria', {})),
                 "mask_images": self._copy_image_dict(getattr(viewer, 'mask_images', {})),
                 "base_page_images": self._copy_image_dict(getattr(viewer, 'base_page_images', {})),
                 "page_images": self._copy_image_dict(getattr(viewer, 'page_images', {})),
@@ -20754,6 +28287,24 @@ class StateManager:
                 viewer.zone_names = {pg: {int(k): v for k, v in (zn.get(pg, {}) or {}).items()} for pg in zn}
             else:
                 viewer.zone_names = {}
+            zc = state.get("zone_criteria", {})
+            if zc:
+                restored_c = {}
+                for pg, m in (zc or {}).items():
+                    try:
+                        pgi = int(pg)
+                    except Exception:
+                        pgi = pg
+                    parsed = {}
+                    for k, v in (m or {}).items():
+                        try:
+                            parsed[int(k)] = "B" if str(v).upper().strip() == "B" else "A"
+                        except Exception:
+                            continue
+                    restored_c[pgi] = parsed
+                viewer.zone_criteria = restored_c
+            else:
+                viewer.zone_criteria = {}
             viewer.mask_images = state.get("mask_images", {})
             viewer.base_page_images = state.get("base_page_images", {})
             if hasattr(viewer, 'page_images'):

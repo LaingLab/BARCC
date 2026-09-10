@@ -22,7 +22,7 @@ import os
 # ============================================================================
 MANUAL_TITLE = "BARCC - Brain Atlas Regional Cell Counter"
 MANUAL_SUBTITLE = "User Manual"
-VERSION = "8.08.000"
+VERSION = "8.10.000"
 OUTPUT_FILENAME = "BARCC_User_Manual.pdf"
 OUTPUT_DIR = ".."  # Place PDF in repository root
 # Figures for workflows (relative to this script's directory)
@@ -175,12 +175,13 @@ class BARCCUserManual(FPDF):
 
         # --- Bottom section ---
         self.set_y(-48)
+        self.set_x(self.l_margin)
         self.set_font("Helvetica", "", 10)
         self.set_text_color(*GRAY_TEXT)
-        self.cell(0, 6, "Laing Lab", new_x=XPos.RIGHT, new_y=YPos.NEXT, align="C")
+        self.cell(0, 6, "Laing Lab", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
 
         self.set_font("Helvetica", "", 9)
-        self.cell(0, 5, "https://github.com/LaingLab/BARCC", new_x=XPos.RIGHT, new_y=YPos.NEXT, align="C")
+        self.cell(0, 5, "https://github.com/LaingLab/BARCC", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
 
         # Bottom accent bar
         self.set_y(-12)
@@ -338,19 +339,19 @@ class BARCCUserManual(FPDF):
 
         toc_items = [
             ("1. Introduction", 3),
-            ("What's New (8.08, 8.07, ...)", 4),
-            ("2. Installation & Requirements", 8),
-            ("3. Getting Started", 9),
-            ("4. User Interface Overview", 10),
-            ("5. File Menu & Multi-Channel Workflow", 11),
-            ("6. Working with Atlas Sections", 12),
-            ("7. Paint Tools for Regions of Interest", 16),
-            ("8. Cell Detection, Masks & Editing", 17),
-            ("9. Axons and Nets (Intensity & PNN)", 20),
-            ("10. Counting Cells & Exporting Results", 22),
-            ("11. Saving & Export Options", 23),
-            ("12. Keyboard Shortcuts", 24),
-            ("13. Troubleshooting", 25),
+            ("What's New (8.10, 8.09, 8.08, ...)", 4),
+            ("2. Installation & Requirements", 23),
+            ("3. Getting Started", 26),
+            ("4. User Interface Overview", 27),
+            ("5. File Menu & Multi-Channel Workflow", 28),
+            ("6. Working with Atlas Sections", 31),
+            ("7. Paint Tools for Regions of Interest", 36),
+            ("8. Cell Detection, Masks & Editing", 37),
+            ("9. Axons and Nets (Intensity & PNN)", 46),
+            ("10. Counting Cells & Exporting Results", 49),
+            ("11. Saving & Export Options", 50),
+            ("12. Keyboard Shortcuts", 51),
+            ("13. Troubleshooting", 52),
         ]
 
         self.set_font("Helvetica", "", 11)
@@ -396,17 +397,20 @@ def build_manual():
 
     pdf.chapter_title("Key Capabilities", 1)
     pdf.bullet_list([
-        "Import TIFF images and multi-page PDF atlas files; browse folders with progress tracking",
+        "Import TIFF images and multi-page PDF atlas files; browse folders with progress tracking, exclude/include, and reload last count",
         "Allen Mouse Reference Atlas plates with semi-auto stitch (Reflect / move / rotate hemispheres)",
-        "Interactive atlas alignment: Fit to Image, crop, move, rotate, scale; per-region edit tools",
+        "Practical atlas alignment stack: landmark point pairs, Edge Snap (ICP silhouette), then local border refine",
+        "Crop with optional locked aspect ratio (match TIFF, 1:1, 4:3, 3:2, 16:9, or custom)",
         "Portable .catlas schematics: save labeled atlas + paint once, apply across channels",
         "Next Channel workflow keeps atlas and regions while switching fluorescence channels",
         "Freehand paint regions that register for counting (including on atlas coordinates)",
-        "Configurable cell detection; manual add/remove/split; save/load cell masks across channels",
+        "Blob/DoG detection with Adaptive tiles, peak-quality filters, Dual Settings (Config A/B per region)",
+        "Area Tune and Measure Tune (TP/FP/FN/TN) plus Smart Suggest A/B for parameter recipes",
+        "Manual add/remove/split; Show Cell Mask toggle; save/load cell masks across channels",
         "Random null cell distributions (optionally stratified by atlas region)",
         "Axons and Nets: regional intensity with background subtraction and counterstain normalization",
         "Perineuronal (PNN) shells (2x cell area) and intensity export (true + random)",
-        "Automated regional cell counting with Excel export under output/<feature>/ subfolders",
+        "Count Cells writes per-image Excel plus an optional combined project spreadsheet ({name}_Counts.xlsx)",
     ])
 
     pdf.note_box(
@@ -416,7 +420,191 @@ def build_manual():
     )
 
     # ------------------------------------------------------------------
-    # What's New — 8.08.000 (current)
+    # What's New — 8.10.000 (current)
+    # ------------------------------------------------------------------
+    pdf.chapter_title("What's New in Version 8.10.000", 0)
+
+    pdf.body(
+        "BARCC 8.10.000 is an atlas-alignment, Dual Settings, and project-counts release on top of "
+        "v8.09.000 detection tools. Use Dual Settings when one detector cannot serve packed and sparse "
+        "regions on the same slice; place Allen/PDF plates with Landmarks then Edge Snap then Local Refine; "
+        "Count Cells can append a combined project spreadsheet."
+    )
+
+    pdf.chapter_title("Practical atlas alignment stack", 1)
+    pdf.body(
+        "Atlas alignment is now a three-step stack under the Atlas menu. Use it after Import Allen Atlas "
+        "(or a PDF plate) and loading the TIFF, typically after a first Fit Atlas to Image."
+    )
+    pdf.bullet_list([
+        "Atlas > Align: Landmarks (point pairs)... — Click a feature on the ATLAS (magenta), then the matching point on the TISSUE (cyan). Repeat for 3-6 pairs (ventricle, midline, outer edge). Need at least 2 pairs; 3-6 is recommended. Undo pair / Apply Fit / Cancel live in a small status window. Apply Fit computes a similarity transform (scale + rotation + translation, Umeyama) and moves the whole atlas. Esc cancels. Pairs are stored in image coordinates so they survive zoom.",
+        "Atlas > Align: Edge Snap... — Opens a preview/apply dialog that snaps the atlas silhouette to the tissue outline (iterative closest-point / chamfer search). Preview first, then Apply; Restore undoes a preview. Options include: Refine current pose vs From scratch (full rotation search); Allow Translate / Rotate / Scale; Matching (partial overlap); Auto tissue polarity or Force invert (dark tissue); Tissue tightness; include holes (ventricles); use zone outlines vs ink; Per-region only (selected Atlas Manager zone); Flip atlas left-right; keep landmark pairs as a prior after Landmarks. Does not bake rasters until Apply.",
+        "Atlas > Align: Local Refine (guide)... — Step 3 after global pose is close. Turns Border drag resize ON, expands the Atlas Manager ribbon, and walks you through: select a labeled region, optional per-region Edge Snap, grab the red border segment, or Move Selected Region, then paint custom zones the atlas cannot match. Save Atlas Schematic (.catlas) when done.",
+    ])
+    pdf.note_box(
+        "Recommended order: Fit Atlas to Image -> Landmarks (3-6 pairs, Apply Fit) -> Edge Snap Preview then Apply "
+        "(refine mode, after landmarks) -> Local Refine for individual structures. Crop after the plate is roughly on "
+        "the section so you do not crop away useful atlas. These alignment tools were deferred in v8.09.000 and ship in 8.10."
+    )
+
+    pdf.chapter_title("Crop box aspect lock", 1)
+    pdf.body(
+        "When Global Crop is on, the Atlas Manager ribbon shows \"Crop box shape (aspect ratio)\". "
+        "Check \"Lock aspect ratio while drawing\" and pick a Ratio before you drag:"
+    )
+    pdf.bullet_list([
+        "Match TIFF image — same shape as the loaded slice (default recommendation).",
+        "Square (1:1), 4:3, 3:2, Widescreen (16:9).",
+        "Custom width x height — type W and H, then Apply custom (or press Enter in the box).",
+        "Uncheck the lock for a free-form rectangle.",
+        "How to... explains the same steps. Changing the ratio while a box is pending re-shapes that box. Then Enter / double-click / Apply Crop to commit.",
+    ])
+
+    pdf.chapter_title("Dual Settings Mode (Config A and Config B)", 1)
+    pdf.body(
+        "One detector rarely fits a whole slice when packed nuclei (e.g. PVN) sit next to sparse tissue "
+        "(e.g. AHA) or when background is mixed. Dual Settings Mode runs two Blob/Adaptive configs on the same image."
+    )
+    pdf.bullet_list([
+        "In Mask Settings, check Dual Settings Mode. A second Blob Detection panel (Config B) and Adaptive Detection — Config B appear to the right of Config A. The first time you enable it, Config B is copied from Config A.",
+        "Assign labeled regions in Atlas Manager: select a region and press A or B (ignored while typing in an entry box). Or use the Atlas Manager context commands Use Config A / Use Config B. The region list caption shows the assignment.",
+        "Show Mask and Count Cells then detect with Config A in A-regions and Config B in B-regions, and merge the two label maps (unique cell IDs). Unassigned regions default to A.",
+        "Smart Suggest A / Smart Suggest B appear when Dual Settings Mode and \"Labeled regions only\" are both on. Autotune can target A, B, or both (checkboxes under Autotune).",
+        "Zone A/B assignments are stored with paint bundles so they reload with the schematic.",
+        "Off = one global detector (default).",
+    ])
+    pdf.note_box(
+        "Typical split: assign packed, bright clusters to Config A (denser packing, slightly lower threshold) "
+        "and dim sparse fields to Config B (higher SNR / bg-relative, sparser packing). Run Smart Suggest A then Smart Suggest B "
+        "with Labeled regions only checked so each recipe is fit from its own pixels."
+    )
+
+    pdf.chapter_title("Extra blob quality filters and Adaptive region mode", 1)
+    pdf.body(
+        "On top of the v8.09 peak-quality gates (local SNR, bg-relative, isotropy, circularity, tissue-edge reject), "
+        "8.10 adds filters aimed at folds, knife lines, bubble rims, and packed Fos clusters:"
+    )
+    pdf.bullet_list([
+        "blob_tissue_margin — reject peaks within N pixels inside the OUTER slice border (bright edge-line FPs). Integer >= 0; 0 = off. Try 6-12 (15-25 for thick glow).",
+        "blob_max_elongation — max major/minor axis ratio (1 = circle). Rejects thin ridges (folds, fibers, cut-edge line). Default 3.0; 0 = off.",
+        "blob_ridge_reject / blob_ridge_thresh — Hessian ridge test. This is what removes the white midline artifact. 1 = on; thresh typical 0.35-0.55.",
+        "blob_cavity_rim — kill zone around AIR BUBBLES (compact bites in the section edge). Does not clear PVN/SCN next to the 3rd ventricle except peaks actually in the lumen. 0 = off; try 16-32.",
+        "blob_chain_reject — 1-D line/ring suppression (ventricle wall, bubble rim, fold). 0 = off, 1 = default, 2-3 = stronger. Packed 2-D clusters are kept.",
+        "blob_cluster_recover / blob_seed_snr / blob_recover_factor — two-tier placement: bright nuclei seed a cluster and dim neighbors are kept; isolated sparse cells stay if they look like cells; crowded speckle without a seed is dropped.",
+        "adaptive_region_mode — 0 = classic square tiles over the whole image; 1 = detect only inside painted/atlas structures, each with its own threshold/SNR (so lcl vs lcr are independent). Unlabeled tissue is not labeled. Requires Adaptive on and zones. Then Show Mask.",
+        "Labeled regions only (Blob Detection checkbox) — Show Mask / Count Cells apply detections only inside painted or atlas regions, with a local threshold per region. Separate from Smart Suggest's \"Labeled regions only\" checkbox.",
+        "Autotune extras: Denser packing, Sparser packing, Background higher (in addition to More/Less cells).",
+    ])
+
+    pdf.chapter_title("Project counts spreadsheet", 1)
+    pdf.body(
+        "File > Select Project Output Directory asks for a folder, then a project name. BARCC writes a combined workbook:"
+    )
+    pdf.bullet_list([
+        "Path: {chosen folder}/{project name}_Counts.xlsx (sheet \"Project Counts\").",
+        "Layout: column File plus one column per unique structure name; each later row is one image. Re-counting the same file replaces that row. New structures add columns (never duplicated).",
+        "Count Cells still also writes the per-image workbook under output/counts/ (Cell Counts + Detection Parameters) and the _masked.tif overlay.",
+        "If the .xlsx is open in Excel (locked), BARCC falls back to a CSV next to it.",
+        "Legacy combined files named BARCC_project_counts / *_project_counts are still recognized.",
+    ])
+
+    pdf.chapter_title("File Browser: exclude, include, reload last count", 1)
+    pdf.bullet_list([
+        "Right-click a TIFF: Exclude removes it from Next Uncounted / progress as skipped (persisted under ~/.barc/). Include puts it back.",
+        "Reload last count (paint, mask, config) — restores the last Count Cells artifacts for that image: detection JSON, paint/.barccpaint, cell mask, and counts table when present. Also Cell > Reload Last Count Session... for the open TIFF.",
+        "After reload, the cell mask is locked (Count Cells will not re-detect). Use Cell > Show Mask if you want a new detection.",
+        "View > Show Cell Mask toggles the red detection rings without re-running detection. Rings now survive zoom and pan (persistent overlay layer).",
+    ])
+
+    pdf.chapter_title("Smarter Add Cell brush", 1)
+    pdf.body(
+        "Add Cell no longer only stamps a disk. Click a nucleus: BARCC traces a cell-like blob at that peak, "
+        "then the brush size (1-10) tightens or expands the fill (1 = tight nucleus, 10 = more aggressive halo, "
+        "4 = traced shape as-is). Right-click still brush-erases. Detection rings stay visible under the edit."
+    )
+
+    pdf.body(
+        "The rest of this manual (chapters 5, 6, 8, 10, 12, 13) describes these tools in the daily workflow, "
+        "not only in this changelog."
+    )
+
+    # ------------------------------------------------------------------
+    # What's New — 8.09.000
+    # ------------------------------------------------------------------
+    pdf.chapter_title("What's New in Version 8.09.000", 0)
+
+    pdf.body(
+        "BARCC 8.09.000 is the published detection and Mask Settings release: Adaptive detection, "
+        "Area Tune, Measure Tune (TP/FP/FN/TN), smarter Smart Suggest, peak quality filters, "
+        "and mask-edit UX fixes. Python 3.14 is the recommended runtime."
+    )
+
+    pdf.chapter_title("Adaptive detection (Blob / DoG overlay)", 1)
+    pdf.bullet_list([
+        "Adaptive is a checkbox on Blob / LoG or DoG (not a separate radio method). Disabled under Watershed.",
+        "Tile-local thresholds, optional dual-pass (sensitive + strict), density-aware packing.",
+        "Parameters: tile size, tile overlap, sensitivity, packing, dual-pass.",
+        "Autotune More/Less Cells nudges adaptive knobs when Adaptive is on.",
+        "Inactive method panels are dimmed and locked so you cannot edit Watershed knobs while Blob is selected (and vice versa).",
+    ])
+
+    pdf.chapter_title("Peak quality filters", 1)
+    pdf.bullet_list([
+        "Local SNR — (mean core - mean surround) / std surround. Raise (1.5-3.5) to reject high-background texture that is not locally brighter.",
+        "bg relative — peak intensity minus local median (normalized 0-1). Try 0.08-0.18 on high background.",
+        "Isotropy — radial symmetry around the peak; rejects edge-of-tissue and fiber detections bright on one side only (try 0.4-0.55).",
+        "Circularity — local shape; raise 0.55-0.75 to reject peanuts / merged doublets. Values above 1 are treated as 0.80.",
+        "Tissue-edge reject — outer ring partly outside the tissue (near-black). Does not treat a pure dark-field image as \"outside\". Use with blob_tissue_margin for bright edge lines.",
+    ])
+
+    pdf.chapter_title("Area Tune", 1)
+    pdf.body(
+        "In Mask Settings, click Area Tune. Draw 10 independent diameter lines (one per representative cell). "
+        "BARCC sets blob_min_area / blob_max_area to 0.7x-1.5x mean area (pi * r^2). "
+        "Results stay for the session so Smart Suggest can prefer those bounds. "
+        "Measure Tune does not overwrite Area Tune size bounds when both have been used."
+    )
+
+    pdf.chapter_title("Measure Tune (TP / FP / FN / TN)", 1)
+    pdf.body(
+        "After Show Mask / Smart Suggest, click Measure Tune (TP/FP/FN/TN) in Mask Settings. "
+        "Label the current mask:"
+    )
+    pdf.bullet_list([
+        "TP (green) — real cell correctly detected.",
+        "FP (orange) — false mark.",
+        "FN (blue) — missed cell.",
+        "TN (gray) — true empty background.",
+        "Precision pass: FP + TN only (>=2 should-not) — tighten threshold / SNR / quality.",
+        "Recall pass: TP + FN only (>=2 should-detect) — recover missed cells.",
+        "Full pass: both sides. Detection rings stay visible while labeling. Apply uses a progress dialog.",
+        "Performance: local-patch LoG (no full-frame LoG storm on large TIFFs). Labels feed Smart Suggest.",
+    ])
+
+    pdf.chapter_title("Smart Suggest upgrades (8.09)", 1)
+    pdf.bullet_list([
+        "Regional diagnosis (bright vs dark tiles: peaks vs detections).",
+        "Named recipes: mixed_both, high_bg_fp, low_bg_fn, recover_clusters, global over/under.",
+        "Joint suggestions (Adaptive + dual-pass + SNR + threshold + packing together).",
+        "Can turn Adaptive on when indicators support it.",
+        "Trajectory memory after Apply (e.g. ease SNR after a strict high-BG pass).",
+        "Area Tune / Measure Tune results preferred over pure LoG-derived sizes when present.",
+        "Everything still runs 100% on your computer.",
+    ])
+
+    pdf.chapter_title("Mask edit UX (8.09)", 1)
+    pdf.bullet_list([
+        "Remove-cell brush paint is yellow/gold (not red or cyan). Add stays red.",
+        "Detection mask stays visible under add/remove paint (rings + brush composite; works while zooming).",
+    ])
+
+    pdf.body(
+        "See release-notes-v8.09.000.md in the repository root. Atlas alignment, Dual Settings, and project "
+        "counts that were deferred from 8.09 are in Version 8.10.000 (preceding chapter)."
+    )
+
+    # ------------------------------------------------------------------
+    # What's New — 8.08.000
     # ------------------------------------------------------------------
     pdf.chapter_title("What's New in Version 8.08.000", 0)
 
@@ -685,8 +873,8 @@ def build_manual():
     pdf.chapter_title("System Requirements", 1)
     pdf.bullet_list([
         "Windows 10 or later (primary supported platform)",
-        "Python 3.8 or higher",
-        "At least 8 GB RAM recommended for large images"
+        "Python 3.14 recommended (conda env barcc314). Python 3.8+ still runs; 3.12 (legacy env barcc) is a fallback",
+        "At least 8 GB RAM recommended for large images (16 GB+ for very large TIFFs)"
     ])
 
     pdf.chapter_title("Image Format and Compatibility Requirements", 1)
@@ -755,39 +943,34 @@ def build_manual():
     pdf.ln(3)
 
     pdf.set_font("Helvetica", "", 10.5)
-    pdf.body("2. Install dependencies:")
+    pdf.body("2. Create the Python 3.14 conda environment (recommended) and install dependencies:")
     pdf.set_font("Courier", "", 9)
-    pdf.multi_cell(0, 5, "pip install -r requirements.txt")
+    pdf.multi_cell(
+        0,
+        5,
+        "conda env create -f environment.yml\n"
+        "conda activate barcc314\n"
+        "pip install -r requirements.txt",
+    )
     pdf.ln(2)
 
     pdf.set_font("Helvetica", "", 10)
     pdf.body(
-        "For full .xlsx export support (including the Detection Parameters metadata sheet) and the _masked.tif "
-        "feature, also install the Excel engines:"
+        "environment.yml names the env barcc314 (Python 3.14). Alternatively: "
+        "conda create -n barcc314 python=3.14 pip -y, then activate and pip install -r requirements.txt. "
+        "requirements.txt includes openpyxl and xlsxwriter for Excel export. "
+        "If those engines are missing, Count Cells falls back to CSV."
     )
-    pdf.set_font("Courier", "", 9)
-    pdf.multi_cell(0, 5, "pip install openpyxl xlsxwriter")
-    pdf.ln(3)
-
-    pdf.set_font("Helvetica", "", 10.5)
-    pdf.body(
-        "For the best experience with automatic Excel exports (including a second sheet with all "
-        "detection parameters), we also recommend installing the Excel engines:"
-    )
-    pdf.set_font("Courier", "", 9)
-    pdf.multi_cell(0, 5, "pip install openpyxl xlsxwriter")
     pdf.ln(2)
 
-    pdf.set_font("Helvetica", "", 10)
-    pdf.body(
-        "If these packages are missing, BARCC will automatically fall back to saving results as a "
-        "plain .csv file instead of .xlsx. These packages are listed as recommended (but not strictly required) "
-        "in the project's requirements.txt."
-    )
-    pdf.ln(3)
-
     pdf.set_font("Helvetica", "", 10.5)
-    pdf.body("3. Launch the application:")
+    pdf.body("3. Launch the application (Windows):")
+    pdf.bullet_list([
+        "Double-click Application/Launch_BARCC.bat (tries barcc314 pythonw, then the legacy barcc 3.12 env, then py -3.14).",
+        "Or double-click Application/BARCC.lnk if you created a shortcut.",
+        "Or from Anaconda Prompt: conda activate barcc314, then cd Application, then python barcc.py.",
+    ])
+    pdf.body("Generic launch:")
     pdf.set_font("Courier", "", 9)
     pdf.multi_cell(0, 5, "cd Application\npython barcc.py")
 
@@ -802,14 +985,14 @@ def build_manual():
     )
 
     pdf.bullet_list([
-        "Import a TIFF (File > Import TIFF or File Browser)",
+        "Import a TIFF (File > Import TIFF or File Browser). Optionally File > Select Project Output Directory for the combined counts workbook",
         "Import an atlas (Atlas > PDF or Allen Atlas + stitch; optionally save .catlas)",
-        "Align with Fit Atlas to Image, Move, Rotate, Scale, Crop",
-        "Define regions via atlas click, Paint, or Load Atlas Schematic",
+        "Align: Fit Atlas to Image, then Landmarks (3-6 pairs) -> Edge Snap Preview/Apply -> Local Refine / Crop (lock aspect if desired)",
+        "Define regions via atlas click, Paint, or Load Atlas Schematic. For Dual Settings, assign regions A or B",
         "Optional multi-channel: Next Channel (keep atlas) or load .catlas / cell mask",
-        "Configure detection (Cell > Show Mask Settings); edit/save cell masks as needed",
+        "Configure detection (Cell > Show Mask Settings): Adaptive, Area Tune, Measure Tune, Smart Suggest; edit/save cell masks as needed",
         "Count Cells and/or Axons and Nets intensity / PNN measurement",
-        "Results auto-save under the image output/<feature>/ folders (counts, intensities, pnn, …)",
+        "Results auto-save under the image output/<feature>/ folders; project workbook updates if you chose a project directory",
     ])
 
     # ------------------------------------------------------------------
@@ -820,13 +1003,15 @@ def build_manual():
     pdf.body(
         "The main interface consists of a left file browser pane and a large central image canvas. "
         "The left pane lets you select a folder and browse all TIFF images within it. Double-clicking "
-        "any file loads it as the active image. A checkmark column shows which images have already "
-        "been counted (based on the presence of matching .csv or .xlsx result files)."
+        "any file loads it as the active image. A status column shows which images have already "
+        "been counted (matching results under output/counts/ or legacy .csv/.xlsx). "
+        "Right-click a file to Exclude / Include it from batch navigation or to Reload last count."
     )
 
     pdf.body(
-        "All other functionality is accessed through the top menu bar. The interface is designed "
-        "to keep as much screen space as possible available for the image and mask visualization."
+        "All other functionality is accessed through the top menu bar and the Atlas Manager ribbon. "
+        "View > Show Atlas Manager Ribbon and View > Show Cell Mask control the ribbon and the persistent "
+        "red detection rings. The interface keeps as much screen space as possible for the image."
     )
 
     pdf.chapter_title("Main Canvas", 1)
@@ -840,7 +1025,10 @@ def build_manual():
     pdf.chapter_title("Menus", 1)
     pdf.body(
         "File, Edit, Atlas, Paint, Cell, Axons and Nets, View, and related menus provide access to all features. "
-        "The former Mask menu is now Cell (detection tools plus a Counting submenu). "
+        "The former Mask menu is now Cell (detection, mask edit, cell masks, Count Cells, Reload Last Count Session). "
+        "Atlas includes Import, Fit, Landmarks, Edge Snap, Local Refine, schematic save/load, and per-region tools. "
+        "File includes Select Project Output Directory and Next Channel. "
+        "View includes Show Atlas Manager Ribbon and Show Cell Mask. "
         "Many operations open auxiliary dialogs for parameter adjustment."
     )
 
@@ -886,6 +1074,28 @@ def build_manual():
         "Useful when your source data contains multiple sections in one file."
     )
 
+    pdf.chapter_title("Select Project Output Directory", 1)
+    pdf.body(
+        "File > Select Project Output Directory chooses where the combined project counts spreadsheet is written. "
+        "BARCC prompts for a folder, then a project name. The workbook is:"
+    )
+    pdf.set_font("Courier", "", 9)
+    pdf.multi_cell(0, 5, "{folder}/{project name}_Counts.xlsx")
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "", 10.5)
+    pdf.body(
+        "Sheet name: \"Project Counts\". Row 1 is File plus unique structure names; each later row is one image. "
+        "Count Cells appends or updates the current TIFF's row (re-counting the same file replaces that row; "
+        "new structures add columns, never duplicates). Per-image files under output/counts/ are still written. "
+        "If the combined .xlsx is open in Excel, BARCC writes a CSV next to it instead. "
+        "The choice is remembered in UI prefs (~/.barc/)."
+    )
+    pdf.note_box(
+        "Set the project directory once at the start of a cohort. Then Count Cells on each TIFF (or walk Next Uncounted) "
+        "and open the combined workbook when the folder is done. Do not keep the .xlsx open in Excel while counting "
+        "if you want live xlsx updates."
+    )
+
     pdf.chapter_title("File Browser (Left Pane)", 1)
     pdf.body(
         "BARCC v8.01 introduced a dedicated file manager pane on the left side of the main window. "
@@ -899,9 +1109,22 @@ def build_manual():
     )
 
     pdf.body(
-        "A second column in the list displays a checkmark (✓) next to any image that has already been processed. "
-        "This checkmark appears automatically if a matching .csv or .xlsx results file (generated by Count Cells) "
-        "exists in the same folder. This is very useful for tracking which images in a large dataset have already been counted."
+        "A status column shows which images have already been processed (checkmark when matching Count Cells "
+        "results exist under output/counts/ or as legacy .csv/.xlsx). "
+        "This is useful for tracking which images in a large dataset have already been counted."
+    )
+
+    pdf.body(
+        "Right-click a TIFF for a context menu:"
+    )
+    pdf.bullet_list([
+        "Exclude — skip this image in Next Uncounted / remaining progress (stored in ~/.barc/). The row stays visible but is treated as out of the batch.",
+        "Include — put an excluded image back into the batch.",
+        "Reload last count (paint, mask, config) — enabled when Count Cells has already saved artifacts for that file. Loads the TIFF if needed, then restores detection JSON, paint/.barccpaint, cell mask, and the counts table when present. The restored cell mask is locked until you Cell > Show Mask.",
+    ])
+
+    pdf.body(
+        "The same reload is also Cell > Reload Last Count Session... for the currently open TIFF (or the File Browser selection)."
     )
 
     pdf.body(
@@ -910,7 +1133,8 @@ def build_manual():
 
     pdf.note_box(
         "The File Browser works independently of the traditional \"File > Import TIFF\" menu. "
-        "You can still use the menu for one-off files, but the left pane is much faster when working with a whole folder of images."
+        "You can still use the menu for one-off files, but the left pane is much faster when working with a whole folder of images. "
+        "Exclude is for images you do not want in this project's remaining count (bad section, duplicate, etc.) without deleting the file."
     )
 
     pdf.chapter_title("Save Flattened Image", 1)
@@ -952,10 +1176,73 @@ def build_manual():
 
     pdf.chapter_title("Fit Atlas to Image, Crop, Clear Atlas", 1)
     pdf.bullet_list([
-        "Fit Atlas to Image: resizes the atlas (and mask/borders) to the TIFF size and aligns top-left corners.",
-        "Crop: draw a rectangle (aspect can lock to the TIFF); incomplete edge structures can be pruned.",
+        "Fit Atlas to Image: resizes the atlas (and mask/borders) to the TIFF size and aligns top-left corners. Use this first, then Landmarks / Edge Snap.",
+        "Crop: turn on the Global Crop checkbox, set Crop box shape (see below), drag a rectangle; incomplete edge structures can be pruned. Enter / double-click / Apply Crop commits.",
         "Clear Atlas: removes drawings and Atlas Manager regions while keeping the loaded TIFF.",
     ])
+
+    pdf.chapter_title("Crop box shape (aspect ratio)", 1)
+    pdf.body(
+        "With Crop checked, the Atlas Manager ribbon shows \"Crop box shape (aspect ratio)\". "
+        "Set this before dragging:"
+    )
+    pdf.bullet_list([
+        "Lock aspect ratio while drawing — checked: the rectangle keeps the selected ratio; unchecked: free-form.",
+        "Ratio dropdown: Match TIFF image (same shape as the slice), Square (1:1), 4:3, 3:2, Widescreen (16:9), or Custom width x height.",
+        "Custom: type W and H, then Apply custom or press Enter in the box. Custom entries are enabled only when lock is on and Custom is selected.",
+        "How to... opens the same instructions. Changing the ratio while a box is pending re-shapes that box.",
+        "Status text on the crop hint shows [lock 16:9], [lock = TIFF ...], or [free aspect].",
+    ])
+
+    pdf.chapter_title("Practical alignment stack (Landmarks, Edge Snap, Local Refine)", 1)
+    pdf.body(
+        "After Fit Atlas to Image, use the Atlas menu alignment tools in order. They are designed as a stack: "
+        "global similarity from point pairs, optional silhouette snap, then per-structure cleanup."
+    )
+
+    pdf.chapter_title("Step 1 — Align: Landmarks (point pairs)", 2)
+    pdf.body(
+        "Atlas > Align: Landmarks (point pairs)... exits Crop/Move/Measure Tune/Area Tune, binds the canvas, "
+        "and opens a Landmark Align status window (always on top)."
+    )
+    pdf.bullet_list([
+        "For each pair: click a point on the ATLAS (line/feature, magenta marker), then the matching point on the TISSUE (cyan).",
+        "Use 3-6 pairs (ventricle, midline, outer edge). Apply Fit requires at least 2 pairs.",
+        "Undo pair removes the last pair. Apply Fit runs a similarity transform (scale + rotation + translation) and moves the whole atlas. Cancel or Esc exits without applying.",
+        "Pairs are stored in image coordinates so they survive zoom. After a successful fit they can be used as a prior in Edge Snap.",
+    ])
+
+    pdf.chapter_title("Step 2 — Align: Edge Snap", 2)
+    pdf.body(
+        "Atlas > Align: Edge Snap... opens a dialog: \"Snap atlas outline to tissue\". Preview first, then Apply. "
+        "Nothing is baked into the atlas rasters until Apply. Restore returns to the captured pose."
+    )
+    pdf.bullet_list([
+        "Search: Refine current pose (+/-12 deg, scale +/-8%, small shift) — use after Landmarks. From scratch — full rotation search when the atlas is still far off.",
+        "Allow Translate / Rotate / Scale — constrain which degrees of freedom the search may change.",
+        "Matching: partial overlap is useful when the atlas plate is a hemisphere or the tissue is cropped.",
+        "Auto tissue polarity (recommended) or Force invert (dark tissue) if the section is dark-field.",
+        "Tissue tightness — how aggressively the tissue mask is eroded/opened before taking the outer contour.",
+        "Optional: include holes (ventricles), use zone outlines instead of ink, Per-region only (selected Atlas Manager zone), Flip atlas left-right, keep landmark pairs as a prior.",
+        "Preview draws the proposed silhouette overlay. Quality text reports the residual. Apply commits; Restore / dialog close without Apply leaves placement unchanged.",
+    ])
+
+    pdf.chapter_title("Step 3 — Align: Local Refine (guide)", 2)
+    pdf.body(
+        "Atlas > Align: Local Refine (guide)... assumes global pose is already close. It turns Border drag resize ON, "
+        "expands the Atlas Manager ribbon if collapsed, and shows the remaining checklist:"
+    )
+    pdf.bullet_list([
+        "Click a labeled region in Atlas Manager (or Select Region).",
+        "Optional: Edge Snap with Per-region only to ICP that one zone.",
+        "Grab the red border segment and drag to match tissue, or Move Selected Region to translate one zone.",
+        "Paint custom zones for anatomy the atlas cannot match.",
+        "Save Atlas Schematic (.catlas) when done.",
+    ])
+    pdf.note_box(
+        "Do not start with Local Refine on a badly placed plate — Landmarks and Edge Snap move the whole atlas. "
+        "Local Refine is for leftover mismatches on individual structures."
+    )
 
     pdf.chapter_title("The Atlas Manager Ribbon", 1)
     pdf.body(
@@ -968,8 +1255,9 @@ def build_manual():
         "\"Move Selected Region\" checkbox: enables interior drag of the orange-tinted selected region to shift *only* its mask pixels (everything else stays fixed).",
         "\"Border drag resize enabled\" checkbox: arms edge-grab mode for the selected region.",
         "Global Quick Adjust: one-click Rot +/-5° and Scale +/-5% for the entire current atlas page (base + all masks), plus quick access to the full Rotate/Scale dialogs.",
-        "Selectable list of every labeled region on the current page. Click any entry to select it for editing (orange highlight appears, ribbon header updates).",
+        "Selectable list of every labeled region on the current page. Click any entry to select it for editing (orange highlight appears, ribbon header updates). When Dual Settings Mode is on, the list caption mentions A/B: select a region and press A or B (or Use Config A / Use Config B) to assign which detector config that zone uses.",
         "Selected Region Quick Adjust: the same +/- rotate and scale buttons, but applied only to the currently selected region (centroid-preserving).",
+        "Crop box shape (aspect ratio) panel when Global Crop is on (lock + ratio presets + custom W x H).",
         "All operations are undoable and immediately reflected in the ribbon list and on-screen tints."
     ])
     pdf.note_box(
@@ -986,7 +1274,8 @@ def build_manual():
     pdf.body(
         "Canvas clicks on already-named regions now intelligently autoselect them into the ribbon (instead of "
         "re-prompting for a name). Clicks near the perimeter (even on boundary pixels) are treated as edge-grab "
-        "intent when the border checkbox is on."
+        "intent when the border checkbox is on. With Dual Settings Mode on, press A or B after selecting a region "
+        "to assign Config A or Config B (the list caption reminds you)."
     )
 
     pdf.chapter_title("Global Quick Adjust (new in 8.03)", 1)
@@ -1080,10 +1369,9 @@ def build_manual():
     )
 
     pdf.note_box(
-        "Best practice: Identify 3-4 reliable anatomical landmarks (e.g., ventricles, major fiber tracts, "
-        "cortical boundaries) and align to those rather than trying to match the entire section at once. "
-        "After global alignment, use the new per-region tools in the ribbon to tweak individual structures "
-        "without disturbing the rest of the plate."
+        "Best practice: Identify 3-6 reliable anatomical landmarks (ventricles, midline, major fiber tracts, "
+        "cortical boundaries) with Align: Landmarks, optionally Edge Snap, then use per-region tools "
+        "(Local Refine / border drag / Move Selected) to tweak individual structures without disturbing the rest of the plate."
     )
 
     # ------------------------------------------------------------------
@@ -1149,24 +1437,26 @@ def build_manual():
 
     pdf.body(
         "This is the most powerful and configurable part of BARCC. The Mask Settings dialog "
-        "provides fine-grained control over cell detection. BARCC v8.01+ supports two different "
-        "detection strategies that you can switch between at any time:"
+        "provides fine-grained control over cell detection. BARCC supports two detection strategies "
+        "that you can switch between at any time:"
     )
 
     pdf.bullet_list([
-        "Blob Detection (Recommended): Uses modern Laplacian-of-Gaussian (blob_log) blob detection. Generally provides the best results on immunofluorescence images with variably bright cells.",
-        "Watershed (Legacy): The original threshold + distance transform + watershed pipeline. Retained for compatibility with older workflows."
+        "Blob Detection (Recommended): Laplacian-of-Gaussian (blob_log) or Difference-of-Gaussian. Generally the best results on immunofluorescence images with variably bright cells. Adaptive is a checkbox on Blob/DoG, not a third radio method.",
+        "Watershed (Legacy): The original threshold + distance transform + watershed pipeline. Retained for compatibility with older workflows. Adaptive is disabled under Watershed."
     ])
 
     pdf.body(
-        "You can switch between these two methods at any time using the radio buttons at the bottom "
-        "of the Mask Settings dialog. Most users should use the Blob method for new work."
+        "You can switch between these two methods at any time using the radio buttons. "
+        "Inactive method panels are dimmed and locked. Most users should use Blob for new work, "
+        "with Adaptive checked when background or density varies across the field."
     )
 
     pdf.note_box(
-        "A powerful new feature in v8.01 is the \"Smart Suggest (Pre-tuning smart settings)\" button. "
-        "This fully local tool analyzes your current image and detection results and suggests "
-        "better parameter values. No data ever leaves your computer."
+        "Recommended tuning order on a new image: Show Mask with defaults -> Area Tune (10 diameters) -> "
+        "Smart Suggest -> optional Measure Tune precision pass (FP/TN) then recall pass (TP/FN) -> "
+        "manual Add/Remove on remaining errors. For mixed packed/sparse anatomy, enable Dual Settings Mode "
+        "and assign regions A/B before Smart Suggest A and B."
     )
 
     pdf.chapter_title("Detection Method", 1)
@@ -1180,9 +1470,45 @@ def build_manual():
     ])
 
     pdf.body(
-        "When Blob is selected, the lower part of the dialog shows the Blob Detection parameters. "
-        "When Watershed is selected, the legacy Watershed parameters are shown instead."
+        "When Blob is selected, the dialog shows Blob Detection parameters (Config A; Config B as well if Dual Settings Mode is on). "
+        "When Watershed is selected, the legacy Watershed parameters are shown instead. "
+        "Adaptive Detection panels appear under Blob/DoG when Adaptive is checked."
     )
+
+    pdf.chapter_title("Dual Settings Mode (Config A / Config B)", 1)
+    pdf.body(
+        "Check Dual Settings Mode at the top of Mask Settings to show a second Blob/Adaptive panel (Config B) "
+        "to the right of Config A. The first enable copies A into B. Show Mask / Count Cells then run Config A "
+        "in regions tagged A and Config B in regions tagged B, and merge the two label maps."
+    )
+    pdf.bullet_list([
+        "Assign a region: select it in Atlas Manager (or click it on the canvas) and press A or B. Keys are ignored while focus is in a text entry. Or right-click / ribbon: Use Config A / Use Config B.",
+        "Unassigned regions default to Config A.",
+        "Smart Suggest A and Smart Suggest B appear only when Dual Settings Mode and Smart Suggest's \"Labeled regions only\" are both on. Each recipe is fit from that group's pixels.",
+        "Autotune shows A/B checkboxes so you can mutate one or both configs.",
+        "Assignments travel with paint bundles. Off = one global detector.",
+    ])
+    pdf.note_box(
+        "Use Dual Settings when one threshold cannot serve packed clusters and sparse fields on the same slice "
+        "(classic example: PVN vs AHA, or left vs right with very different background). "
+        "It is not a substitute for Adaptive tiles inside one config — you can use both: Adaptive on A and on B."
+    )
+
+    pdf.chapter_title("Adaptive Detection", 1)
+    pdf.body(
+        "Adaptive is a checkbox on Blob / LoG or DoG. It is not a third detection method. "
+        "When on, BARCC estimates thresholds per tile (or per labeled region) and can run a dual-pass "
+        "(sensitive + strict) then fuse detections with density-aware packing."
+    )
+    pdf.bullet_list([
+        "adaptive_tile_size — tile size in pixels (typical 192-384). Smaller adapts more; larger is smoother/faster.",
+        "adaptive_tile_overlap — fractional overlap 0-0.5. Higher reduces misses at tile edges.",
+        "adaptive_sensitivity — global multiplier. <1 lowers tile thresholds (more cells); >1 is stricter.",
+        "adaptive_packing — 0 = sparse (more free space); 1 = dense clusters; ~0.5 balanced.",
+        "adaptive_dual_pass — 1 = sensitive + strict fused (best for mixed high/low background); 0 = single pass.",
+        "adaptive_region_mode — 0 = square tiles over the whole image; 1 = one window per painted/atlas zone with its own threshold/SNR. Unlabeled tissue is not labeled. Requires zones. Then Show Mask.",
+        "Labeled regions only (Blob Detection) — restrict Show Mask / Count Cells to painted or atlas regions even when Adaptive region mode is off. Separate from Smart Suggest's Labeled regions only checkbox.",
+    ])
 
     pdf.chapter_title("Blob Detection Parameters (Recommended)", 1)
     pdf.body(
@@ -1218,8 +1544,31 @@ def build_manual():
 
     pdf.chapter_title("Blob Min Circularity", 2)
     pdf.body(
-        "Requires detected blobs to be reasonably round. Raising this value helps reject irregular artifacts."
+        "Minimum local shape circularity (0 = off, 1 = a perfect circle). Typical cells score ~0.6-0.9. "
+        "Raise (0.55-0.75) to reject peanuts / merged doublets. Values above 1 (e.g. 2) are treated as 0.80. "
+        "This is not the Watershed circularity box."
     )
+
+    pdf.chapter_title("Peak quality filters (fewer false positives)", 2)
+    pdf.body(
+        "These gates run on candidate peaks after LoG/DoG. Hover any Mask Settings control for the same help text."
+    )
+    pdf.bullet_list([
+        "blob_min_local_snr / blob_local_snr_outer — local signal-to-noise: (mean_core - mean_surround) / std_surround. 0 = off. Typical 1.5-3.5. Outer ring is r to r * outer (default 2.0).",
+        "blob_bg_relative — peak minus local median on a 0-1 image. 0 = off. Try 0.08-0.18 on high background texture.",
+        "blob_min_isotropy — radial symmetry (0 = off, 1 = perfect). Rejects edge-of-tissue and fibers bright on one side. Try 0.4-0.55.",
+        "blob_reject_tissue_edge / blob_edge_dark_frac — reject peaks whose outer ring is partly near-black (section border). Does not treat a fully dark-field image as outside. Lower dark_frac (0.25-0.35) is stricter.",
+        "blob_tissue_margin — integer pixels inside the OUTER slice border to reject (bright edge-line FPs). 0 = off. Try 6-12 (15-25 for thick glow). Must be a whole number.",
+        "blob_max_elongation — max major/minor axis ratio (1 = circle). Default 3.0; 0 = off. Nuclei are typically 1-2. Rejects folds, fibers, cut-edge line.",
+        "blob_ridge_reject / blob_ridge_thresh — Hessian ridge test (white midline / knife line). 1 = on; thresh 0.35-0.55 typical (lower drops more lines).",
+        "blob_cavity_rim — kill zone around air-bubble bites in the section edge. Does not clear PVN/SCN next to the 3rd ventricle except peaks in the lumen. 0 = off; try 16-32.",
+        "blob_chain_reject — 1-D line/ring suppression (ventricle wall, bubble rim, fold). 0 = off, 1 = default, 2-3 stronger. Packed 2-D clusters are kept.",
+        "blob_cluster_recover / blob_seed_snr / blob_recover_factor — two-tier placement: bright nuclei seed a dense patch; dim neighbors within (factor x typical radius) are kept. Isolated sparse cells still pass if they look like cells. Crowded speckle without a seed is dropped. Seed SNR default ~1.15; recover factor ~3.5-4.5.",
+        "blob_free_space — spacing between packed cells (0.05-0.95). Higher = more space (0.6-0.75 if cells look too tight). Lower = denser (0.15-0.3). Main packing knob; Adaptive packing only eases it slightly.",
+        "blob_min_peak_intensity — normalized peak >= this (0-1). 0 = off.",
+        "blob_exclude_border — ignore detections within N pixels of the image edge. 0 keeps border cells.",
+        "blob_radius_scale — converts detected sigma to mask disk radius (r ~ sigma * scale). Default ~1.8.",
+    ])
 
     pdf.chapter_title("Threshold Methods", 1)
     pdf.body(
@@ -1356,11 +1705,17 @@ def build_manual():
 
     pdf.body("The available Autotune buttons are:")
     pdf.bullet_list([
-        "More cells - Increases overall sensitivity. With Blob mode this primarily lowers the Blob Threshold and Min Sigma.",
+        "More cells - Increases overall sensitivity. With Blob mode this primarily lowers the Blob Threshold and Min Sigma. With Adaptive on it also eases adaptive knobs.",
         "Less cells - Decreases sensitivity and raises size/shape requirements.",
         "Bigger cells / Smaller cells - Adjust size-related parameters (Min/Max Area or Min/Max Cell Size).",
-        "Brighter cells / Dimmer cells - Primarily adjust intensity sensitivity (Blob Threshold or Peak Min Intensity)."
+        "Brighter cells / Dimmer cells - Primarily adjust intensity sensitivity (Blob Threshold or Peak Min Intensity).",
+        "Denser packing / Sparser packing - Nudge blob_free_space (and Adaptive packing when Adaptive is on).",
+        "Background higher - Raise bg-relative / SNR-style gates when the field is brighter than expected.",
     ])
+    pdf.body(
+        "In Dual Settings Mode, Autotune shows A/B checkboxes. Check the config(s) you want mutated. "
+        "If neither is checked, Autotune asks you to pick one."
+    )
 
     pdf.body(
         "Note: The Autotune buttons are intentionally conservative. For best results on difficult images, "
@@ -1385,23 +1740,55 @@ def build_manual():
         "This is separate from the internal Presets system (which stores quick named presets locally in ~/.barc/presets.json)."
     )
 
-    pdf.chapter_title("Smart Suggest (Offline) – New in v8.01", 1)
+    pdf.chapter_title("Smart Suggest (Offline)", 1)
     pdf.body(
-        "This is one of the most powerful new features in BARCC 8.01. Clicking \"Smart Suggest (Pre-tuning smart settings)\" "
-        "runs a fully local analysis on your current image and detection results. It then proposes specific "
-        "parameter improvements with clear explanations for each suggestion."
+        "Clicking \"Smart Suggest (Pre-tuning smart settings)\" runs a fully local analysis on your current image "
+        "and detection results. It then proposes specific parameter improvements with explanations."
     )
 
     pdf.bullet_list([
         "Everything runs 100% on your computer — no images or data are sent anywhere.",
-        "Each suggestion has a checkbox. You can selectively choose which changes to apply.",
-        "Buttons at the bottom allow you to \"Apply All\", \"Apply All That Are Checked\", or simply \"Close\".",
-        "It works with both Blob and Watershed modes and gives context-aware advice based on your actual data."
+        "Each suggestion has a checkbox. Apply All, apply checked, or Close.",
+        "Regional diagnosis (bright vs dark tiles) and named recipes (mixed_both, high_bg_fp, low_bg_fn, recover_clusters, global over/under).",
+        "Joint suggestions can turn Adaptive on and move dual-pass, SNR, threshold, and packing together.",
+        "Trajectory memory after Apply (e.g. ease SNR after a strict high-BG pass).",
+        "Prefers Area Tune / Measure Tune size bounds when those tools have been used.",
+        "Labeled regions only — fit using only painted/atlas pixels (does not change where Show Mask draws).",
+        "With Dual Settings Mode + Labeled regions only: Smart Suggest A and Smart Suggest B each fit their assigned region group.",
+        "Works with Blob and Watershed; advice is context-aware from your actual data.",
     ])
 
     pdf.body(
-        "This tool is especially useful when the simple Autotune buttons are too aggressive or not aggressive enough. "
-        "It is the recommended way to get good starting parameters for new or difficult images."
+        "This tool is especially useful when Autotune is too coarse. It is the recommended way to get "
+        "starting parameters for new or difficult images, after Area Tune if you have representative cells."
+    )
+
+    pdf.chapter_title("Area Tune", 1)
+    pdf.body(
+        "Mask Settings > Area Tune. Draw 10 independent diameter lines, one per representative cell "
+        "(not across a clump). BARCC sets blob_min_area / blob_max_area to 0.7x-1.5x the mean area (pi * r^2). "
+        "The result is stored for the session so Smart Suggest can prefer those bounds. "
+        "Measure Tune does not overwrite Area Tune size bounds when both have been used. Esc or Finish exits."
+    )
+
+    pdf.chapter_title("Measure Tune (TP / FP / FN / TN)", 1)
+    pdf.body(
+        "Mask Settings > Measure Tune (TP/FP/FN/TN). Label the current detection after Show Mask / Smart Suggest. "
+        "Clicks snap to nearby detections. AUTO can classify a click from the image; or choose the class explicitly."
+    )
+    pdf.bullet_list([
+        "TP (green) — real cell correctly detected.",
+        "FP (orange) — false mark that should not be a cell.",
+        "FN (blue) — missed cell that should have been detected.",
+        "TN (gray) — true empty background.",
+        "Precision pass: label FP + TN only (need >=2 should-not) to tighten threshold / SNR / quality.",
+        "Recall pass: label TP + FN only (need >=2 should-detect) to recover misses.",
+        "Full pass: both sides. Apply runs with a progress dialog (local-patch LoG, not a full-frame LoG storm).",
+        "Detection rings stay visible while labeling. Results feed Smart Suggest.",
+    ])
+    pdf.note_box(
+        "Expert mixed-background slices often need a precision pass, then a recall pass, then a few manual Add/Remove clicks. "
+        "Do not skip Area Tune if cell size is consistent — it keeps Measure Tune from rewriting your size window."
     )
 
     # ------------------------------------------------------------------
@@ -1414,6 +1801,13 @@ def build_manual():
         "let you correct errors before counting. Brush Settings opens automatically for add/remove. "
         "Manual edits combine with the automatic mask: (auto | add) & ~remove."
     )
+    pdf.bullet_list([
+        "Add Cell: click one nucleus. BARCC traces a cell-like blob at that peak; brush 1-10 tightens or expands the fill (1 = tight nucleus, 10 = more aggressive halo, 4 = traced shape). Add paint is red.",
+        "Remove Cell: brush-erase (right-click still erases in add mode). Remove paint is yellow/gold. Detection rings stay visible under the brush, including while zooming.",
+        "Split Cell: click a single masked blob that should be two cells. BARCC finds two intensity-weighted centers and watershed-cuts between them.",
+        "View > Show Cell Mask toggles the red rings without re-detecting. The overlay is a persistent layer: zoom and pan no longer wipe the rings.",
+        "Finish Mask Edit when done, then Count Cells.",
+    ])
 
     pdf.chapter_title("Save / Load Cell Mask (cross-channel)", 1)
     pdf.body(
@@ -1485,7 +1879,7 @@ def build_manual():
     pdf.chapter_title("Step 1 — Regions on counterstain; save .catlas", 2)
     pdf.body(
         "Open the counterstain image (e.g. DAPI / channel 0). Draw or import atlas regions "
-        "(Allen plate, PDF atlas, or paint). Align with Fit / Move / Crop as needed. "
+        "(Allen plate, PDF atlas, or paint). Align with Fit, then Landmarks / Edge Snap / Local Refine / Crop as needed. "
         "Save Atlas Schematic as a .catlas (cropped atlas) file under output/."
     )
 
@@ -1557,7 +1951,8 @@ def build_manual():
 
     pdf.body(
         "Once regions are defined and detection parameters are tuned, click \"Count Cells\" "
-        "under the Cell menu."
+        "under the Cell menu. If Dual Settings Mode is on, counting uses Config A in A-regions "
+        "and Config B in B-regions (same as Show Mask)."
     )
 
     pdf.body(
@@ -1568,25 +1963,36 @@ def build_manual():
     )
 
     pdf.body(
-        "BARCC will compute the number of detected cells within each named region. "
-        "Results are now saved **automatically** (no file dialog) with the following files created in the same folder as your source TIFF:"
+        "BARCC computes the number of detected cells within each named region. "
+        "Results are saved automatically (no file dialog) under the image's output/counts/ folder "
+        "(legacy flat files beside the TIFF are still detected):"
     )
 
     pdf.bullet_list([
-        "`YourImage.xlsx` — Excel workbook with two sheets:",
-        "    • Cell Counts — Region name, cell count, area, density, etc.",
-        "    • Detection Parameters — Complete record of every setting used (both cell detection and preprocessing). This is extremely useful for reproducibility and methods sections.",
-        "`YourImage_masked.tif` — The original image with the final cell mask (including any manual Add/Remove edits) drawn as a semi-transparent red overlay. Ready for figures or further analysis."
+        "{name}.xlsx — Excel workbook with two sheets: Cell Counts (region name, cell count, area, density, ...) and Detection Parameters (every setting used, including Dual Settings / Adaptive fields when present).",
+        "{name}_masked.tif — original image with the final cell mask (including manual Add/Remove) as a semi-transparent red overlay.",
+        "Paint bundle / cell mask / metadata JSON as needed so Cell > Reload Last Count Session can restore the session.",
     ])
 
+    pdf.chapter_title("Combined project spreadsheet", 1)
     pdf.body(
-        "BARCC automatically saves two files when you click Count Cells (no manual Save dialog):"
+        "If you used File > Select Project Output Directory, Count Cells also appends this image to:"
     )
-
-    pdf.bullet_list([
-        "`YourImage.xlsx` — Contains two sheets: \"Cell Counts\" (the actual results) and \"Detection Parameters\" (a complete record of every setting used for reproducibility).",
-        "`YourImage_masked.tif` — The original image with the final cell mask (after all manual Add/Remove edits) drawn as a semi-transparent red overlay. This is very useful for figure preparation."
-    ])
+    pdf.set_font("Courier", "", 9)
+    pdf.multi_cell(0, 5, "{project folder}/{project name}_Counts.xlsx")
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "", 10.5)
+    pdf.body(
+        "Sheet \"Project Counts\": first column File, then one column per unique structure name. "
+        "Each image is one row. Re-running Count Cells on the same TIFF replaces that row. "
+        "New structures seen later in the cohort add columns. "
+        "If the workbook is locked (open in Excel), BARCC writes a CSV with the same stem."
+    )
+    pdf.note_box(
+        "Per-image workbooks remain the complete record (parameters + counts). The project spreadsheet is the "
+        "cohort table (one row per file). Reload Last Count Session restores the per-image mask/paint/config, "
+        "not the combined workbook."
+    )
 
     pdf.body(
         "To generate the .xlsx file (instead of falling back to .csv), the following packages are required:"
@@ -1612,12 +2018,13 @@ def build_manual():
     )
 
     pdf.bullet_list([
-        "output/counts/ — Count Cells: {name}.xlsx (Cell Counts + Detection Parameters), _masked.tif, centroids CSV, metadata",
+        "output/counts/ — Count Cells: {name}.xlsx (Cell Counts + Detection Parameters), _masked.tif, centroids CSV, metadata (used by Reload Last Count Session)",
+        "Project workbook — {project folder}/{project name}_Counts.xlsx when Select Project Output Directory was used (cohort table, not under output/counts/)",
         "output/intensities/ — _intensities.xlsx, _counterstain_norm.xlsx",
         "output/pnn/ — _pnn_by_structure.xlsx, _pnn_cells_true.xlsx, _pnn_cells_random.xlsx",
         "output/atlas/ — .catlas schematics for multi-channel reuse",
         "output/cell_masks/ — .barccmask / cellmask PNG; random cell masks (_random_cellmask.png + JSON)",
-        "output/paint/ — paint layers and .barccpaint region bundles",
+        "output/paint/ — paint layers and .barccpaint region bundles (include Dual Settings A/B zone tags when present)",
         "output/flattened/ — flattened composites (TIFF + zones + paint + cell rings)",
     ])
 
@@ -1632,9 +2039,13 @@ def build_manual():
         ["Ctrl + S", "Save flattened image"],
         ["Ctrl + Left", "Previous image in File Browser"],
         ["Ctrl + Right", "Next image in File Browser"],
-        ["Ctrl + Shift + Right", "Next uncounted image"],
-        ["Enter", "Commit painted border refit after edge drag"],
+        ["Ctrl + Shift + Right", "Next uncounted image (skips excluded)"],
+        ["Enter", "Commit crop, or painted border refit after edge drag"],
+        ["Esc", "Cancel Landmarks / crop / Area Tune / Measure Tune"],
+        ["A / B", "Assign selected Atlas Manager region to Dual Settings Config A or B"],
         ["s (paint mode)", "Toggle pen drag vs segment mode"],
+        ["Mouse wheel", "Zoom (rings, atlas, paint stay aligned)"],
+        ["Alt + drag", "Pan the canvas"],
     ]
     pdf.add_table(headers, rows, col_widths=[55, 125])
 
@@ -1645,22 +2056,30 @@ def build_manual():
 
     pdf.chapter_title("Common Issues", 1)
 
-    pdf.body("- Cells not detected: Try lowering Peak Min Intensity or switching detection method / Smart Suggest.")
-    pdf.body("- Too many false positives: Increase min size/sigma or use Remove Cell.")
+    pdf.body("- Cells not detected: Lower Blob Threshold, ease local SNR / bg-relative, or run Smart Suggest then a Measure Tune recall pass (TP/FN).")
+    pdf.body("- Too many false positives: Raise SNR / bg-relative / isotropy; turn on ridge reject or chain reject; Measure Tune precision pass (FP/TN); Remove Cell (yellow brush).")
+    pdf.body("- Packed clusters missing members: Enable blob_cluster_recover; Autotune Denser packing; Dual Settings with a dedicated Config for those zones.")
+    pdf.body("- Midline / fold / bubble-rim FPs: blob_ridge_reject, blob_chain_reject, blob_cavity_rim (see Mask Settings tooltips).")
+    pdf.body("- Dual Settings seems ignored: Dual Settings Mode must be on; regions must be tagged A/B (select + press A or B); then Show Mask, not only Smart Suggest.")
+    pdf.body("- Atlas still far off: Fit Atlas to Image, then Landmarks with 3-6 pairs (Apply Fit), then Edge Snap in Refine mode. Use From scratch only if pose is wildly wrong. Local Refine is last.")
+    pdf.body("- Edge Snap jumps the wrong way: turn on Auto tissue polarity; try Force invert for dark-field; increase tightness; Preview before Apply; Restore if needed.")
+    pdf.body("- Crop box is the wrong shape: Crop checkbox on, lock aspect, pick Match TIFF or a preset before dragging. How to... in the ribbon.")
+    pdf.body("- Cell rings vanish on zoom: use View > Show Cell Mask (persistent overlay in 8.10).")
     pdf.body("- Atlas drifts on zoom: Use current build (model-space img_x/img_y); re-Fit if needed.")
     pdf.body("- .catlas loads shifted: Prefer same-resolution channels; rebuild schematic after Fit; 8.08 scales layers with background size.")
     pdf.body("- Left/right structures not distinguished: Re-Reflect/stitch so names get _r/_l; too many structures may exceed uint8 bilateral split.")
-    pdf.body("- Count Cells re-detects after Load Cell Mask: Ensure mask stayed locked; avoid Show Mask recalculate until you want a new mask.")
+    pdf.body("- Count Cells re-detects after Load Cell Mask or Reload Last Count: mask is locked until Cell > Show Mask recalculates.")
     pdf.body("- Random cells not in counts: By design — only the ground-truth cell mask is counted.")
-    pdf.body("- Excel not written: pip install openpyxl; check the image folder output/<feature>/ is writable.")
+    pdf.body("- Combined project xlsx not updating: set File > Select Project Output Directory; close the workbook in Excel if it is locked (CSV fallback).")
+    pdf.body("- Excel not written: pip install openpyxl xlsxwriter; check output/<feature>/ is writable.")
     pdf.body("- Count Cells crashes: Use v8.06+ (TIFF deflate fix); open TIFF after the window is laid out.")
-    pdf.body("- Performance is slow: Close other apps; large frames use viewer downscale — 16 GB+ RAM helps.")
+    pdf.body("- Performance is slow: Close other apps; large frames use viewer downscale — 16 GB+ RAM helps. Adaptive dual-pass on huge TIFFs is heavier than a single Blob pass.")
 
     pdf.chapter_title("Getting Help", 1)
     pdf.body(
         "For bugs or feature requests, please open an issue on the GitHub repository:\n"
         "https://github.com/LaingLab/BARCC\n\n"
-        "Release notes for each version live in the repository root (e.g. release-notes-v8.08.000.md)."
+        "Release notes for each version live in the repository root (e.g. release-notes-v8.10.000.md)."
     )
 
     # Final page

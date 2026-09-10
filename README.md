@@ -2,7 +2,16 @@
 
 A GUI tool for analyzing immunofluorescence images with atlas region mapping and automated cell counting.
 
-**v8.09.000 Highlights** (current)
+**v8.10.000 Highlights** (current)
+- **Dual Settings Mode**: Config A and Config B on the same slice; assign regions with A/B keys; Smart Suggest A/B.
+- **Atlas alignment stack**: Landmarks (point pairs) → Edge Snap (ICP silhouette, preview then apply) → Local Refine.
+- **Project counts**: File → Select Project Output Directory writes `{name}_Counts.xlsx` (one row per image).
+- **Crop aspect lock**: match TIFF, 1:1 / 4:3 / 3:2 / 16:9, or custom W×H.
+- Extra blob filters: ridge/midline reject, cavity rim, chain reject, cluster recover; Adaptive per-region mode.
+- File Browser: Exclude / Include, Reload last count; View → Show Cell Mask (rings survive zoom).
+- Version: **8.10.000**. See [release-notes-v8.10.000.md](release-notes-v8.10.000.md).
+
+**v8.09.000 Highlights** (previous)
 - **Adaptive detection** (Blob/DoG overlay): tile thresholds, dual-pass, density packing.
 - **Peak quality filters**: local SNR, bg-relative, isotropy, circularity, tissue-edge reject.
 - **Area Tune**: 10 per-cell diameter lines → min/max blob area (0.7×–1.5× mean); preserved over Measure Tune.
