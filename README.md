@@ -205,39 +205,42 @@ python barcc.py
 
 ## Basic Usage
 
-1. **Import TIFF Image**:
-   - Click "File > Import TIFF"
-   - Select your TIFF image file
+Detection parameters are listed in [mask_settings_documentation.md](mask_settings_documentation.md). The full walkthrough is [BARCC_User_Manual.pdf](BARCC_User_Manual.pdf).
 
-2. **Determine Regions**
+1. **Import a TIFF**:
+   - File > Import Tiff, or double-click a file in the left File Browser
+   - File > Next Channel… loads another channel of the same section and keeps the atlas, names, and paint
 
-   a. *Draw Region of Interest*:
-      - Click "Paint > Start Paint"
-      - Draw a circle around the ROI
-      - Once done, click "Paint > Stop Paint"
-      - Use "Paint > Save Paint Layer" to auto-save the paint into your current left File Browser folder (or "Load Paint" to reload one).
-   
-   b. *Import Atlas*:
-      - Click "Atlas > Import Atlas"
-      - Select your PDF atlas file
+2. **Define regions**
 
-3. **Align Atlas**:
-   - Use "Move Atlas" button to position the atlas over your image
-   - Use rotation and scaling controls if needed
-   - For fine per-region adjustments (after naming zones): Atlas > Select Region (then click a yellow region), then use Rotate Selected Region / Scale Selected Region to tweak individual shapes larger/smaller or rotate them. The underlying atlas lines stay fixed as reference while the counting zones (yellow) adjust.
+   a. *Paint*:
+      - Paint > Start Paint, draw the ROI, then Paint > Stop Paint
+      - Paint > Save Paint Layer writes into the folder open in the File Browser (Paint > Load Paint reloads it)
 
-4. **Define Regions**:
-   - Click on regions to highlight them
-   - Name each region when prompted
+   b. *Atlas*:
+      - Atlas > Import Atlas (PDF), or Atlas > Import Allen Atlas…
+      - File or Atlas > Load Atlas Schematic… (`.catlas`) reuses labeled regions on another channel
 
-5. **Verify Mask**:
-   - Click "Mask > Show Mask"
-   - Adjust detection with "Mask > Show Mask Settings"
-   - Manually add and remove cells under "Mask > Add/Remove Cells"
+3. **Align the atlas** (this order):
+   - Atlas > Fit Atlas to Image
+   - Atlas > Align: Landmarks (point pairs)… — click atlas, then matching tissue; 3–6 pairs; Apply Fit
+   - Atlas > Align: Edge Snap… — Preview, then Apply (Restore undoes a preview)
+   - Atlas > Align: Local Refine (guide)… — border-drag individual structures once the global pose is close
+   - With Global Crop on, lock the crop box to Match TIFF, 1:1, 4:3, 3:2, 16:9, or a custom W×H
 
-7. **Count Cells**:
-   - Click "Count Cells" to analyze
-   - Save results to Excel when prompted
+4. **Name regions**:
+   - Click a region and name it when prompted
+   - Dual Settings Mode (Mask Settings): select a region in Atlas Manager and press **A** or **B** so packed and sparse zones can use different detectors. Unassigned regions use Config A
+
+5. **Check the cell mask** (Cell menu):
+   - Cell > Show Mask
+   - Cell > Show Mask Settings — Blob/DoG or Watershed; Adaptive checkbox; Area Tune; Measure Tune (TP/FP/FN/TN); Smart Suggest
+   - Cell > Add Cell (red) / Remove Cell (yellow/gold). View > Show Cell Mask toggles detection rings without re-detecting
+
+6. **Count cells**:
+   - Cell > Counting > Count Cells
+   - Each image still gets a workbook under `output/counts/`
+   - File > Select Project Output Directory also writes `{project name}_Counts.xlsx` (one row per image; re-counting a file replaces that row)
 
 ## Common Issues
 

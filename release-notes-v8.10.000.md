@@ -43,11 +43,21 @@ Atlas alignment, Dual Settings, and project-counts release on top of v8.09.000 d
 - **View → Show Cell Mask** toggles red detection rings without re-detecting; overlay survives zoom/pan.
 - **Add Cell** traces a nucleus at the click; brush 1–10 tightens or expands the fill (4 = traced shape). Remove remains yellow/gold.
 
+## Documentation
+Manual, README, and the parameter reference match this release:
+
+- README basic usage uses the **Cell** menu (not Mask), the alignment order Fit → Landmarks → Edge Snap → Local Refine, Dual Settings **A** / **B**, and File → Select Project Output Directory.
+- The user manual separates the Watershed **Adaptive** threshold window from the Blob/DoG **Adaptive** checkbox. Blob num sigma default is **15**. Cluster-recover seed SNR default is **0.85**. Base Multiplier and Sensitivity Range are not in Mask Settings.
+- Background correction documents tophat, gaussian, and none.
+- `mask_settings_documentation.md` lists 8.10.000 defaults. **Dialog** fields have a Mask Settings row. **Engine** fields (`blob_tissue_margin`, `blob_recover_factor`, `adaptive_tile_overlap`, and the others named in the manual) are still applied and can be changed by Smart Suggest or Import Settings.
+- `BARCC_User_Manual.pdf` regenerated from `docs/generate_barcc_manual.py`.
+
 ## Files
 - `Application/barcc.py` — Dual Settings, alignment stack, project counts, extra filters, File Browser, mask overlay.
 - `docs/generate_barcc_manual.py` — user manual source.
 - `BARCC_User_Manual.pdf` — regenerated for 8.10.000.
-- `README.md` — version highlights.
+- `README.md` — version highlights and current basic usage.
+- `mask_settings_documentation.md` — detection parameter reference.
 - `release-notes-v8.10.000.md` — this file.
 - Version string: **8.10.000**.
 

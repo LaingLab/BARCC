@@ -1529,7 +1529,7 @@ def build_manual():
 
     pdf.chapter_title("Blob Num Sigma", 2)
     pdf.body(
-        "Number of scales tested between Min and Max Sigma. Higher values give finer granularity at the cost of speed. Default (12) is usually sufficient."
+        "Number of scales tested between Min and Max Sigma (LoG only). Higher values give finer granularity at the cost of speed. Default is 15. Set blob_log_scale to 1 (default) for geometric spacing, which samples small cells more finely."
     )
 
     pdf.chapter_title("Blob Overlap", 2)
@@ -1563,30 +1563,33 @@ def build_manual():
         "blob_ridge_reject / blob_ridge_thresh — Hessian ridge test (white midline / knife line). 1 = on; thresh 0.35-0.55 typical (lower drops more lines).",
         "blob_cavity_rim — kill zone around air-bubble bites in the section edge. Does not clear PVN/SCN next to the 3rd ventricle except peaks in the lumen. 0 = off; try 16-32.",
         "blob_chain_reject — 1-D line/ring suppression (ventricle wall, bubble rim, fold). 0 = off, 1 = default, 2-3 stronger. Packed 2-D clusters are kept.",
-        "blob_cluster_recover / blob_seed_snr / blob_recover_factor — two-tier placement: bright nuclei seed a dense patch; dim neighbors within (factor x typical radius) are kept. Isolated sparse cells still pass if they look like cells. Crowded speckle without a seed is dropped. Seed SNR default ~1.15; recover factor ~3.5-4.5.",
+        "blob_cluster_recover / blob_seed_snr / blob_recover_factor — two-tier placement: bright nuclei seed a dense patch; dim neighbors within (factor x typical radius) are kept. Isolated sparse cells still pass if they look like cells. Crowded speckle without a seed is dropped. Seed SNR default 0.85 (sparse cells use a milder bar); recover factor default 3.8.",
         "blob_free_space — spacing between packed cells (0.05-0.95). Higher = more space (0.6-0.75 if cells look too tight). Lower = denser (0.15-0.3). Main packing knob; Adaptive packing only eases it slightly.",
         "blob_min_peak_intensity — normalized peak >= this (0-1). 0 = off.",
         "blob_exclude_border — ignore detections within N pixels of the image edge. 0 keeps border cells.",
         "blob_radius_scale — converts detected sigma to mask disk radius (r ~ sigma * scale). Default ~1.8.",
+        "Not every gate is its own Mask Settings row. blob_tissue_margin, blob_edge_dark_frac, blob_recover_factor, blob_local_snr_outer, blob_log_scale, blob_radius_scale, blob_threshold_rel, blob_min_peak_intensity, blob_exclude_border, and adaptive_tile_overlap are still applied, and Smart Suggest or Import Settings can change them.",
     ])
 
     pdf.chapter_title("Threshold Methods", 1)
     pdf.body(
-        "The Threshold Method controls how the image is converted to a binary (black and white) "
-        "mask for cell detection. Four options are available:"
+        "These controls apply only when Detection Method is Watershed. They are dimmed while Blob or DoG is selected. "
+        "They are not the Adaptive checkbox (that overlay runs on Blob or DoG). "
+        "The Threshold Method controls how the watershed pipeline converts the image to a binary mask. Four options are available:"
     )
 
     pdf.bullet_list([
         "Otsu: Automatically determines the optimal global threshold using Otsu's method. Fast and effective on images with good contrast.",
-        "Adaptive: Uses local areas to determine the threshold. Excellent for images with varying brightness across the field of view.",
-        "Local: Similar to Adaptive but uses a different neighborhood computation. Useful when Adaptive produces too many or too few detections.",
+        "Adaptive (watershed window): Uses local areas to determine the threshold. Excellent for images with varying brightness across the field of view. This is the watershed adaptive_block_size control, not Adaptive Detection.",
+        "Local: Similar to the watershed adaptive window but uses a different neighborhood computation.",
         "Manual: Uses a fixed threshold value (0.0-1.0) that you specify. Provides maximum reproducibility across batches of images."
     ])
 
     pdf.chapter_title("Cell Detection Parameters", 1)
 
     pdf.body(
-        "These parameters control how individual cells are identified from the binary mask:"
+        "These Watershed parameters control how individual cells are identified from the binary mask. "
+        "The panel is locked while Blob or DoG is the active method."
     )
 
     pdf.chapter_title("Manual Threshold", 2)
@@ -1640,10 +1643,9 @@ def build_manual():
         "Typical value: 0.0."
     )
 
-    pdf.chapter_title("Base Multiplier & Sensitivity Range", 2)
     pdf.body(
-        "Advanced sensitivity controls. Base Multiplier sets overall detection sensitivity (default ~1.1). "
-        "Sensitivity Range controls how much the sensitivity slider can influence results (default 0.2)."
+        "Mask Settings does not include the older Base Multiplier or Sensitivity Range controls. "
+        "Blob sensitivity is Blob Threshold. When Adaptive is on, Adaptive Sensitivity is the global tile multiplier."
     )
 
     pdf.chapter_title("Preprocessing Pipeline", 1)
@@ -1654,9 +1656,9 @@ def build_manual():
 
     pdf.chapter_title("Background Method", 2)
     pdf.body(
-        "Options: tophat or none. Controls removal of large-scale background variations. "
-        "Tophat uses morphological operations and is generally recommended. When enabled, the Ball Radius "
-        "(structural element size, default 15) controls how large-scale the background variations removed are."
+        "Options: tophat, gaussian, or none. Tophat uses morphological operations and is the default. "
+        "When tophat is selected, Ball Radius (disk_radius, default 15) sets how broad a background is removed. "
+        "Gaussian background uses bg_gaussian_sigma (default 1.0)."
     )
 
     pdf.chapter_title("Denoise Method", 2)
