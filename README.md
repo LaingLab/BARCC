@@ -21,7 +21,7 @@ https://github.com/LaingLab/BARCC/archive/refs/heads/main.zip
 
 Unzip it. The folder is named `BARCC-main`. Open a terminal in that folder (the one that contains `environment.yml`, `requirements.txt`, and the `Application` folder).
 
-A frozen snapshot of release 8.10.000 is at https://github.com/LaingLab/BARCC/releases/tag/v8.10.000 (Source code zip). Use `main` if you want the latest documentation.
+A frozen snapshot of release 8.11.000 is at https://github.com/LaingLab/BARCC/releases/tag/v8.11.000 (Source code zip). Use `main` if you want the latest documentation.
 
 ### 2. Install Miniconda or Anaconda (once per computer)
 
@@ -79,6 +79,8 @@ python barcc.py
 
 A window titled with BARCC opens. The menu bar has File, Edit, Atlas, Paint, Cell, and Axons and Nets. **File → User Manual** opens `BARCC_User_Manual.pdf` from the repository root.
 
+**File → Update** checks GitHub and downloads newer program files when this folder was created with `git clone`. Close BARCC and open it again after it reports an update. A copy that came from Download ZIP has no `.git` folder, so that command cannot update it. Clone once and keep using that folder. Images and `output` folders live outside the program folder and are not replaced.
+
 `Application/Launch_BARCC.bat` is an optional Windows double-click launcher. It looks for one developer’s conda path first, then `py -3.14`, then `python` on PATH. On a new computer those later Pythons often do not have the BARCC packages, so the window never opens. Use the Anaconda Prompt commands above until you know the bat file is launching `barcc314`.
 
 ### 5. First session
@@ -100,7 +102,14 @@ The longer click-by-click workflow is in [Basic Usage](#basic-usage) below and i
 - **Count Cells writes a `.csv` instead of `.xlsx`.** `pip install "openpyxl>=3.0.10" "xlsxwriter>=3.0.0"`.
 - **Images fail to load.** Use an uncompressed or lossless TIFF. JPEG is not supported.
 
-**v8.10.000 Highlights** (current)
+**v8.11.000 Highlights** (current)
+- **File → Update**: checks GitHub and fast-forwards a Git clone. Close and reopen BARCC afterward.
+- **Batch Recalculate Intensities**: Axons and Nets remeasures every TIFF that already has a paint file, without opening each image. Change the background percentile and run again.
+- **One intensity workbook**: `output/intensities/{image}_intensities.xlsx` (sheet Region Intensities only). Measuring also overwrites the paint bundle and `{stem}_atlas.catlas`.
+- **Project intensities**: `{name}_Intensities.xlsx` — column A is the image name, then the same columns as the per-image sheet. Re-measuring an image replaces its rows.
+- Version: **8.11.000**. See [release-notes-v8.11.000.md](release-notes-v8.11.000.md).
+
+**v8.10.000 Highlights**
 - **Dual Settings Mode**: Config A and Config B on the same slice; assign regions with A/B keys; Smart Suggest A/B.
 - **Atlas alignment stack**: Landmarks (point pairs) → Edge Snap (ICP silhouette, preview then apply) → Local Refine.
 - **Project workbook**: File → Select Project Output Directory writes `{name}_Counts.xlsx` (one row per image) and, when you measure region intensities, `{name}_Intensities.xlsx` (image name in column A, then the same columns as the per-image intensity sheet).

@@ -22,7 +22,7 @@ import os
 # ============================================================================
 MANUAL_TITLE = "BARCC - Brain Atlas Regional Cell Counter"
 MANUAL_SUBTITLE = "User Manual"
-VERSION = "8.10.000"
+VERSION = "8.11.000"
 OUTPUT_FILENAME = "BARCC_User_Manual.pdf"
 OUTPUT_DIR = ".."  # Place PDF in repository root
 # Figures for workflows (relative to this script's directory)
@@ -420,7 +420,25 @@ def build_manual():
     )
 
     # ------------------------------------------------------------------
-    # What's New — 8.10.000 (current)
+    # What's New — 8.11.000 (current)
+    # ------------------------------------------------------------------
+    pdf.chapter_title("What's New in Version 8.11.000", 0)
+
+    pdf.body(
+        "BARCC 8.11.000 adds in-app update and batch intensity recalculation, and finishes the "
+        "region-intensity export started after 8.10.000. Detection and atlas alignment are unchanged."
+    )
+    pdf.bullet_list([
+        "File > Update checks GitHub and fast-forwards a copy installed with git clone. Close BARCC and open it again afterward. A Download ZIP copy has no .git folder, so clone once and use that folder.",
+        "Axons and Nets > Batch Recalculate Intensities remeasures every TIFF in a folder that already has output/paint/{image}_paint_with_regions.barccpaint, without opening each image. Set the background percentile and run again.",
+        "Batch recalculation overwrites each output/intensities/{image}_intensities.xlsx. With a project folder set, it updates {project}_Intensities.xlsx. Otherwise it writes output/intensities/{folder name}_Intensities.xlsx.",
+        "Measure Region Intensities writes one workbook and one sheet (Region Intensities). It no longer also writes {image}_region_intensity.xlsx.",
+        "The same measurement overwrites the paint bundle and, when an atlas or labeled zones are loaded, output/atlas/{stem}_atlas.catlas.",
+        "Edit > Brightness and zoom do not change intensity numbers. The mean includes every pixel in the region, so a uniform haze can outscore sparse axons until background subtraction is on.",
+    ])
+
+    # ------------------------------------------------------------------
+    # What's New — 8.10.000
     # ------------------------------------------------------------------
     pdf.chapter_title("What's New in Version 8.10.000", 0)
 
@@ -956,7 +974,7 @@ def build_manual():
         "or open https://github.com/LaingLab/BARCC/archive/refs/heads/main.zip. "
         "Unzip it. The folder is named BARCC-main. Work in the folder that contains "
         "environment.yml, requirements.txt, and Application. "
-        "A frozen 8.10.000 snapshot is the Source code zip on the GitHub release page."
+        "A frozen 8.11.000 snapshot is the Source code zip on the GitHub release page."
     )
 
     pdf.chapter_title("2. Install Miniconda or Anaconda (once per computer)", 2)
@@ -1013,6 +1031,20 @@ def build_manual():
         "It checks one developer conda path first, then py -3.14, then python on PATH. "
         "On a new computer those later interpreters often lack the BARCC packages, so the window does not open. "
         "Use the Anaconda Prompt commands until you know the bat file is launching the barcc314 environment."
+    )
+
+    pdf.chapter_title("Updating", 2)
+    pdf.body(
+        "File > Update checks GitHub and fast-forwards this install when the folder was created with git clone. "
+        "Close BARCC and open it again after the dialog says it updated. "
+        "Your images and output folders are not inside the program folder, so an update does not replace them. "
+        "If environment.yml or requirements.txt changed, the dialog tells you to run "
+        "conda env update -f environment.yml --prune in the barcc314 environment."
+    )
+    pdf.body(
+        "A folder that came from Download ZIP has no .git directory. File > Update cannot change that copy. "
+        "Clone the repository once and use that folder afterward. "
+        "The same command from Anaconda Prompt, in the BARCC folder, is: git pull"
     )
 
     pdf.chapter_title("5. First session", 2)
@@ -1934,6 +1966,13 @@ def build_manual():
         "Each zone is its own row. Measuring that TIFF again replaces its rows and leaves other images in place. "
         "Count Cells still writes {project name}_Counts.xlsx in the same folder. "
         "If the workbook is open in Excel, BARCC writes a CSV with the same stem."
+    )
+    pdf.body(
+        "Axons and Nets > Batch Recalculate Intensities remeasures every TIFF in a folder that already has "
+        "output/paint/{image}_paint_with_regions.barccpaint, without opening each image. "
+        "Change the background percentile (and, optionally, the counterstain file) and run it again. "
+        "Each per-image workbook is overwritten. When a project folder is set, {project}_Intensities.xlsx "
+        "is updated. Otherwise BARCC writes output/intensities/{folder name}_Intensities.xlsx."
     )
 
     pdf.chapter_title("Counterstain Normalization Measurement", 1)

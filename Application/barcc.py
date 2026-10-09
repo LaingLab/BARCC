@@ -42,6 +42,7 @@ import hashlib
 from datetime import datetime
 import platform
 import subprocess
+import threading
 import webbrowser
 import zipfile
 from io import BytesIO
@@ -3102,6 +3103,7 @@ class PDFViewer:
         filemenu.add_command(label="Clear Canvas", command=self.clear_canvas_session)
         filemenu.add_separator()
         filemenu.add_command(label="User Manual", command=self.open_user_manual)
+        filemenu.add_command(label="Update", command=self.update_barcc)
         filemenu.add_command(label="Exit", command=self.master.destroy)
 
         # Create Edit menu dropdown
@@ -3216,6 +3218,10 @@ class PDFViewer:
         axonsmenu.add_command(
             label="Measure Region Intensities…",
             command=self.measure_region_intensities,
+        )
+        axonsmenu.add_command(
+            label="Batch Recalculate Intensities…",
+            command=self.batch_recalculate_intensities,
         )
         axonsmenu.add_command(
             label="Counterstain Normalization Measurement…",
@@ -15608,6 +15614,232 @@ class PDFViewer:
         enhancer = ImageEnhance.Brightness(img)
         return enhancer.enhance(factor)
 
+    def _barcc_repo_root(self):
+        """Directory that contains this install's .git, or None for a ZIP copy."""
+        cur = os.path.abspath(os.path.dirname(__file__))
+        for _ in range(6):
+            if os.path.exists(os.path.join(cur, ".git")):
+                return cur
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        return None
+
+    def _git(self, repo, *args, timeout=180):
+        """Run git in repo. Returns (returncode, stdout, stderr)."""
+        cmd = ["git", *args]
+        kwargs = {
+            "cwd": repo,
+            "capture_output": True,
+            "text": True,
+            "timeout": timeout,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        proc = subprocess.run(cmd, **kwargs)
+        return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
+
+    def _git_upstream(self, repo):
+        """Tracking ref (origin/main), or origin/main / origin/master if unset."""
+        code, upstream, _err = self._git(
+            repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"
+        )
+        if code == 0 and upstream and upstream != "@{upstream}":
+            return upstream
+        for cand in ("origin/main", "origin/master"):
+            code, _out, _err = self._git(repo, "rev-parse", "--verify", "--quiet", cand)
+            if code == 0:
+                return cand
+        return None
+
+    def _pull_ff_only(self, repo, upstream):
+        """Fast-forward to upstream. Returns (ok, message)."""
+        if upstream and "/" in upstream:
+            remote, branch = upstream.split("/", 1)
+            code, out, err = self._git(repo, "pull", "--ff-only", remote, branch)
+        else:
+            code, out, err = self._git(repo, "pull", "--ff-only")
+        detail = "\n".join(p for p in (out, err) if p)
+        if code != 0:
+            return False, detail or "git pull failed."
+        changed = ""
+        c2, names, _e2 = self._git(repo, "diff", "--name-only", "ORIG_HEAD", "HEAD")
+        if c2 == 0 and names:
+            interesting = [
+                n for n in names.splitlines()
+                if n.replace("\\", "/").rstrip() in ("environment.yml", "requirements.txt")
+            ]
+            if interesting:
+                changed = (
+                    "\n\nThis update changed "
+                    + " and ".join(interesting)
+                    + ".\nIn Anaconda Prompt, from the BARCC folder, run:\n"
+                    "conda activate barcc314\n"
+                    "conda env update -f environment.yml --prune"
+                )
+        return True, (detail + changed).strip()
+
+    def _check_barcc_update(self, repo):
+        """Fetch and classify. May pull when the tree is clean and only behind."""
+        try:
+            self._git(repo, "--version")
+        except FileNotFoundError:
+            return {
+                "kind": "error",
+                "text": "Git is not installed, or it is not on the PATH.\n\n"
+                "Install Git from https://git-scm.com/download/win and reopen BARCC.",
+            }
+        code, _out, err = self._git(repo, "remote", "get-url", "origin")
+        if code != 0:
+            return {
+                "kind": "error",
+                "text": "This BARCC folder has no GitHub remote named origin.\n\n" + err,
+            }
+        code, _out, err = self._git(repo, "fetch", "origin")
+        if code != 0:
+            return {
+                "kind": "error",
+                "text": "Could not reach GitHub.\n\n" + (err or "git fetch failed."),
+            }
+        upstream = self._git_upstream(repo)
+        if not upstream:
+            return {
+                "kind": "error",
+                "text": "Could not find origin/main to compare against.",
+            }
+        code, counts, err = self._git(
+            repo, "rev-list", "--left-right", "--count", f"HEAD...{upstream}"
+        )
+        if code != 0 or not counts:
+            return {"kind": "error", "text": err or "Could not compare with GitHub."}
+        try:
+            ahead_s, behind_s = counts.split()
+            ahead, behind = int(ahead_s), int(behind_s)
+        except ValueError:
+            return {"kind": "error", "text": f"Unexpected git rev-list output:\n{counts}"}
+        if behind == 0 and ahead == 0:
+            return {"kind": "current", "text": "BARCC is already up to date."}
+        if ahead > 0 and behind > 0:
+            return {
+                "kind": "error",
+                "text": "This copy has local commits and GitHub has newer commits.\n"
+                "File > Update will not merge those automatically.",
+            }
+        if behind == 0 and ahead > 0:
+            return {
+                "kind": "error",
+                "text": "This copy has local commits that are not on GitHub.\n"
+                "File > Update did not change anything.",
+            }
+        _c, log, _e = self._git(repo, "log", "--oneline", f"HEAD..{upstream}")
+        summary = log or f"{behind} new commit(s) on {upstream}."
+        _c, porcelain, _e = self._git(repo, "status", "--porcelain")
+        if porcelain:
+            return {
+                "kind": "dirty",
+                "repo": repo,
+                "upstream": upstream,
+                "summary": summary,
+                "porcelain": porcelain,
+            }
+        ok, detail = self._pull_ff_only(repo, upstream)
+        if not ok:
+            return {"kind": "error", "text": "Update failed.\n\n" + detail}
+        return {"kind": "updated", "text": "Updated from GitHub:\n\n" + summary + (
+            "\n\n" + detail if detail and detail not in summary else ""
+        )}
+
+    def update_barcc(self):
+        """File > Update: fetch GitHub and fast-forward this install."""
+        repo = self._barcc_repo_root()
+        if repo is None:
+            messagebox.showinfo(
+                "Update",
+                "This copy of BARCC was not installed with Git, so it cannot update itself.\n\n"
+                "One-time setup, in Anaconda Prompt:\n"
+                "git clone https://github.com/LaingLab/BARCC.git\n\n"
+                "Use that folder from then on. File > Update will work there.\n"
+                "Your images and output folders are not inside the program folder, so they stay put.",
+            )
+            return
+        win = tk.Toplevel(self.master)
+        win.title("Update")
+        win.transient(self.master)
+        win.resizable(False, False)
+        ttk.Label(win, text="Checking GitHub for updates…").pack(padx=28, pady=18)
+        win.update_idletasks()
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+
+        def work():
+            try:
+                payload = self._check_barcc_update(repo)
+            except subprocess.TimeoutExpired:
+                payload = {"kind": "error", "text": "GitHub took too long to answer. Try again."}
+            except Exception as e:
+                logger.error(f"Update check failed: {e}", exc_info=True)
+                payload = {"kind": "error", "text": str(e)}
+            self.master.after(0, lambda: self._finish_barcc_update(win, payload))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_barcc_update(self, win, payload):
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        kind = (payload or {}).get("kind")
+        text = (payload or {}).get("text") or ""
+        if kind == "dirty":
+            preview = "\n".join((payload.get("porcelain") or "").splitlines()[:12])
+            if not messagebox.askyesno(
+                "Update",
+                "GitHub has updates, and this BARCC folder also has local edits:\n\n"
+                f"{preview}\n\n"
+                "Update anyway? If those edits touch a file GitHub also changed, the update will stop.",
+            ):
+                return
+            repo = payload.get("repo")
+            upstream = payload.get("upstream")
+
+            def pull():
+                try:
+                    ok, detail = self._pull_ff_only(repo, upstream)
+                    if ok:
+                        msg = "Updated from GitHub:\n\n" + (payload.get("summary") or "")
+                        if detail:
+                            msg += "\n\n" + detail
+                        result = {"kind": "updated", "text": msg}
+                    else:
+                        result = {"kind": "error", "text": "Update failed.\n\n" + detail}
+                except Exception as e:
+                    result = {"kind": "error", "text": str(e)}
+                self.master.after(0, lambda: self._show_update_result(result))
+
+            threading.Thread(target=pull, daemon=True).start()
+            return
+        self._show_update_result(payload)
+
+    def _show_update_result(self, payload):
+        kind = (payload or {}).get("kind")
+        text = (payload or {}).get("text") or ""
+        if kind == "updated":
+            messagebox.showinfo(
+                "Update",
+                text.rstrip() + "\n\nClose BARCC and open it again to use the new version.",
+            )
+        elif kind == "current":
+            messagebox.showinfo("Update", text or "BARCC is already up to date.")
+        else:
+            messagebox.showerror("Update", text or "Update failed.")
+
     def open_user_manual(self):
         """Open the PDF user manual in the system's default viewer (cross-platform)."""
         # The manual lives in the repository root, one level above the Application/ directory
@@ -15675,7 +15907,7 @@ class PDFViewer:
 
         meta = {
             "format_version": 1,
-            "barcc_version": "8.10.000",
+            "barcc_version": "8.11.000",
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "purpose": "Parameters used to generate the cell mask and regional counts",
             "source": {
@@ -16120,7 +16352,7 @@ class PDFViewer:
             config_data = self._collect_mask_generation_metadata()
             # Keep portable settings export compatible with import_detection_settings
             config_data = {
-                "version": config_data.get("barcc_version", "8.10.000"),
+                "version": config_data.get("barcc_version", "8.11.000"),
                 "detection_method": self.image_processor.cell_config.detection_method,
                 "cell_detection": self.image_processor.cell_config.__dict__.copy(),
                 "cell_detection_B": getattr(
@@ -25252,10 +25484,11 @@ class PDFViewer:
             )
         return bg_arr.astype(np.float64).squeeze()
 
-    def _zone_mask_registered_to_background(self, mask_img, bg_h, bg_w):
+    def _zone_mask_registered_to_background(self, mask_img, bg_h, bg_w, offset_xy=None):
         """Place atlas/zone mask into background image coordinates.
 
         Returns (mask_on_bg uint8, original_mask_w, original_mask_h).
+        ``offset_xy`` overrides the on-screen atlas offset (img_x, img_y).
         """
         m = np.array(mask_img)
         if m.ndim > 2:
@@ -25270,8 +25503,12 @@ class PDFViewer:
                 )
             return m.astype(np.uint8), mw, mh
 
-        ox = int(round(float(getattr(self, "img_x", 0) or 0)))
-        oy = int(round(float(getattr(self, "img_y", 0) or 0)))
+        if offset_xy is None:
+            ox = int(round(float(getattr(self, "img_x", 0) or 0)))
+            oy = int(round(float(getattr(self, "img_y", 0) or 0)))
+        else:
+            ox = int(round(float(offset_xy[0] or 0)))
+            oy = int(round(float(offset_xy[1] or 0)))
         mask_on_bg = np.zeros((bg_h, bg_w), dtype=np.uint8)
         x0 = max(0, ox)
         y0 = max(0, oy)
@@ -25312,6 +25549,10 @@ class PDFViewer:
         bg_percentile=None,
         normalization_lookup=None,
         mode="signal",
+        image=None,
+        mask_image=None,
+        zone_names_override=None,
+        offset_xy=None,
     ):
         """Compute per-region intensity stats on the current TIFF + zone mask.
 
@@ -25332,23 +25573,30 @@ class PDFViewer:
         Returns (df, meta_dict) or (None, error_message).
         """
         page = self.current_page
-        if page not in self.mask_images or self.mask_images[page] is None:
-            return None, "No region mask is available."
-
-        bg = None
-        if getattr(self, "original_background", None) is not None:
-            bg = self.original_background
-        elif getattr(self, "background_image", None) is not None:
-            bg = self.background_image
-        if bg is None:
-            return None, "No image is loaded."
-
-        mask_img = self.mask_images[page]
-        zone_names = dict(self.zone_names.get(page, {}) or {})
+        if image is not None:
+            if mask_image is None:
+                return None, "No region mask is available."
+            bg = image
+            mask_img = mask_image
+            zone_names = dict(zone_names_override or {})
+        else:
+            if page not in self.mask_images or self.mask_images[page] is None:
+                return None, "No region mask is available."
+            bg = None
+            if getattr(self, "original_background", None) is not None:
+                bg = self.original_background
+            elif getattr(self, "background_image", None) is not None:
+                bg = self.background_image
+            if bg is None:
+                return None, "No image is loaded."
+            mask_img = self.mask_images[page]
+            zone_names = dict(self.zone_names.get(page, {}) or {})
 
         gray = self._pil_to_gray_float(bg)
         bg_h, bg_w = gray.shape[:2]
-        mask_on_bg, mw, mh = self._zone_mask_registered_to_background(mask_img, bg_h, bg_w)
+        mask_on_bg, mw, mh = self._zone_mask_registered_to_background(
+            mask_img, bg_h, bg_w, offset_xy=offset_xy
+        )
 
         zids = set()
         for z in zone_names.keys():
@@ -25587,11 +25835,15 @@ class PDFViewer:
         """Detection-Parameters-style sheet for intensity exports (mirrors Count Cells)."""
         meta = meta if isinstance(meta, dict) else {}
         rows = [
-            {"Category": "Source", "Parameter": "Image", "Value": str(self.tiff_filename or "")},
+            {
+                "Category": "Source",
+                "Parameter": "Image",
+                "Value": str(meta.get("image_name") or self.tiff_filename or ""),
+            },
             {
                 "Category": "Source",
                 "Parameter": "TIFF_Path",
-                "Value": str(getattr(self, "current_tiff_path", "") or ""),
+                "Value": str(meta.get("tiff_path") or getattr(self, "current_tiff_path", "") or ""),
             },
             {
                 "Category": "Source",
@@ -26013,7 +26265,7 @@ class PDFViewer:
         }, None
 
     def _export_region_intensity_workbook(
-        self, df, meta, out_dir, base_name, *, kind="intensities"
+        self, df, meta, out_dir, base_name, *, kind="intensities", quiet=False
     ):
         """Write intensity results as multi-sheet .xlsx under output/intensities/.
 
@@ -26083,7 +26335,7 @@ class PDFViewer:
                 except Exception:
                     pass
             logger.info(f"Intensity CSV fallback: {csv_path}")
-            if excel_errors:
+            if excel_errors and not quiet:
                 messagebox.showwarning(
                     "Excel Export Failed",
                     "Could not save as Excel "
@@ -26289,6 +26541,410 @@ class PDFViewer:
                 "Counterstain Normalization",
                 f"Failed to measure counterstain normalization:\n{e}",
             )
+
+    def _read_paint_region_mask(self, paint_path):
+        """Load zones.png and zone names from a .barccpaint bundle.
+
+        Returns (zones_image, names_dict, error_message).
+        """
+        try:
+            with zipfile.ZipFile(paint_path, "r") as zf:
+                names_in_zip = zf.namelist()
+                if "zones.png" not in names_in_zip:
+                    return None, None, "Paint file has no region mask (zones.png)."
+                zones = Image.open(BytesIO(zf.read("zones.png"))).convert("L")
+                zones.load()
+                manifest = {}
+                if "manifest.json" in names_in_zip:
+                    manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+        except Exception as e:
+            return None, None, str(e)
+        names = {}
+        for key, value in (manifest.get("zone_names") or {}).items():
+            try:
+                names[int(key)] = value
+            except Exception:
+                continue
+        return zones, names, None
+
+    def _open_tiff_matched_to_mask(self, tiff_path, mask_size):
+        """Open a TIFF the same way BARCC measures it, on the paint mask's grid.
+
+        Grayscale images are min-max scaled to 0–255, matching File > Import Tiff.
+        The result is resized to ``mask_size`` so saved regions line up without
+        opening the image in the viewer.
+        """
+        bg = Image.open(tiff_path)
+        try:
+            bg.seek(0)
+        except Exception:
+            pass
+        array = np.array(bg)
+        if array.ndim == 2 or (array.ndim == 3 and array.shape[2] == 1):
+            array = np.squeeze(array)
+            array_norm = (array - array.min()) / (array.max() - array.min() + 1e-8) * 255
+            image = Image.fromarray(array_norm.astype(np.uint8)).convert("RGBA")
+        elif getattr(array, "max", lambda: 255)() <= 1.0:
+            array = (array * 255).astype(np.uint8)
+            image = Image.fromarray(array).convert("RGBA")
+        else:
+            image = bg.convert("RGBA")
+        if mask_size and image.size != tuple(mask_size):
+            image = image.resize(
+                (int(mask_size[0]), int(mask_size[1])), Image.BILINEAR
+            )
+        return image
+
+    def _paint_jobs_in_folder(self, folder):
+        """Pair each TIFF in ``folder`` with output/paint/{name}_paint_with_regions.barccpaint."""
+        jobs = []
+        missing = []
+        if not folder or not os.path.isdir(folder):
+            return jobs, missing
+        paint_dir = os.path.join(folder, "output", "paint")
+        names = []
+        try:
+            names = sorted(os.listdir(folder))
+        except Exception:
+            return jobs, missing
+        for name in names:
+            lower = name.lower()
+            if not lower.endswith((".tif", ".tiff")):
+                continue
+            tiff_path = os.path.join(folder, name)
+            if not os.path.isfile(tiff_path):
+                continue
+            stem = os.path.splitext(name)[0]
+            paint_path = os.path.join(paint_dir, f"{stem}_paint_with_regions.barccpaint")
+            if os.path.isfile(paint_path):
+                jobs.append((tiff_path, paint_path, stem, name))
+            else:
+                missing.append(name)
+        return jobs, missing
+
+    def batch_recalculate_intensities(self):
+        """Re-measure every TIFF that already has a paint bundle, without opening them.
+
+        Uses output/paint/{image}_paint_with_regions.barccpaint for the regions.
+        Rewrites each {image}_intensities.xlsx and, when a project folder is set,
+        updates {project}_Intensities.xlsx. Otherwise writes a master workbook in
+        output/intensities/.
+        """
+        prefs = getattr(self, "_intensity_corr_prefs", {}) or {}
+        default_folder = ""
+        if getattr(self, "current_tiff_directory", None) and os.path.isdir(
+            self.current_tiff_directory
+        ):
+            default_folder = self.current_tiff_directory
+        elif getattr(self, "tiff_dir", None) and os.path.isdir(self.tiff_dir):
+            default_folder = self.tiff_dir
+
+        win = Toplevel(self.master)
+        win.title("Batch Recalculate Intensities")
+        win.transient(self.master)
+        win.grab_set()
+        win.resizable(False, False)
+        try:
+            self._register_transparent_window(win)
+        except Exception:
+            pass
+
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(
+            frm,
+            text="Recalculate region intensities for a whole folder",
+            font=("Helvetica", 10, "bold"),
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        ttk.Label(
+            frm,
+            text=(
+                "Uses the paint file already saved for each TIFF\n"
+                "(output/paint/{image}_paint_with_regions.barccpaint).\n"
+                "Images are not opened in the viewer."
+            ),
+            justify=tk.LEFT,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        ttk.Label(frm, text="TIFF folder:").grid(row=2, column=0, sticky="w")
+        folder_var = tk.StringVar(value=default_folder)
+        ttk.Entry(frm, textvariable=folder_var, width=54).grid(
+            row=2, column=1, sticky="ew", padx=4
+        )
+
+        def browse_folder():
+            initial = folder_var.get().strip() or default_folder or None
+            chosen = fd.askdirectory(
+                title="Select the folder that contains the TIFFs",
+                initialdir=initial if initial and os.path.isdir(initial) else None,
+                parent=win,
+            )
+            if chosen:
+                folder_var.set(chosen)
+
+        ttk.Button(frm, text="Browse…", command=browse_folder, width=10).grid(
+            row=2, column=2, sticky="e"
+        )
+
+        use_bg_var = tk.BooleanVar(value=True)
+        pct_var = tk.StringVar(value=str(prefs.get("bg_percentile", 10.0)))
+        bg_frame = ttk.LabelFrame(frm, text="Background subtraction", padding=8)
+        bg_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 4))
+        ttk.Checkbutton(
+            bg_frame,
+            text="Subtract Xth-percentile intensity within each region",
+            variable=use_bg_var,
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(bg_frame, text="Percentile (X):").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(bg_frame, textvariable=pct_var, width=8).grid(
+            row=1, column=1, sticky="w", padx=4, pady=(6, 0)
+        )
+        ttk.Label(
+            bg_frame,
+            text="(typical: 5–20)",
+            foreground="gray",
+        ).grid(row=1, column=2, sticky="w", pady=(6, 0))
+
+        use_norm_var = tk.BooleanVar(value=bool(prefs.get("use_norm", False)))
+        path_var = tk.StringVar(value=str(prefs.get("norm_path", "") or ""))
+        norm_frame = ttk.LabelFrame(frm, text="Counterstain normalization", padding=8)
+        norm_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=4)
+        ttk.Checkbutton(
+            norm_frame,
+            text="Normalize by counterstain regional intensity",
+            variable=use_norm_var,
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Entry(norm_frame, textvariable=path_var, width=52).grid(
+            row=1, column=0, columnspan=2, sticky="ew", padx=(0, 4), pady=(6, 0)
+        )
+
+        def browse_norm():
+            initial = None
+            cur = path_var.get().strip()
+            if cur and os.path.isfile(cur):
+                initial = os.path.dirname(cur)
+            p = fd.askopenfilename(
+                title="Select counterstain normalization file",
+                initialdir=initial,
+                filetypes=[
+                    ("Excel / CSV", "*.xlsx *.xls *.csv"),
+                    ("All files", "*.*"),
+                ],
+                parent=win,
+            )
+            if p:
+                path_var.set(p)
+
+        ttk.Button(norm_frame, text="Browse…", command=browse_norm, width=10).grid(
+            row=1, column=2, sticky="e", pady=(6, 0)
+        )
+
+        project_path = self._configured_project_intensities_path()
+        if project_path:
+            project_note = f"Project workbook updated:\n{project_path}"
+        else:
+            project_note = (
+                "No project folder is set. A master workbook will be written to\n"
+                "output/intensities/{folder name}_Intensities.xlsx"
+            )
+        ttk.Label(frm, text=project_note, justify=tk.LEFT, foreground="gray").grid(
+            row=5, column=0, columnspan=3, sticky="w", pady=(8, 4)
+        )
+
+        result = {"ok": False}
+
+        def on_ok():
+            folder = folder_var.get().strip()
+            if not folder or not os.path.isdir(folder):
+                messagebox.showwarning(
+                    "Batch Recalculate",
+                    "Choose the folder that contains the TIFF images.",
+                    parent=win,
+                )
+                return
+            pct = None
+            if use_bg_var.get():
+                try:
+                    pct = float(pct_var.get().strip())
+                except Exception:
+                    messagebox.showwarning(
+                        "Batch Recalculate",
+                        "Percentile must be a number from 0 to 100.",
+                        parent=win,
+                    )
+                    return
+                if not (0.0 <= pct <= 100.0):
+                    messagebox.showwarning(
+                        "Batch Recalculate",
+                        "Percentile must be between 0 and 100.",
+                        parent=win,
+                    )
+                    return
+            norm_path = path_var.get().strip()
+            if use_norm_var.get() and not (norm_path and os.path.isfile(norm_path)):
+                messagebox.showwarning(
+                    "Batch Recalculate",
+                    "Choose a counterstain normalization file, or turn normalization off.",
+                    parent=win,
+                )
+                return
+            jobs, missing = self._paint_jobs_in_folder(folder)
+            if not jobs:
+                messagebox.showwarning(
+                    "Batch Recalculate",
+                    "No TIFF in that folder has a paint file at\n"
+                    "output/paint/{image}_paint_with_regions.barccpaint.\n\n"
+                    "Measure or count an image once so BARCC saves the regions, then run this again.",
+                    parent=win,
+                )
+                return
+            skip_note = ""
+            if missing:
+                shown = "\n".join(missing[:8])
+                extra = "" if len(missing) <= 8 else f"\n… and {len(missing) - 8} more"
+                skip_note = f"\n\n{len(missing)} TIFF(s) have no paint file and will be skipped:\n{shown}{extra}"
+            bg_note = (
+                f"background percentile {pct:g}" if pct is not None else "no background subtraction"
+            )
+            if not messagebox.askyesno(
+                "Batch Recalculate",
+                f"Recalculate {len(jobs)} image(s) with {bg_note}?\n"
+                "Each image's intensity workbook will be overwritten."
+                + skip_note,
+                parent=win,
+            ):
+                return
+            result["ok"] = True
+            result["folder"] = folder
+            result["pct"] = pct
+            result["use_norm"] = bool(use_norm_var.get())
+            result["norm_path"] = norm_path
+            result["jobs"] = jobs
+            result["missing"] = missing
+            win.destroy()
+
+        def on_cancel():
+            win.destroy()
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=6, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        ttk.Button(btns, text="Recalculate", command=on_ok).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Cancel", command=on_cancel).pack(side=tk.LEFT)
+        win.protocol("WM_DELETE_WINDOW", on_cancel)
+        self.master.wait_window(win)
+        if not result.get("ok"):
+            return
+
+        self._intensity_corr_prefs = {
+            "use_bg": result["pct"] is not None,
+            "bg_percentile": result["pct"] if result["pct"] is not None else prefs.get("bg_percentile", 10.0),
+            "use_norm": result["use_norm"],
+            "norm_path": result["norm_path"],
+        }
+        normalization_lookup = None
+        if result["use_norm"]:
+            normalization_lookup, err = self._load_counterstain_normalization_file(
+                result["norm_path"]
+            )
+            if normalization_lookup is None:
+                messagebox.showerror(
+                    "Batch Recalculate",
+                    err or "Could not load the counterstain normalization file.",
+                )
+                return
+
+        jobs = result["jobs"]
+        progress = self._show_busy_dialog("Batch Recalculate Intensities")
+        ok_rows = []
+        failures = []
+        master_path = None
+        try:
+            for index, (tiff_path, paint_path, stem, image_name) in enumerate(jobs):
+                if getattr(progress, "closed", False):
+                    break
+                progress.set_progress(
+                    int(100 * index / max(len(jobs), 1)),
+                    f"{index + 1} / {len(jobs)}  {image_name}",
+                )
+                try:
+                    zones, names, paint_err = self._read_paint_region_mask(paint_path)
+                    if zones is None:
+                        failures.append(f"{image_name}: {paint_err}")
+                        continue
+                    image = self._open_tiff_matched_to_mask(tiff_path, zones.size)
+                    df, meta_or_err = self._compute_region_intensities_df(
+                        bg_percentile=result["pct"],
+                        normalization_lookup=normalization_lookup,
+                        mode="signal",
+                        image=image,
+                        mask_image=zones,
+                        zone_names_override=names,
+                        offset_xy=(0, 0),
+                    )
+                    if df is None:
+                        failures.append(f"{image_name}: {meta_or_err}")
+                        continue
+                    meta = meta_or_err if isinstance(meta_or_err, dict) else {}
+                    meta["image_name"] = stem
+                    meta["tiff_path"] = tiff_path
+                    meta["paint_file"] = paint_path
+                    out_dir = self._get_output_directory(
+                        os.path.dirname(tiff_path), feature="intensities"
+                    )
+                    saved, _fmt = self._export_region_intensity_workbook(
+                        df, meta, out_dir, stem, kind="intensities", quiet=True
+                    )
+                    if not saved:
+                        failures.append(f"{image_name}: could not write the intensity workbook")
+                        continue
+                    export_df = self._format_intensity_export_df(df)
+                    stamped = export_df.copy()
+                    stamped.insert(0, "Image", image_name)
+                    ok_rows.append(stamped)
+                    if self._configured_project_intensities_path():
+                        try:
+                            self._append_intensities_to_project_spreadsheet(
+                                export_df, image_name=image_name
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"Project intensity update failed for {image_name}: {e}"
+                            )
+                            if not any(str(x).startswith("Project workbook:") for x in failures):
+                                failures.append(f"Project workbook: {e}")
+                except Exception as e:
+                    logger.error(f"Batch intensity failed for {image_name}: {e}", exc_info=True)
+                    failures.append(f"{image_name}: {e}")
+            if ok_rows and not self._configured_project_intensities_path():
+                intensities_dir = self._get_output_directory(result["folder"], feature="intensities")
+                folder_name = os.path.basename(os.path.normpath(result["folder"])) or "project"
+                master_path = os.path.join(intensities_dir, f"{folder_name}_Intensities.xlsx")
+                combined = pd.concat(ok_rows, ignore_index=True)
+                written, _fmt = self._write_project_intensities_df(master_path, combined)
+                master_path = written
+            elif ok_rows:
+                master_path = self._configured_project_intensities_path()
+        finally:
+            try:
+                progress.set_progress(100, "Done")
+                progress.close()
+            except Exception:
+                pass
+
+        if hasattr(self, "tiff_tree") and self.current_tiff_directory:
+            try:
+                self.refresh_tiff_file_list()
+            except Exception:
+                pass
+
+        lines = [f"Recalculated {len(ok_rows)} of {len(jobs)} image(s)."]
+        if master_path:
+            lines.append(f"\nMaster workbook:\n{master_path}")
+        if result["missing"]:
+            lines.append(f"\nSkipped (no paint file): {len(result['missing'])}")
+        if failures:
+            lines.append("\nFailed:\n" + "\n".join(failures[:12]))
+        messagebox.showinfo("Batch Recalculate", "\n".join(lines))
 
     def measure_region_intensities(self):
         """Measure mean/median intensity and area of each Atlas Manager region.
@@ -27117,12 +27773,13 @@ class PDFViewer:
             return csv_path, "csv"
         raise last_error or RuntimeError("Project intensities write failed")
 
-    def _append_intensities_to_project_spreadsheet(self, export_df):
+    def _append_intensities_to_project_spreadsheet(self, export_df, image_name=None):
         """Add this image's region intensities to the project master workbook.
 
         Written only when File → Select Project Output Directory is set.
         Column A is the image filename. Remaining columns match the per-image
         Region Intensities sheet. Re-measuring an image replaces its rows.
+        ``image_name`` overrides the currently open TIFF (used by batch recalculation).
         """
         if export_df is None or getattr(export_df, "empty", True):
             return None
@@ -27135,7 +27792,8 @@ class PDFViewer:
         except Exception as e:
             logger.warning(f"Could not create project output directory {directory}: {e}")
             return None
-        image_name = self._project_counts_file_label()
+        if not image_name:
+            image_name = self._project_counts_file_label()
         rows = export_df.copy()
         image_col = self.PROJECT_INTENSITIES_IMAGE_COL
         if image_col in rows.columns:
