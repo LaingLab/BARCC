@@ -18496,9 +18496,13 @@ class PDFViewer:
                 name = name[: -len(ext)].rstrip()
                 lower = name.lower()
                 break
-        suffix = self.PROJECT_COUNTS_OUTPUT_SUFFIX
-        if lower.endswith(suffix.lower()):
-            name = name[: -len(suffix)].rstrip()
+        for suffix in (
+            self.PROJECT_COUNTS_OUTPUT_SUFFIX,
+            self.PROJECT_INTENSITIES_OUTPUT_SUFFIX,
+        ):
+            if lower.endswith(suffix.lower()):
+                name = name[: -len(suffix)].rstrip()
+                lower = name.lower()
         invalid = '<>:"/\\|?*'
         name = "".join("_" if c in invalid else c for c in name)
         return name.strip(" .")
@@ -18510,6 +18514,14 @@ class PDFViewer:
         if not directory or not name:
             return None
         return os.path.join(directory, f"{name}{self.PROJECT_COUNTS_OUTPUT_SUFFIX}.xlsx")
+
+    def _configured_project_intensities_path(self):
+        """``{dir}/{project_name}_Intensities.xlsx`` when a project folder is set."""
+        directory = getattr(self, "project_output_directory", None)
+        name = getattr(self, "project_name", None)
+        if not directory or not name:
+            return None
+        return os.path.join(directory, f"{name}{self.PROJECT_INTENSITIES_OUTPUT_SUFFIX}.xlsx")
 
     def _is_combined_project_counts_file(self, path):
         """True for the combined project workbook (legacy or user-named)."""
@@ -18546,9 +18558,10 @@ class PDFViewer:
         name = simpledialog.askstring(
             "Project Name",
             "Enter a name for this project.\n\n"
-            "The combined counts spreadsheet will be saved as:\n"
-            "<project name>_Counts.xlsx\n"
-            f"in:\n{directory}",
+            "Files saved in that folder:\n"
+            "<project name>_Counts.xlsx  (one row per image, from Count Cells)\n"
+            "<project name>_Intensities.xlsx  (one row per region, from Measure Region Intensities)\n"
+            f"Folder:\n{directory}",
             initialvalue=suggested,
             parent=self.master,
         )
@@ -18578,15 +18591,30 @@ class PDFViewer:
         self._save_ui_prefs()
 
         out_path = self._configured_project_counts_path()
+        intensity_path = self._configured_project_intensities_path()
         exists = os.path.isfile(out_path) or os.path.isfile(os.path.splitext(out_path)[0] + ".csv")
-        extra = (
-            "\n\nThat file already exists. New Count Cells results will be added to it."
-            if exists
-            else "\n\nCount Cells will create this file and add each image as a new row."
+        intensity_exists = os.path.isfile(intensity_path) or os.path.isfile(
+            os.path.splitext(intensity_path)[0] + ".csv"
         )
+        extra = (
+            "\n\nThe counts file already exists. New Count Cells results will be added to it."
+            if exists
+            else "\n\nCount Cells will create the counts file and add each image as a new row."
+        )
+        if intensity_exists:
+            extra += (
+                "\nThe intensities file already exists. "
+                "New region measurements will be added to it."
+            )
+        else:
+            extra += (
+                "\nMeasure Region Intensities will create the intensities file "
+                "and add each region as a new row."
+            )
         messagebox.showinfo(
             "Project Output",
-            f"Project: {name}\n\nCombined counts file:\n{out_path}{extra}",
+            f"Project: {name}\n\nCounts file:\n{out_path}\n\n"
+            f"Intensities file:\n{intensity_path}{extra}",
             parent=self.master,
         )
         logger.info(f"Project output set: {out_path}")
@@ -18699,6 +18727,9 @@ class PDFViewer:
     PROJECT_COUNTS_OUTPUT_SUFFIX = "_Counts"
     PROJECT_COUNTS_FILE_COL = "File"
     PROJECT_COUNTS_SHEET = "Project Counts"
+    PROJECT_INTENSITIES_OUTPUT_SUFFIX = "_Intensities"
+    PROJECT_INTENSITIES_IMAGE_COL = "Image"
+    PROJECT_INTENSITIES_SHEET = "Project Intensities"
     BRIGHTNESS_MIN = -100
     BRIGHTNESS_MAX = 400
     BRIGHTNESS_DEFAULT = 400  # slider maximum; display opens fully boosted
@@ -26018,12 +26049,10 @@ class PDFViewer:
             xlsx_path = os.path.join(out_dir, f"{base_name}_counterstain_norm.xlsx")
             data_sheet = "Counterstain Normalization"
             csv_path = os.path.join(out_dir, f"{base_name}_counterstain_norm.csv")
-            legacy_path = None
         else:
             xlsx_path = os.path.join(out_dir, f"{base_name}_intensities.xlsx")
             data_sheet = "Region Intensities"
             csv_path = os.path.join(out_dir, f"{base_name}_intensities.csv")
-            legacy_path = os.path.join(out_dir, f"{base_name}_region_intensity.xlsx")
 
         param_df = self._build_intensity_parameter_sheet(meta)
 
@@ -26032,14 +26061,11 @@ class PDFViewer:
             try:
                 with pd.ExcelWriter(xlsx_path, engine=engine) as writer:
                     export_df.to_excel(writer, sheet_name=data_sheet, index=False)
-                    param_df.to_excel(writer, sheet_name="Measurement Parameters", index=False)
+                    if kind == "counterstain_norm":
+                        param_df.to_excel(
+                            writer, sheet_name="Measurement Parameters", index=False
+                        )
                 if os.path.isfile(xlsx_path) and os.path.getsize(xlsx_path) > 0:
-                    if legacy_path:
-                        try:
-                            import shutil
-                            shutil.copy2(xlsx_path, legacy_path)
-                        except Exception:
-                            pass
                     logger.info(f"Intensity Excel saved: {xlsx_path} (engine={engine})")
                     return xlsx_path, "xlsx"
             except Exception as e:
@@ -26048,13 +26074,14 @@ class PDFViewer:
 
         try:
             export_df.to_csv(csv_path, index=False)
-            try:
-                param_df.to_csv(
-                    os.path.splitext(csv_path)[0] + "_parameters.csv",
-                    index=False,
-                )
-            except Exception:
-                pass
+            if kind == "counterstain_norm":
+                try:
+                    param_df.to_csv(
+                        os.path.splitext(csv_path)[0] + "_parameters.csv",
+                        index=False,
+                    )
+                except Exception:
+                    pass
             logger.info(f"Intensity CSV fallback: {csv_path}")
             if excel_errors:
                 messagebox.showwarning(
@@ -26087,6 +26114,50 @@ class PDFViewer:
             base_name = "regions"
         out_dir = self._get_output_directory(tiff_dir, feature=feature) if tiff_dir else None
         return base_name, tiff_dir, out_dir
+
+    def _autosave_paint_and_atlas(self, base_name, tiff_dir):
+        """Write paint and atlas files the way Count Cells writes paint.
+
+        Paint overwrites ``output/paint/{image}_paint_with_regions.barccpaint``
+        (or ``_paint.png`` when there are no named regions). When an atlas or
+        labeled zones are loaded, the schematic overwrites
+        ``output/atlas/{stem}_atlas.catlas``. No dialogs.
+        Returns ``[(label, path), ...]`` for files that were written.
+        """
+        saved = []
+        if not tiff_dir or not base_name:
+            return saved
+
+        paint_out = self._get_output_directory(tiff_dir, feature="paint")
+        if paint_out:
+            try:
+                paint_path = self._save_paint_layer_to_dir(
+                    paint_out, base_name, unique=False, show_messages=False
+                )
+                if paint_path:
+                    saved.append(("Paint", paint_path))
+            except Exception as e:
+                logger.error(f"Failed to auto-save paint on intensity measure: {e}")
+
+        if self._atlas_schematic_has_content():
+            atlas_out = self._get_output_directory(tiff_dir, feature="atlas")
+            if atlas_out:
+                stem = base_name
+                for suffix in (
+                    "_ch0", "_ch1", "_ch2", "_ch3", "_c0", "_c1", "_c2", "_c3",
+                    "-ch0", "-ch1", "-ch2", "-ch3",
+                ):
+                    if stem.lower().endswith(suffix):
+                        stem = stem[: -len(suffix)]
+                        break
+                save_path = os.path.join(atlas_out, f"{stem}_atlas.catlas")
+                try:
+                    self._write_atlas_file(save_path)
+                    logger.info(f"Auto-saved atlas schematic: {save_path}")
+                    saved.append(("Atlas", save_path))
+                except Exception as e:
+                    logger.error(f"Failed to auto-save atlas on intensity measure: {e}")
+        return saved
 
     def measure_counterstain_normalization(self):
         """Measure per-region counterstain intensity → Normalization_Factor table.
@@ -26276,10 +26347,36 @@ class PDFViewer:
             meta = meta_or_err if isinstance(meta_or_err, dict) else {}
             self.last_intensity_df = df
             n_rows = int(meta.get("n_regions", len(df)) or len(df))
+            export_df = self._format_intensity_export_df(df)
 
             base_name, tiff_dir, out_dir = self._intensity_output_basename_and_dir()
             saved_paths = []
             intensities_path = None
+
+            try:
+                project_intensity_path = self._append_intensities_to_project_spreadsheet(
+                    export_df
+                )
+                if project_intensity_path:
+                    saved_paths.append(f"Project intensities: {project_intensity_path}")
+            except Exception as e:
+                logger.error(
+                    f"Failed to update project intensities spreadsheet: {e}",
+                    exc_info=True,
+                )
+                try:
+                    messagebox.showwarning(
+                        "Project Intensities",
+                        "Could not update the combined project intensity spreadsheet "
+                        "(it may be open in Excel).\n"
+                        "This image's intensity file will still be saved.\n\n"
+                        f"{e}",
+                    )
+                except Exception:
+                    pass
+
+            for label, path in self._autosave_paint_and_atlas(base_name, tiff_dir):
+                saved_paths.append(f"{label}: {path}")
 
             if out_dir:
                 intensities_path, fmt = self._export_region_intensity_workbook(
@@ -26311,23 +26408,18 @@ class PDFViewer:
                         self.show_page()
                     return
                 if path.lower().endswith(".csv"):
-                    self._format_intensity_export_df(df).to_csv(path, index=False)
+                    export_df.to_csv(path, index=False)
                     intensities_path = path
                     saved_paths.append(f"Intensities (CSV): {path}")
                 else:
                     if not path.lower().endswith(".xlsx"):
                         path = path + ".xlsx"
-                    export_df = self._format_intensity_export_df(df)
-                    param_df = self._build_intensity_parameter_sheet(meta)
                     excel_ok = False
                     for engine in ("openpyxl", "xlsxwriter"):
                         try:
                             with pd.ExcelWriter(path, engine=engine) as writer:
                                 export_df.to_excel(
                                     writer, sheet_name="Region Intensities", index=False
-                                )
-                                param_df.to_excel(
-                                    writer, sheet_name="Measurement Parameters", index=False
                                 )
                             excel_ok = True
                             break
@@ -26373,7 +26465,9 @@ class PDFViewer:
                     + "\n\nResults saved"
                     + (f" to output folder:\n{dest}\n\n" if dest else ":\n\n")
                     + "\n".join(saved_paths)
-                    + "\n\nSheets: Region Intensities | Measurement Parameters\n"
+                    + "\n\nPer image: {name}_intensities.xlsx (one sheet, Region Intensities).\n"
+                    "In a project, {project}_Intensities.xlsx adds these rows with "
+                    "the image name in column A.\n"
                     "Key columns: Pre_Correction_Mean/Median, "
                     "Post_Correction_Mean/Median, Background_Level, Normalization_Factor."
                 )
@@ -26973,6 +27067,86 @@ class PDFViewer:
             path = os.path.splitext(path)[0] + ".xlsx"
         written, _fmt = self._write_project_counts_df(path, merged)
         logger.info(f"Project counts updated: {written}")
+        return written
+
+    def _load_project_intensities_df(self, path):
+        """Load the project intensity table, letting a newer sidecar replace each image."""
+        sidecars = _project_counts_sidecar_paths(path)
+        if not sidecars:
+            return None
+        tables = []
+        for sidecar in sidecars:
+            df = _read_project_intensities_table(sidecar, self.PROJECT_INTENSITIES_SHEET)
+            if df is not None:
+                tables.append(df)
+        return _union_project_intensities_tables(tables)
+
+    def _write_project_intensities_df(self, xlsx_path, df):
+        """Write the project intensity table to .xlsx and a .csv sidecar."""
+        csv_path = os.path.splitext(xlsx_path)[0] + ".csv"
+        last_error = None
+        xlsx_written = False
+        for engine in ("openpyxl", "xlsxwriter"):
+            try:
+                with pd.ExcelWriter(xlsx_path, engine=engine) as writer:
+                    df.to_excel(
+                        writer,
+                        sheet_name=self.PROJECT_INTENSITIES_SHEET,
+                        index=False,
+                    )
+                xlsx_written = True
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Project intensities Excel ({engine}): {e}")
+        csv_written = False
+        try:
+            df.to_csv(csv_path, index=False)
+            csv_written = True
+        except Exception as e:
+            logger.error(f"Project intensities CSV failed: {e}")
+            if not xlsx_written:
+                raise last_error or e
+        if xlsx_written:
+            return xlsx_path, "xlsx"
+        if csv_written:
+            logger.warning(
+                "Project intensities Excel is locked or unwritable; saved CSV instead: %s",
+                csv_path,
+            )
+            return csv_path, "csv"
+        raise last_error or RuntimeError("Project intensities write failed")
+
+    def _append_intensities_to_project_spreadsheet(self, export_df):
+        """Add this image's region intensities to the project master workbook.
+
+        Written only when File → Select Project Output Directory is set.
+        Column A is the image filename. Remaining columns match the per-image
+        Region Intensities sheet. Re-measuring an image replaces its rows.
+        """
+        if export_df is None or getattr(export_df, "empty", True):
+            return None
+        path = self._configured_project_intensities_path()
+        if not path:
+            return None
+        directory = os.path.dirname(path)
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"Could not create project output directory {directory}: {e}")
+            return None
+        image_name = self._project_counts_file_label()
+        rows = export_df.copy()
+        image_col = self.PROJECT_INTENSITIES_IMAGE_COL
+        if image_col in rows.columns:
+            rows = rows.drop(columns=[image_col])
+        rows.insert(0, image_col, image_name)
+        existing = self._load_project_intensities_df(path)
+        merged = _merge_project_intensities_table(existing, rows, image_name)
+        if path.lower().endswith(".csv"):
+            path = os.path.splitext(path)[0] + ".xlsx"
+        written, _fmt = self._write_project_intensities_df(path, merged)
+        logger.info(f"Project intensities updated: {written}")
         return written
 
     def count_cells(self):
@@ -27907,6 +28081,91 @@ def _union_project_counts_tables(tables):
 def _project_counts_row_key(file_name):
     """Match image rows by stem so foo.tif and foo.tiff update the same row."""
     return os.path.splitext(str(file_name or "").strip())[0].lower()
+
+
+def _read_project_intensities_table(path, sheet_name="Project Intensities"):
+    """Load one project intensity workbook, or None if it is not that table."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        lower = path.lower()
+        if lower.endswith((".xlsx", ".xls")):
+            try:
+                df = pd.read_excel(path, sheet_name=sheet_name)
+            except Exception:
+                df = pd.read_excel(path, sheet_name=0)
+        else:
+            df = pd.read_csv(path)
+    except Exception as e:
+        logger.warning(f"Could not read project intensities file {path}: {e}")
+        return None
+    if df is None or getattr(df, "empty", True):
+        return None
+    drop = [c for c in df.columns if str(c).startswith("Unnamed")]
+    if drop:
+        df = df.drop(columns=drop)
+    if "Image" not in df.columns:
+        return None
+    return df
+
+
+def _union_project_intensities_tables(tables):
+    """Combine project intensity tables. Later frames replace matching images."""
+    result = None
+    for df in tables:
+        if df is None or getattr(df, "empty", True) or "Image" not in df.columns:
+            continue
+        keys = df["Image"].map(_project_counts_row_key)
+        for key in pd.unique(keys):
+            if not key:
+                continue
+            group = df.loc[keys == key].copy()
+            label = str(group["Image"].iloc[0])
+            result = _merge_project_intensities_table(result, group, label)
+    return result
+
+
+def _merge_project_intensities_table(existing_df, new_df, image_name):
+    """Long project table: Image in column A, then the per-image intensity columns.
+
+    Re-measuring an image replaces every row for that image and keeps its place.
+    """
+    image_col = "Image"
+    if new_df is None or getattr(new_df, "empty", True):
+        return existing_df
+    new_df = new_df.copy()
+    if image_col in new_df.columns:
+        new_df = new_df.drop(columns=[image_col])
+    new_df.insert(0, image_col, image_name)
+
+    def _cols_from(*frames):
+        cols = [image_col]
+        for frame in frames:
+            if frame is None:
+                continue
+            for col in frame.columns:
+                if col not in cols:
+                    cols.append(col)
+        return cols
+
+    if existing_df is None or getattr(existing_df, "empty", True) or image_col not in existing_df.columns:
+        return new_df[_cols_from(new_df)]
+
+    existing_df = existing_df.copy()
+    key = _project_counts_row_key(image_name)
+    mask = existing_df[image_col].map(_project_counts_row_key) == key
+    kept = existing_df.loc[~mask]
+    cols = _cols_from(new_df, kept)
+    kept = kept.reindex(columns=cols)
+    new_df = new_df.reindex(columns=cols)
+    if not bool(mask.any()):
+        return pd.concat([kept, new_df], ignore_index=True)
+    first = int(np.flatnonzero(mask.to_numpy())[0])
+    n_before = int((~mask).to_numpy()[:first].sum())
+    return pd.concat(
+        [kept.iloc[:n_before], new_df, kept.iloc[n_before:]],
+        ignore_index=True,
+    )
 
 
 def _structure_counts_from_zone_df(df):

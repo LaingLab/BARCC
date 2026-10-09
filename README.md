@@ -2,10 +2,108 @@
 
 A GUI tool for analyzing immunofluorescence images with atlas region mapping and automated cell counting.
 
+## Download and start using BARCC
+
+BARCC is a desktop program. You download this repository, create a Python environment once, then launch `Application/barcc.py`. Windows with [Miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install) or [Anaconda](https://www.anaconda.com/download) is the setup these steps use. The same conda commands work on macOS and Linux.
+
+### 1. Download the code
+
+**With Git** (this keeps the folder easy to update later):
+
+```bash
+git clone https://github.com/LaingLab/BARCC.git
+cd BARCC
+```
+
+**Without Git:** open https://github.com/LaingLab/BARCC and choose **Code → Download ZIP**, or download the main-branch archive directly:
+
+https://github.com/LaingLab/BARCC/archive/refs/heads/main.zip
+
+Unzip it. The folder is named `BARCC-main`. Open a terminal in that folder (the one that contains `environment.yml`, `requirements.txt`, and the `Application` folder).
+
+A frozen snapshot of release 8.10.000 is at https://github.com/LaingLab/BARCC/releases/tag/v8.10.000 (Source code zip). Use `main` if you want the latest documentation.
+
+### 2. Install Miniconda or Anaconda (once per computer)
+
+1. Download the installer from https://www.anaconda.com/docs/getting-started/miniconda/install (Miniconda) or https://www.anaconda.com/download (full Anaconda).
+2. Run the installer. On Windows, accept the option that registers Anaconda/Miniconda so **Anaconda Prompt** appears in the Start menu.
+3. Open **Anaconda Prompt** (Windows) or a new terminal (macOS/Linux). `conda` must be on the path in that window. Check with:
+
+```bash
+conda --version
+```
+
+### 3. Create the BARCC environment (once per computer)
+
+From the folder you downloaded (the one that contains `environment.yml`):
+
+```bash
+conda env create -f environment.yml
+conda activate barcc314
+```
+
+That creates an environment named `barcc314` on Python 3.14 and installs the packages in `environment.yml`, including tkinter, PyMuPDF (atlas PDFs), and openpyxl/xlsxwriter (Excel export).
+
+If `barcc314` already exists and you only need to refresh packages:
+
+```bash
+conda activate barcc314
+conda env update -f environment.yml --prune
+```
+
+If `conda env create` is not available, this is the same environment built by hand:
+
+```bash
+conda create -n barcc314 python=3.14 pip -y
+conda activate barcc314
+pip install -r requirements.txt
+```
+
+### 4. Start the program (every session)
+
+**Anaconda Prompt** (this is the reliable start on a new computer):
+
+```bash
+conda activate barcc314
+cd Application
+python barcc.py
+```
+
+Use the full path to `Application` if you are not already inside the downloaded folder. Example:
+
+```bash
+conda activate barcc314
+cd C:\Users\YourName\BARCC\Application
+python barcc.py
+```
+
+A window titled with BARCC opens. The menu bar has File, Edit, Atlas, Paint, Cell, and Axons and Nets. **File → User Manual** opens `BARCC_User_Manual.pdf` from the repository root.
+
+`Application/Launch_BARCC.bat` is an optional Windows double-click launcher. It looks for one developer’s conda path first, then `py -3.14`, then `python` on PATH. On a new computer those later Pythons often do not have the BARCC packages, so the window never opens. Use the Anaconda Prompt commands above until you know the bat file is launching `barcc314`.
+
+### 5. First session
+
+1. **File → Import Tiff** and choose a single-channel `.tif` or `.tiff`. You can also use the left File Browser: pick a folder, then double-click a TIFF.
+2. Mark regions with **Paint → Start Paint**, draw, then **Paint → Stop Paint**. Or load an atlas with **Atlas → Import Atlas (PDF)** or **Atlas → Import Allen Atlas…**.
+3. If you loaded an atlas, align it in this order: **Atlas → Fit Atlas to Image**, then **Align: Landmarks (point pairs)…**, then **Align: Edge Snap…** (Preview, then Apply), then **Align: Local Refine (guide)…**.
+4. Click each region and name it.
+5. **Cell → Show Mask** to see detections. Tune them with **Cell → Show Mask Settings** (Smart Suggest, Area Tune, Measure Tune).
+6. **Cell → Counting → Count Cells**. BARCC writes a workbook and a masked TIFF under `output/counts/` next to the image workflow (see the manual for the exact output folders).
+
+The longer click-by-click workflow is in [Basic Usage](#basic-usage) below and in [BARCC_User_Manual.pdf](BARCC_User_Manual.pdf). Detection parameters are in [mask_settings_documentation.md](mask_settings_documentation.md).
+
+### If the first launch fails
+
+- **`conda` is not recognized.** Open Anaconda Prompt, not a plain Command Prompt, or reopen the terminal after installing Miniconda.
+- **`No module named tkinter` / the window does not appear.** Recreate the env from `environment.yml` (it installs the `tk` package). On Ubuntu/Debian with system Python only: `sudo apt-get install python3-tk`.
+- **Atlas PDF will not open.** From the active `barcc314` env: `pip install "PyMuPDF>=1.21.0"`.
+- **Count Cells writes a `.csv` instead of `.xlsx`.** `pip install "openpyxl>=3.0.10" "xlsxwriter>=3.0.0"`.
+- **Images fail to load.** Use an uncompressed or lossless TIFF. JPEG is not supported.
+
 **v8.10.000 Highlights** (current)
 - **Dual Settings Mode**: Config A and Config B on the same slice; assign regions with A/B keys; Smart Suggest A/B.
 - **Atlas alignment stack**: Landmarks (point pairs) → Edge Snap (ICP silhouette, preview then apply) → Local Refine.
-- **Project counts**: File → Select Project Output Directory writes `{name}_Counts.xlsx` (one row per image).
+- **Project workbook**: File → Select Project Output Directory writes `{name}_Counts.xlsx` (one row per image) and, when you measure region intensities, `{name}_Intensities.xlsx` (image name in column A, then the same columns as the per-image intensity sheet).
 - **Crop aspect lock**: match TIFF, 1:1 / 4:3 / 3:2 / 16:9, or custom W×H.
 - Extra blob filters: ridge/midline reject, cavity rim, chain reject, cluster recover; Adaptive per-region mode.
 - File Browser: Exclude / Include, Reload last count; View → Show Cell Mask (rings survive zoom).
@@ -127,81 +225,7 @@ The Regional IF Analyzer is designed to help researchers analyze immunofluoresce
 - Automatic Excel + masked image export on Count Cells (with full parameter metadata)
 - Saving annotated images
 
-## Installation
-
-### Prerequisites
-
-- Python 3.8 or higher
-- pip (Python package installer)
-- tkinter (usually comes with Python, but may need separate installation on Linux)
-
-On Ubuntu/Debian Linux, you might need to install tkinter separately:
-```bash
-sudo apt-get install python3-tk
-```
-
-### Setting Up
-
-1. Clone the repository:
-```bash
-git clone https://github.com/LaingLab/BARCC.git
-cd BARCC
-```
-
-2. Install required packages:
-```bash
-pip install -r requirements.txt
-```
-
-**Note on Excel exports** (recommended):
-Starting with v8.01 (refined in 8.02), clicking **Count Cells** automatically saves:
-- `YourImage.xlsx` — Contains two sheets:
-  - "Cell Counts" (per region)
-  - "Detection Parameters" (complete record of every setting used — excellent for methods/reproducibility)
-- `YourImage_masked.tif` — Original image with the final cell mask (including manual edits) as a semi-transparent red overlay.
-
-For full `.xlsx` support, install the Excel engines:
-
-```bash
-pip install openpyxl xlsxwriter
-```
-
-Without them, BARCC falls back to a plain `.csv`.
-
-## Running the Program
-
-**Recommended runtime: Python 3.14** (conda env `barcc314`).
-
-### Windows (recommended)
-
-1. Use the launcher (targets Python 3.14 first):
-   - Double-click `Application/Launch_BARCC.bat`, or
-   - Double-click `Application/BARCC.lnk` (if present)
-
-2. Or from Anaconda Prompt:
-```bash
-conda activate barcc314
-cd Application
-python barcc.py
-```
-
-### Create / refresh the Python 3.14 environment
-
-```bash
-conda env create -f environment.yml
-# or: conda create -n barcc314 python=3.14 pip -y
-conda activate barcc314
-pip install -r requirements.txt
-```
-
-The older `barcc` conda env (Python 3.12) remains available as a fallback if `barcc314` is missing.
-
-### Generic
-
-```bash
-cd Application
-python barcc.py
-```
+Count Cells writes an Excel workbook (Cell Counts and Detection Parameters) and a masked TIFF. Those Excel engines are included when you install from `environment.yml` or `requirements.txt`. If they are missing, BARCC falls back to a `.csv`.
 
 ## Basic Usage
 
@@ -244,9 +268,10 @@ Detection parameters are listed in [mask_settings_documentation.md](mask_setting
 
 ## Common Issues
 
-- If tkinter is missing: Install python3-tk package via your system's package manager
-- If images don't load: Ensure your TIFF files are in a compatible format
-- For PDF loading issues: Ensure PyMuPDF is properly installed
+Setup failures (conda not found, missing tkinter, PDF import, Excel falling back to CSV) are listed under [If the first launch fails](#if-the-first-launch-fails).
+
+- Images fail to load: use an uncompressed or lossless TIFF. JPEG is not supported.
+- Atlas PDFs fail to open: `pip install "PyMuPDF>=1.21.0"` inside the `barcc314` environment.
 
 ## Support
 

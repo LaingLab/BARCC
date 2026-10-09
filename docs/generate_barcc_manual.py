@@ -648,7 +648,7 @@ def build_manual():
     pdf.chapter_title("Intensity, cell masks, random null, PNN", 1)
     pdf.bullet_list([
         "Measure Region Intensities with optional Xth-percentile background subtraction and counterstain normalization (file from Counterstain Normalization Measurement).",
-        "Exports include Pre_Correction and Post_Correction mean/median columns; Excel under output/intensities/.",
+        "Exports one file, output/intensities/{name}_intensities.xlsx (sheet Region Intensities). Brightness does not affect the values. A project folder also receives {project}_Intensities.xlsx.",
         "Save / Load Cell Mask (.barccmask + PNG) across channels; loaded mask locks Count Cells (no re-detect until Show Mask).",
         "Generate Random Cell Mask: same count as ground truth, random XY; stratified by atlas region when a .catlas/atlas is loaded (red = true, cyan = random).",
         "Draw Perineuronal Masks: shell from cell edge out to a disk of 2x cell area; also for random cells if present.",
@@ -872,9 +872,11 @@ def build_manual():
 
     pdf.chapter_title("System Requirements", 1)
     pdf.bullet_list([
-        "Windows 10 or later (primary supported platform)",
-        "Python 3.14 recommended (conda env barcc314). Python 3.8+ still runs; 3.12 (legacy env barcc) is a fallback",
-        "At least 8 GB RAM recommended for large images (16 GB+ for very large TIFFs)"
+        "Windows 10 or later (primary supported platform). macOS and Linux work with the same conda environment.",
+        "Miniconda or Anaconda, so you can create the barcc314 environment",
+        "Python 3.14 in that environment. Python 3.12 (legacy env named barcc) is a fallback only.",
+        "At least 8 GB RAM recommended for large images (16 GB+ for very large TIFFs)",
+        "Git, or a web browser to download the ZIP",
     ])
 
     pdf.chapter_title("Image Format and Compatibility Requirements", 1)
@@ -936,43 +938,92 @@ def build_manual():
         "For best accuracy and performance, prepare images as single-channel TIFFs with good contrast between cells and background."
     )
 
-    pdf.chapter_title("Installation Steps", 1)
-    pdf.body("1. Clone the repository:")
+    pdf.chapter_title("Download and start", 1)
+    pdf.body(
+        "BARCC is not a website. Download this repository, create the conda environment once, "
+        "then start Application/barcc.py. These steps match the README section "
+        "\"Download and start using BARCC\"."
+    )
+
+    pdf.chapter_title("1. Download the code", 2)
+    pdf.body("With Git:")
     pdf.set_font("Courier", "", 9)
     pdf.multi_cell(0, 5, "git clone https://github.com/LaingLab/BARCC.git\ncd BARCC")
-    pdf.ln(3)
-
+    pdf.ln(2)
     pdf.set_font("Helvetica", "", 10.5)
-    pdf.body("2. Create the Python 3.14 conda environment (recommended) and install dependencies:")
+    pdf.body(
+        "Without Git: on https://github.com/LaingLab/BARCC choose Code, then Download ZIP, "
+        "or open https://github.com/LaingLab/BARCC/archive/refs/heads/main.zip. "
+        "Unzip it. The folder is named BARCC-main. Work in the folder that contains "
+        "environment.yml, requirements.txt, and Application. "
+        "A frozen 8.10.000 snapshot is the Source code zip on the GitHub release page."
+    )
+
+    pdf.chapter_title("2. Install Miniconda or Anaconda (once per computer)", 2)
+    pdf.body(
+        "Install Miniconda (https://www.anaconda.com/docs/getting-started/miniconda/install) "
+        "or Anaconda (https://www.anaconda.com/download). On Windows, open Anaconda Prompt "
+        "from the Start menu after the installer finishes. Confirm conda is available:"
+    )
+    pdf.set_font("Courier", "", 9)
+    pdf.multi_cell(0, 5, "conda --version")
+    pdf.ln(2)
+
+    pdf.chapter_title("3. Create the BARCC environment (once per computer)", 2)
+    pdf.set_font("Helvetica", "", 10.5)
+    pdf.body("From the downloaded folder:")
     pdf.set_font("Courier", "", 9)
     pdf.multi_cell(
         0,
         5,
         "conda env create -f environment.yml\n"
-        "conda activate barcc314\n"
-        "pip install -r requirements.txt",
+        "conda activate barcc314",
     )
     pdf.ln(2)
-
-    pdf.set_font("Helvetica", "", 10)
-    pdf.body(
-        "environment.yml names the env barcc314 (Python 3.14). Alternatively: "
-        "conda create -n barcc314 python=3.14 pip -y, then activate and pip install -r requirements.txt. "
-        "requirements.txt includes openpyxl and xlsxwriter for Excel export. "
-        "If those engines are missing, Count Cells falls back to CSV."
-    )
-    pdf.ln(2)
-
     pdf.set_font("Helvetica", "", 10.5)
-    pdf.body("3. Launch the application (Windows):")
-    pdf.bullet_list([
-        "Double-click Application/Launch_BARCC.bat (tries barcc314 pythonw, then the legacy barcc 3.12 env, then py -3.14).",
-        "Or double-click Application/BARCC.lnk if you created a shortcut.",
-        "Or from Anaconda Prompt: conda activate barcc314, then cd Application, then python barcc.py.",
-    ])
-    pdf.body("Generic launch:")
+    pdf.body(
+        "The environment is named barcc314 and uses Python 3.14. environment.yml installs "
+        "tkinter, PyMuPDF (atlas PDFs), and openpyxl plus xlsxwriter (Excel). "
+        "If barcc314 already exists, refresh it with: conda activate barcc314, then "
+        "conda env update -f environment.yml --prune. "
+        "Hand-built equivalent: conda create -n barcc314 python=3.14 pip -y, "
+        "conda activate barcc314, pip install -r requirements.txt. "
+        "If the Excel packages are missing, Count Cells falls back to CSV."
+    )
+
+    pdf.chapter_title("4. Start BARCC (every session)", 2)
+    pdf.body("From Anaconda Prompt, this is the reliable launch on a new computer:")
     pdf.set_font("Courier", "", 9)
-    pdf.multi_cell(0, 5, "cd Application\npython barcc.py")
+    pdf.multi_cell(
+        0,
+        5,
+        "conda activate barcc314\n"
+        "cd Application\n"
+        "python barcc.py",
+    )
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "", 10.5)
+    pdf.body(
+        "If you are not already inside the downloaded folder, cd to the full path of Application first. "
+        "The window opens with File, Edit, Atlas, Paint, Cell, and Axons and Nets. "
+        "File > User Manual opens BARCC_User_Manual.pdf from the repository root."
+    )
+    pdf.body(
+        "Application/Launch_BARCC.bat is an optional Windows double-click launcher. "
+        "It checks one developer conda path first, then py -3.14, then python on PATH. "
+        "On a new computer those later interpreters often lack the BARCC packages, so the window does not open. "
+        "Use the Anaconda Prompt commands until you know the bat file is launching the barcc314 environment."
+    )
+
+    pdf.chapter_title("5. First session", 2)
+    pdf.bullet_list([
+        "File > Import Tiff, or double-click a TIFF in the left File Browser. Use a single-channel TIFF.",
+        "Paint > Start Paint, draw, Paint > Stop Paint. Or Atlas > Import Atlas (PDF) / Import Allen Atlas.",
+        "Align an atlas in order: Fit Atlas to Image, Align: Landmarks, Align: Edge Snap (Preview then Apply), Align: Local Refine.",
+        "Click each region and name it.",
+        "Cell > Show Mask, then Cell > Show Mask Settings (Smart Suggest, Area Tune, Measure Tune).",
+        "Cell > Counting > Count Cells. Results are written under output/ (see Chapter 10).",
+    ])
 
     # ------------------------------------------------------------------
     # 3. GETTING STARTED
@@ -1844,15 +1895,45 @@ def build_manual():
 
     pdf.chapter_title("Measure Region Intensities", 1)
     pdf.body(
-        "Measures mean/median (and other stats) of image intensity inside each zone. A dialog asks whether to:"
+        "Axons and Nets > Measure Region Intensities averages every pixel inside each labeled zone "
+        "on the original TIFF. The Edit > Brightness slider and the zoom level change only the display. "
+        "They do not change the numbers. Grayscale is 0.2989 R + 0.5870 G + 0.1140 B."
+    )
+    pdf.body(
+        "Mean and median include the whole region, not just bright axons. A negative-control haze that "
+        "lifts nearly every pixel can score higher than a positive image whose bright fibers cover only "
+        "a small fraction of the zone. Background subtraction removes each region's own floor so the "
+        "remaining mean is signal above that floor."
+    )
+    pdf.body("The dialog offers two corrections. Leave both off and post-correction equals pre-correction:")
+    pdf.bullet_list([
+        "Background subtraction: subtract the Xth-percentile intensity within each region (typical X = 5-20). Stored as Background_Level. Post_Correction is the mean after that subtraction.",
+        "Counterstain normalization: divide by Normalization_Factor from a file produced by Counterstain Normalization Measurement on the same atlas. Corrected mean = (mean - BG) / factor when both options are on.",
+    ])
+
+    pdf.chapter_title("Intensity files", 2)
+    pdf.body(
+        "One workbook is written: output/intensities/{name}_intensities.xlsx. It has a single sheet, "
+        "Region Intensities (zone, area, Pre_Correction and Post_Correction mean/median, background, "
+        "normalization factor, and the detail columns). BARCC does not also write {name}_region_intensity.xlsx. "
+        "Older copies of that name, if present from a previous version, are duplicates and can be ignored."
+    )
+    pdf.body(
+        "The same measurement overwrites the region files, with no extra dialog:"
     )
     pdf.bullet_list([
-        "Background subtraction: subtract the Xth-percentile intensity within each region (typical X = 5-20).",
-        "Counterstain normalization: divide by Normalization_Factor from a file produced by Counterstain Normalization Measurement on the same atlas.",
+        "output/paint/{image}_paint_with_regions.barccpaint (or {image}_paint.png when there are no named regions). This is the same automatic paint save Count Cells uses.",
+        "output/atlas/{stem}_atlas.catlas when an atlas or labeled zones are loaded. A channel suffix such as _ch0 is dropped so channels of one section share one schematic.",
     ])
+
+    pdf.chapter_title("Project intensity workbook", 2)
     pdf.body(
-        "Exports under output/intensities/ as {name}_intensities.xlsx with Pre_Correction_Mean/Median and "
-        "Post_Correction_Mean/Median (and detail columns). Corrected mean = (mean - BG) / factor when both options are on."
+        "If File > Select Project Output Directory is set, the same rows are added to "
+        "{project folder}/{project name}_Intensities.xlsx, sheet Project Intensities. "
+        "Column A is Image (the TIFF filename). Every column after that matches Region Intensities. "
+        "Each zone is its own row. Measuring that TIFF again replaces its rows and leaves other images in place. "
+        "Count Cells still writes {project name}_Counts.xlsx in the same folder. "
+        "If the workbook is open in Excel, BARCC writes a CSV with the same stem."
     )
 
     pdf.chapter_title("Counterstain Normalization Measurement", 1)
@@ -1978,17 +2059,17 @@ def build_manual():
 
     pdf.chapter_title("Combined project spreadsheet", 1)
     pdf.body(
-        "If you used File > Select Project Output Directory, Count Cells also appends this image to:"
+        "If you used File > Select Project Output Directory, Count Cells also appends this image to "
+        "{project folder}/{project name}_Counts.xlsx. Measure Region Intensities appends to "
+        "{project folder}/{project name}_Intensities.xlsx in that same folder."
     )
-    pdf.set_font("Courier", "", 9)
-    pdf.multi_cell(0, 5, "{project folder}/{project name}_Counts.xlsx")
-    pdf.ln(2)
-    pdf.set_font("Helvetica", "", 10.5)
     pdf.body(
         "Sheet \"Project Counts\": first column File, then one column per unique structure name. "
         "Each image is one row. Re-running Count Cells on the same TIFF replaces that row. "
         "New structures seen later in the cohort add columns. "
-        "If the workbook is locked (open in Excel), BARCC writes a CSV with the same stem."
+        "Sheet \"Project Intensities\": first column Image, then the same columns as the per-image "
+        "Region Intensities sheet, one row per zone. Re-measuring a TIFF replaces that image's rows. "
+        "If either workbook is locked (open in Excel), BARCC writes a CSV with the same stem."
     )
     pdf.note_box(
         "Per-image workbooks remain the complete record (parameters + counts). The project spreadsheet is the "
@@ -2020,13 +2101,13 @@ def build_manual():
     )
 
     pdf.bullet_list([
-        "output/counts/ — Count Cells: {name}.xlsx (Cell Counts + Detection Parameters), _masked.tif, centroids CSV, metadata (used by Reload Last Count Session)",
-        "Project workbook — {project folder}/{project name}_Counts.xlsx when Select Project Output Directory was used (cohort table, not under output/counts/)",
-        "output/intensities/ — _intensities.xlsx, _counterstain_norm.xlsx",
+        "output/counts/ — Count Cells: {name}.xlsx (Cell Counts + Detection Parameters), _masked.tif, centroids CSV, metadata (used by Reload Last Count Session). Also overwrites output/paint/{name}_paint_with_regions.barccpaint.",
+        "Project workbooks — {project folder}/{project name}_Counts.xlsx and {project name}_Intensities.xlsx when Select Project Output Directory was used (not under output/).",
+        "output/intensities/ — {name}_intensities.xlsx (one sheet, Region Intensities) and {name}_counterstain_norm.xlsx. Measure Region Intensities also overwrites the paint bundle and {stem}_atlas.catlas.",
         "output/pnn/ — _pnn_by_structure.xlsx, _pnn_cells_true.xlsx, _pnn_cells_random.xlsx",
-        "output/atlas/ — .catlas schematics for multi-channel reuse",
+        "output/atlas/ — .catlas schematics for multi-channel reuse. Measure Region Intensities writes {stem}_atlas.catlas here.",
         "output/cell_masks/ — .barccmask / cellmask PNG; random cell masks (_random_cellmask.png + JSON)",
-        "output/paint/ — paint layers and .barccpaint region bundles (include Dual Settings A/B zone tags when present)",
+        "output/paint/ — paint layers and .barccpaint region bundles (include Dual Settings A/B zone tags when present). Count Cells and Measure Region Intensities overwrite {name}_paint_with_regions.barccpaint.",
         "output/flattened/ — flattened composites (TIFF + zones + paint + cell rings)",
     ])
 
