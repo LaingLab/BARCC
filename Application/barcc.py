@@ -6000,12 +6000,135 @@ class PDFViewer:
         window.title("Mask Settings")
         self._mask_settings_setters = []
 
-        if restore_geometry:
-            window.geometry(restore_geometry)
-
-        # Configure grid layout
+        # Parameter columns are taller than many laptop screens. Keep the
+        # action buttons and Close on screen, and scroll the settings themselves.
         window.columnconfigure(0, weight=1)
-        window.columnconfigure(1, weight=1)
+        window.rowconfigure(1, weight=1)
+        window.minsize(640, 320)
+
+        scroll_host = ttk.Frame(window)
+        scroll_host.grid(row=1, column=0, sticky="nsew")
+        scroll_host.columnconfigure(0, weight=1)
+        scroll_host.rowconfigure(0, weight=1)
+        settings_canvas = tk.Canvas(scroll_host, highlightthickness=0, borderwidth=0)
+        try:
+            canvas_bg = ttk.Style(window).lookup("TFrame", "background")
+            if canvas_bg:
+                settings_canvas.configure(background=canvas_bg)
+        except Exception:
+            pass
+        settings_vscroll = ttk.Scrollbar(
+            scroll_host, orient="vertical", command=settings_canvas.yview
+        )
+        settings_hscroll = ttk.Scrollbar(
+            scroll_host, orient="horizontal", command=settings_canvas.xview
+        )
+        settings_canvas.configure(
+            yscrollcommand=settings_vscroll.set,
+            xscrollcommand=settings_hscroll.set,
+        )
+        settings_canvas.grid(row=0, column=0, sticky="nsew")
+        settings_vscroll.grid(row=0, column=1, sticky="ns")
+        settings_hscroll.grid(row=1, column=0, sticky="ew")
+        body = ttk.Frame(settings_canvas)
+        body_window = settings_canvas.create_window((0, 0), window=body, anchor="nw")
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+
+        def _sync_mask_settings_scroll(_event=None):
+            bbox = settings_canvas.bbox("all")
+            settings_canvas.configure(scrollregion=bbox or (0, 0, 0, 0))
+            if not bbox:
+                return
+            content_h = bbox[3] - bbox[1]
+            content_w = bbox[2] - bbox[0]
+            view_h = settings_canvas.winfo_height()
+            view_w = settings_canvas.winfo_width()
+            # Show a bar only once the matching edge of the settings is cut off.
+            if view_h > 1 and content_h > view_h + 2:
+                settings_vscroll.grid(row=0, column=1, sticky="ns")
+            elif view_h > 1:
+                settings_vscroll.grid_remove()
+            if view_w > 1 and content_w > view_w + 2:
+                settings_hscroll.grid(row=1, column=0, sticky="ew")
+            elif view_w > 1:
+                settings_hscroll.grid_remove()
+
+        def _fit_mask_settings_body(event):
+            try:
+                needed = int(body.winfo_reqwidth())
+            except Exception:
+                needed = event.width
+            settings_canvas.itemconfigure(body_window, width=max(int(event.width), needed))
+            _sync_mask_settings_scroll()
+
+        body.bind("<Configure>", _sync_mask_settings_scroll)
+        settings_canvas.bind("<Configure>", _fit_mask_settings_body)
+
+        def _on_mask_settings_wheel(event):
+            delta = getattr(event, "delta", 0) or 0
+            if delta:
+                steps = int(-delta / 120)
+                if steps == 0:
+                    steps = -1 if delta > 0 else 1
+                if getattr(event, "state", 0) & 0x0001:
+                    settings_canvas.xview_scroll(steps, "units")
+                else:
+                    settings_canvas.yview_scroll(steps, "units")
+            elif getattr(event, "num", None) == 4:
+                settings_canvas.yview_scroll(-1, "units")
+            elif getattr(event, "num", None) == 5:
+                settings_canvas.yview_scroll(1, "units")
+            return "break"
+
+        def _bind_mask_settings_wheel(widget):
+            widget.bind("<MouseWheel>", _on_mask_settings_wheel, add="+")
+            widget.bind("<Button-4>", _on_mask_settings_wheel, add="+")
+            widget.bind("<Button-5>", _on_mask_settings_wheel, add="+")
+            for child in widget.winfo_children():
+                _bind_mask_settings_wheel(child)
+
+        def _fit_mask_settings_window():
+            try:
+                window.update_idletasks()
+                _bind_mask_settings_wheel(window)
+                screen_h = window.winfo_screenheight()
+                screen_w = window.winfo_screenwidth()
+                max_h = max(420, screen_h - 80)
+                max_w = max(760, screen_w - 40)
+                req_w = max(
+                    control_frame.winfo_reqwidth() + 24,
+                    body.winfo_reqwidth() + settings_vscroll.winfo_reqwidth() + 28,
+                )
+                content_h = control_frame.winfo_reqheight() + body.winfo_reqheight() + 56
+                width = min(max(req_w, 760), max_w)
+                height = min(max(content_h, 420), max_h)
+                if restore_geometry:
+                    import re
+                    match = re.match(
+                        r"(\d+)x(\d+)([+-]\d+)([+-]\d+)",
+                        str(restore_geometry).replace(" ", ""),
+                    )
+                    if match:
+                        width = min(int(match.group(1)), max_w)
+                        height = min(int(match.group(2)), max_h)
+                        window.geometry(
+                            f"{width}x{height}{match.group(3)}{match.group(4)}"
+                        )
+                        _sync_mask_settings_scroll()
+                        return
+                window.geometry(f"{int(width)}x{int(height)}")
+                window.update_idletasks()
+                x = max(0, window.winfo_x())
+                y = max(0, window.winfo_y())
+                if y + height > screen_h - 8:
+                    y = max(0, screen_h - int(height) - 8)
+                if x + width > screen_w - 8:
+                    x = max(0, screen_w - int(width) - 8)
+                window.geometry(f"{int(width)}x{int(height)}+{int(x)}+{int(y)}")
+                _sync_mask_settings_scroll()
+            except Exception as e:
+                logger.debug(f"mask settings scroll fit skipped: {e}")
 
         def save_settings():
             try:
@@ -6806,9 +6929,9 @@ class PDFViewer:
                 case _:
                     print('somethings broken', file=sys.stderr)
 
-        # Control buttons at the top
+        # Control buttons at the top (stay visible while the settings scroll)
         control_frame = ttk.Frame(window)
-        control_frame.grid(row=0, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
+        control_frame.grid(row=0, column=0, sticky='ew', padx=5, pady=5)
         ttk.Button(control_frame, text="Save", command=save_settings).grid(row=0, column=0, padx=5)
         ttk.Button(control_frame, text="Load", command=load_settings).grid(row=0, column=1, padx=5)
         def _show_mask_from_settings():
@@ -6968,11 +7091,11 @@ class PDFViewer:
                    command=lambda: [self.import_detection_settings(), window.destroy()]).grid(row=0, column=2, padx=2)
 
         # Create frame for radiobuttons and their options
-        radio_frame = ttk.Frame(window)
-        radio_frame.grid(row=1, column=0, sticky='nwes', padx=5, pady=5)
+        radio_frame = ttk.Frame(body)
+        radio_frame.grid(row=0, column=0, sticky='nwes', padx=5, pady=5)
         # Create frame for rightmost options
-        option_frame = ttk.Frame(window)
-        option_frame.grid(row=1, column=1, sticky='nwes', padx=5, pady=5)
+        option_frame = ttk.Frame(body)
+        option_frame.grid(row=0, column=1, sticky='nwes', padx=5, pady=5)
 
         # Create options frames aligned with radiobuttons, keyword:grid_alignment
         bg_frame = ttk.Frame(radio_frame)
@@ -7097,9 +7220,10 @@ class PDFViewer:
         on_radio_button_change() # To show initial settings
 
 
-        # Close button
+        # Close stays visible; the parameter columns scroll above it.
         close_button = tk.Button(window, text="Close", command=lambda: window.destroy())
-        close_button.grid(row=10, column=1, sticky=tk.SE, padx=5, pady=5)
+        close_button.grid(row=2, column=0, sticky=tk.SE, padx=5, pady=5)
+        window.after_idle(_fit_mask_settings_window)
 
     def _ensure_cell_config_b(self, copy_from_a_if_new=False):
         """Return Config B, optionally seeding it from Config A the first time."""
@@ -26790,13 +26914,14 @@ class PDFViewer:
         if project_path:
             project_note = (
                 "Each run writes a new timestamped master workbook next to:\n"
-                f"{project_path}\n"
-                "The workbook already there is left as it is."
+                f"{os.path.dirname(project_path)}\n"
+                "The confirmation step shows the exact file name. "
+                f"{os.path.basename(project_path)} is left as it is."
             )
         else:
             project_note = (
-                "No project folder is set. Each run writes a new master workbook:\n"
-                "output/intensities/{folder name}_Intensities_YYYYMMDD_HHMMSS.xlsx"
+                "No project folder is set. Each run writes a new master workbook in\n"
+                "output/intensities/. The confirmation step shows the exact timestamped names."
             )
         ttk.Label(frm, text=project_note, justify=tk.LEFT, foreground="gray").grid(
             row=5, column=0, columnspan=3, sticky="w", pady=(8, 4)
@@ -26857,11 +26982,20 @@ class PDFViewer:
             bg_note = (
                 f"background percentile {pct:g}" if pct is not None else "no background subtraction"
             )
+            stamp = self._fresh_batch_intensity_stamp(folder, jobs)
+            example_name = f"{jobs[0][2]}_intensities_{stamp}.xlsx"
+            configured = self._configured_project_intensities_path()
+            if configured:
+                master_stem = os.path.splitext(os.path.basename(configured))[0]
+                master_name = f"{master_stem}_{stamp}.xlsx"
+            else:
+                folder_name = os.path.basename(os.path.normpath(folder)) or "project"
+                master_name = f"{folder_name}_Intensities_{stamp}.xlsx"
             if not messagebox.askyesno(
                 "Batch Recalculate",
-                f"Recalculate {len(jobs)} image(s) with {bg_note}?\n"
-                "Each image is saved as a new file:\n"
-                "{image}_intensities_YYYYMMDD_HHMMSS.xlsx\n"
+                f"Recalculate {len(jobs)} image(s) with {bg_note}?\n\n"
+                f"Each image is saved as a new file, for example:\n{example_name}\n\n"
+                f"Master workbook:\n{master_name}\n\n"
                 "Existing workbooks stay on disk."
                 + skip_note,
                 parent=win,
@@ -26874,6 +27008,7 @@ class PDFViewer:
             result["norm_path"] = norm_path
             result["jobs"] = jobs
             result["missing"] = missing
+            result["stamp"] = stamp
             win.destroy()
 
         def on_cancel():
@@ -26907,7 +27042,7 @@ class PDFViewer:
                 return
 
         jobs = result["jobs"]
-        stamp = self._fresh_batch_intensity_stamp(result["folder"], jobs)
+        stamp = result["stamp"]
         progress = self._show_busy_dialog("Batch Recalculate Intensities")
         ok_rows = []
         failures = []
