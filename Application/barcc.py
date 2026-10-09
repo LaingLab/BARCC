@@ -15907,7 +15907,7 @@ class PDFViewer:
 
         meta = {
             "format_version": 1,
-            "barcc_version": "8.11.000",
+            "barcc_version": "8.11.001",
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "purpose": "Parameters used to generate the cell mask and regional counts",
             "source": {
@@ -16352,7 +16352,7 @@ class PDFViewer:
             config_data = self._collect_mask_generation_metadata()
             # Keep portable settings export compatible with import_detection_settings
             config_data = {
-                "version": config_data.get("barcc_version", "8.11.000"),
+                "version": config_data.get("barcc_version", "8.11.001"),
                 "detection_method": self.image_processor.cell_config.detection_method,
                 "cell_detection": self.image_processor.cell_config.__dict__.copy(),
                 "cell_detection_B": getattr(
@@ -19179,6 +19179,16 @@ class PDFViewer:
                 if real and real.lower() not in seen:
                     intensity_files.append(rel_prefix + real)
                     seen.add(real.lower())
+
+            # Batch recalculation writes {stem}_intensities_YYYYMMDD_HHMMSS.xlsx
+            stamp_prefix = f"{base_l}_intensities_"
+            for f in listing:
+                fl = f.lower()
+                if fl in seen:
+                    continue
+                if fl.startswith(stamp_prefix) and fl.endswith((".xlsx", ".xls", ".csv")):
+                    intensity_files.append(rel_prefix + f)
+                    seen.add(fl)
 
             # Cell masks + atlas schematics (per-channel name and stem without _chN)
             mask_candidates = [
@@ -26265,7 +26275,7 @@ class PDFViewer:
         }, None
 
     def _export_region_intensity_workbook(
-        self, df, meta, out_dir, base_name, *, kind="intensities", quiet=False
+        self, df, meta, out_dir, base_name, *, kind="intensities", quiet=False, file_stamp=None
     ):
         """Write intensity results as multi-sheet .xlsx under output/intensities/.
 
@@ -26273,12 +26283,16 @@ class PDFViewer:
           - ``intensities`` → ``{base}_intensities.xlsx`` sheet Region Intensities
           - ``counterstain_norm`` → ``{base}_counterstain_norm.xlsx`` sheet Counterstain Normalization
 
+        ``file_stamp`` (batch recalculation) writes ``{base}_intensities_{stamp}.xlsx``
+        so a later run does not replace an earlier workbook.
+
         Returns (path, format) where format is 'xlsx' or 'csv', or (None, None) on failure.
         """
         if df is None or df.empty or not out_dir or not base_name:
             return None, None
 
         export_df = self._format_intensity_export_df(df)
+        stamp = str(file_stamp).strip() if file_stamp else ""
         if kind == "counterstain_norm":
             # Lean export focused on factors for later axon normalization
             keep = [
@@ -26301,6 +26315,10 @@ class PDFViewer:
             xlsx_path = os.path.join(out_dir, f"{base_name}_counterstain_norm.xlsx")
             data_sheet = "Counterstain Normalization"
             csv_path = os.path.join(out_dir, f"{base_name}_counterstain_norm.csv")
+        elif stamp:
+            xlsx_path = os.path.join(out_dir, f"{base_name}_intensities_{stamp}.xlsx")
+            data_sheet = "Region Intensities"
+            csv_path = os.path.join(out_dir, f"{base_name}_intensities_{stamp}.csv")
         else:
             xlsx_path = os.path.join(out_dir, f"{base_name}_intensities.xlsx")
             data_sheet = "Region Intensities"
@@ -26622,13 +26640,42 @@ class PDFViewer:
                 missing.append(name)
         return jobs, missing
 
+    def _fresh_batch_intensity_stamp(self, folder, jobs):
+        """One YYYYMMDD_HHMMSS stamp for a batch, chosen so no planned file already exists."""
+        base = datetime.now().strftime("%Y%m%d_%H%M%S")
+        intensities_dir = self._get_output_directory(folder, feature="intensities") or ""
+        project_path = self._configured_project_intensities_path()
+        for n in range(100):
+            stamp = base if n == 0 else f"{base}_{n + 1}"
+            collision = False
+            for _tiff, _paint, stem, _name in jobs:
+                for ext in (".xlsx", ".csv"):
+                    path = os.path.join(intensities_dir, f"{stem}_intensities_{stamp}{ext}")
+                    if os.path.exists(path):
+                        collision = True
+                        break
+                if collision:
+                    break
+            if collision:
+                continue
+            if project_path:
+                master_dir = os.path.dirname(project_path)
+                master_stem = os.path.splitext(os.path.basename(project_path))[0]
+                master = os.path.join(master_dir, f"{master_stem}_{stamp}.xlsx")
+            else:
+                folder_name = os.path.basename(os.path.normpath(folder)) or "project"
+                master = os.path.join(intensities_dir, f"{folder_name}_Intensities_{stamp}.xlsx")
+            if os.path.exists(master) or os.path.exists(os.path.splitext(master)[0] + ".csv"):
+                continue
+            return stamp
+        return f"{base}_{datetime.now().strftime('%f')}"
+
     def batch_recalculate_intensities(self):
         """Re-measure every TIFF that already has a paint bundle, without opening them.
 
         Uses output/paint/{image}_paint_with_regions.barccpaint for the regions.
-        Rewrites each {image}_intensities.xlsx and, when a project folder is set,
-        updates {project}_Intensities.xlsx. Otherwise writes a master workbook in
-        output/intensities/.
+        Writes a new {image}_intensities_YYYYMMDD_HHMMSS.xlsx for each image and a
+        new timestamped master workbook. Earlier intensity workbooks stay on disk.
         """
         prefs = getattr(self, "_intensity_corr_prefs", {}) or {}
         default_folder = ""
@@ -26741,11 +26788,15 @@ class PDFViewer:
 
         project_path = self._configured_project_intensities_path()
         if project_path:
-            project_note = f"Project workbook updated:\n{project_path}"
+            project_note = (
+                "Each run writes a new timestamped master workbook next to:\n"
+                f"{project_path}\n"
+                "The workbook already there is left as it is."
+            )
         else:
             project_note = (
-                "No project folder is set. A master workbook will be written to\n"
-                "output/intensities/{folder name}_Intensities.xlsx"
+                "No project folder is set. Each run writes a new master workbook:\n"
+                "output/intensities/{folder name}_Intensities_YYYYMMDD_HHMMSS.xlsx"
             )
         ttk.Label(frm, text=project_note, justify=tk.LEFT, foreground="gray").grid(
             row=5, column=0, columnspan=3, sticky="w", pady=(8, 4)
@@ -26809,7 +26860,9 @@ class PDFViewer:
             if not messagebox.askyesno(
                 "Batch Recalculate",
                 f"Recalculate {len(jobs)} image(s) with {bg_note}?\n"
-                "Each image's intensity workbook will be overwritten."
+                "Each image is saved as a new file:\n"
+                "{image}_intensities_YYYYMMDD_HHMMSS.xlsx\n"
+                "Existing workbooks stay on disk."
                 + skip_note,
                 parent=win,
             ):
@@ -26854,6 +26907,7 @@ class PDFViewer:
                 return
 
         jobs = result["jobs"]
+        stamp = self._fresh_batch_intensity_stamp(result["folder"], jobs)
         progress = self._show_busy_dialog("Batch Recalculate Intensities")
         ok_rows = []
         failures = []
@@ -26892,7 +26946,13 @@ class PDFViewer:
                         os.path.dirname(tiff_path), feature="intensities"
                     )
                     saved, _fmt = self._export_region_intensity_workbook(
-                        df, meta, out_dir, stem, kind="intensities", quiet=True
+                        df,
+                        meta,
+                        out_dir,
+                        stem,
+                        kind="intensities",
+                        quiet=True,
+                        file_stamp=stamp,
                     )
                     if not saved:
                         failures.append(f"{image_name}: could not write the intensity workbook")
@@ -26901,29 +26961,35 @@ class PDFViewer:
                     stamped = export_df.copy()
                     stamped.insert(0, "Image", image_name)
                     ok_rows.append(stamped)
-                    if self._configured_project_intensities_path():
-                        try:
-                            self._append_intensities_to_project_spreadsheet(
-                                export_df, image_name=image_name
-                            )
-                        except Exception as e:
-                            logger.error(
-                                f"Project intensity update failed for {image_name}: {e}"
-                            )
-                            if not any(str(x).startswith("Project workbook:") for x in failures):
-                                failures.append(f"Project workbook: {e}")
                 except Exception as e:
                     logger.error(f"Batch intensity failed for {image_name}: {e}", exc_info=True)
                     failures.append(f"{image_name}: {e}")
-            if ok_rows and not self._configured_project_intensities_path():
-                intensities_dir = self._get_output_directory(result["folder"], feature="intensities")
-                folder_name = os.path.basename(os.path.normpath(result["folder"])) or "project"
-                master_path = os.path.join(intensities_dir, f"{folder_name}_Intensities.xlsx")
+            if ok_rows:
                 combined = pd.concat(ok_rows, ignore_index=True)
-                written, _fmt = self._write_project_intensities_df(master_path, combined)
-                master_path = written
-            elif ok_rows:
-                master_path = self._configured_project_intensities_path()
+                project_path = self._configured_project_intensities_path()
+                if project_path:
+                    master_dir = os.path.dirname(project_path)
+                    master_stem = os.path.splitext(os.path.basename(project_path))[0]
+                    try:
+                        os.makedirs(master_dir, exist_ok=True)
+                    except Exception as e:
+                        logger.warning(f"Could not create project output directory {master_dir}: {e}")
+                    master_path = os.path.join(master_dir, f"{master_stem}_{stamp}.xlsx")
+                else:
+                    intensities_dir = self._get_output_directory(
+                        result["folder"], feature="intensities"
+                    )
+                    folder_name = os.path.basename(os.path.normpath(result["folder"])) or "project"
+                    master_path = os.path.join(
+                        intensities_dir, f"{folder_name}_Intensities_{stamp}.xlsx"
+                    )
+                try:
+                    written, _fmt = self._write_project_intensities_df(master_path, combined)
+                    master_path = written
+                except Exception as e:
+                    logger.error(f"Batch master workbook failed: {e}", exc_info=True)
+                    failures.append(f"Master workbook: {e}")
+                    master_path = None
         finally:
             try:
                 progress.set_progress(100, "Done")
@@ -26938,6 +27004,8 @@ class PDFViewer:
                 pass
 
         lines = [f"Recalculated {len(ok_rows)} of {len(jobs)} image(s)."]
+        lines.append(f"\nSaved as new files with timestamp {stamp}.")
+        lines.append("Existing workbooks were left in place.")
         if master_path:
             lines.append(f"\nMaster workbook:\n{master_path}")
         if result["missing"]:

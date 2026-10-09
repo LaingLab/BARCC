@@ -22,7 +22,7 @@ import os
 # ============================================================================
 MANUAL_TITLE = "BARCC - Brain Atlas Regional Cell Counter"
 MANUAL_SUBTITLE = "User Manual"
-VERSION = "8.11.000"
+VERSION = "8.11.001"
 OUTPUT_FILENAME = "BARCC_User_Manual.pdf"
 OUTPUT_DIR = ".."  # Place PDF in repository root
 # Figures for workflows (relative to this script's directory)
@@ -409,8 +409,10 @@ def build_manual():
         "Manual add/remove/split; Show Cell Mask toggle; save/load cell masks across channels",
         "Random null cell distributions (optionally stratified by atlas region)",
         "Axons and Nets: regional intensity with background subtraction and counterstain normalization",
+        "Batch Recalculate Intensities: change the background percentile for every painted TIFF in a folder without opening each image. Each run writes new timestamped workbooks",
         "Perineuronal (PNN) shells (2x cell area) and intensity export (true + random)",
-        "Count Cells writes per-image Excel plus an optional combined project spreadsheet ({name}_Counts.xlsx)",
+        "Count Cells and Measure Region Intensities write per-image Excel plus optional project workbooks ({name}_Counts.xlsx and {name}_Intensities.xlsx)",
+        "File > Update fast-forwards a Git clone from GitHub",
     ])
 
     pdf.note_box(
@@ -420,7 +422,23 @@ def build_manual():
     )
 
     # ------------------------------------------------------------------
-    # What's New — 8.11.000 (current)
+    # What's New — 8.11.001 (current)
+    # ------------------------------------------------------------------
+    pdf.chapter_title("What's New in Version 8.11.001", 0)
+
+    pdf.body(
+        "BARCC 8.11.001 keeps every batch intensity run. Recalculation writes new files "
+        "with the date and time in the name. Earlier workbooks stay on disk."
+    )
+    pdf.bullet_list([
+        "Axons and Nets > Batch Recalculate Intensities writes output/intensities/{image}_intensities_YYYYMMDD_HHMMSS.xlsx for each TIFF. One timestamp is shared by every file from that run.",
+        "The same run writes a new master workbook. With a project folder set, that file is {project folder}/{project name}_Intensities_YYYYMMDD_HHMMSS.xlsx. Otherwise it is output/intensities/{folder name}_Intensities_YYYYMMDD_HHMMSS.xlsx.",
+        "The existing {project name}_Intensities.xlsx and the untimestamped {image}_intensities.xlsx from Measure Region Intensities are left in place.",
+        "Measure Region Intensities still updates those untimestamped files when you measure one open image.",
+    ])
+
+    # ------------------------------------------------------------------
+    # What's New — 8.11.000
     # ------------------------------------------------------------------
     pdf.chapter_title("What's New in Version 8.11.000", 0)
 
@@ -430,8 +448,7 @@ def build_manual():
     )
     pdf.bullet_list([
         "File > Update checks GitHub and fast-forwards a copy installed with git clone. Close BARCC and open it again afterward. A Download ZIP copy has no .git folder, so clone once and use that folder.",
-        "Axons and Nets > Batch Recalculate Intensities remeasures every TIFF in a folder that already has output/paint/{image}_paint_with_regions.barccpaint, without opening each image. Set the background percentile and run again.",
-        "Batch recalculation overwrites each output/intensities/{image}_intensities.xlsx. With a project folder set, it updates {project}_Intensities.xlsx. Otherwise it writes output/intensities/{folder name}_Intensities.xlsx.",
+        "Axons and Nets > Batch Recalculate Intensities remeasures every TIFF in a folder that already has output/paint/{image}_paint_with_regions.barccpaint, without opening each image. Set the background percentile and run again. Version 8.11.001 saves each run under a new timestamp.",
         "Measure Region Intensities writes one workbook and one sheet (Region Intensities). It no longer also writes {image}_region_intensity.xlsx.",
         "The same measurement overwrites the paint bundle and, when an atlas or labeled zones are loaded, output/atlas/{stem}_atlas.catlas.",
         "Edit > Brightness and zoom do not change intensity numbers. The mean includes every pixel in the region, so a uniform haze can outscore sparse axons until background subtraction is on.",
@@ -974,7 +991,7 @@ def build_manual():
         "or open https://github.com/LaingLab/BARCC/archive/refs/heads/main.zip. "
         "Unzip it. The folder is named BARCC-main. Work in the folder that contains "
         "environment.yml, requirements.txt, and Application. "
-        "A frozen 8.11.000 snapshot is the Source code zip on the GitHub release page."
+        "A frozen 8.11.001 snapshot is the Source code zip on the GitHub release page."
     )
 
     pdf.chapter_title("2. Install Miniconda or Anaconda (once per computer)", 2)
@@ -1110,7 +1127,7 @@ def build_manual():
         "File, Edit, Atlas, Paint, Cell, Axons and Nets, View, and related menus provide access to all features. "
         "The former Mask menu is now Cell (detection, mask edit, cell masks, Count Cells, Reload Last Count Session). "
         "Atlas includes Import, Fit, Landmarks, Edge Snap, Local Refine, schematic save/load, and per-region tools. "
-        "File includes Select Project Output Directory and Next Channel. "
+        "File includes Select Project Output Directory, Update, and Next Channel. "
         "View includes Show Atlas Manager Ribbon and Show Cell Mask. "
         "Many operations open auxiliary dialogs for parameter adjustment."
     )
@@ -1159,25 +1176,35 @@ def build_manual():
 
     pdf.chapter_title("Select Project Output Directory", 1)
     pdf.body(
-        "File > Select Project Output Directory chooses where the combined project counts spreadsheet is written. "
-        "BARCC prompts for a folder, then a project name. The workbook is:"
+        "File > Select Project Output Directory chooses where the combined project workbooks are written. "
+        "BARCC prompts for a folder, then a project name. Two workbooks share that folder:"
     )
-    pdf.set_font("Courier", "", 9)
-    pdf.multi_cell(0, 5, "{folder}/{project name}_Counts.xlsx")
-    pdf.ln(2)
-    pdf.set_font("Helvetica", "", 10.5)
+    pdf.bullet_list([
+        "{folder}/{project name}_Counts.xlsx — sheet Project Counts. Column File, then one column per structure. Each image is one row. Count Cells replaces that image's row.",
+        "{folder}/{project name}_Intensities.xlsx — sheet Project Intensities. Column Image, then the same columns as the per-image Region Intensities sheet. Each zone is one row. Measure Region Intensities replaces that image's rows. Batch Recalculate Intensities leaves this file in place and writes {project name}_Intensities_YYYYMMDD_HHMMSS.xlsx beside it.",
+    ])
     pdf.body(
-        "Sheet name: \"Project Counts\". Row 1 is File plus unique structure names; each later row is one image. "
-        "Count Cells appends or updates the current TIFF's row (re-counting the same file replaces that row; "
-        "new structures add columns, never duplicates). Per-image files under output/counts/ are still written. "
-        "If the combined .xlsx is open in Excel, BARCC writes a CSV next to it instead. "
+        "Per-image files under output/counts/ and output/intensities/ are still written. "
+        "If a combined .xlsx is open in Excel, BARCC writes a CSV next to it instead. "
         "The choice is remembered in UI prefs (~/.barc/)."
     )
     pdf.note_box(
-        "Set the project directory once at the start of a cohort. Then Count Cells on each TIFF (or walk Next Uncounted) "
-        "and open the combined workbook when the folder is done. Do not keep the .xlsx open in Excel while counting "
-        "if you want live xlsx updates."
+        "Set the project directory once at the start of a cohort. Then Count Cells or measure intensities on each TIFF. "
+        "Do not keep the .xlsx open in Excel while BARCC is writing it."
     )
+
+    pdf.chapter_title("Update", 1)
+    pdf.body(
+        "File > Update checks GitHub and downloads newer program files when this BARCC folder was created with git clone. "
+        "A short dialog says either that you are already up to date, or lists the new commits and tells you to close BARCC and open it again. "
+        "The copy that is running does not reload itself."
+    )
+    pdf.bullet_list([
+        "Images, output folders, and project workbooks are not inside the program folder, so an update does not replace them.",
+        "If environment.yml or requirements.txt changed, the dialog tells you to run conda env update -f environment.yml --prune in the barcc314 environment.",
+        "Edits you made inside the BARCC folder are listed first. Confirm only if you still want those files updated. Local commits are not merged.",
+        "A folder that came from Download ZIP has no .git directory. File > Update cannot change that copy. Clone the repository once and use that folder afterward.",
+    ])
 
     pdf.chapter_title("File Browser (Left Pane)", 1)
     pdf.body(
@@ -1447,8 +1474,9 @@ def build_manual():
 
     pdf.chapter_title("Brightness & Contrast Adjustments", 1)
     pdf.body(
-        "The atlas rendering can be lightened or darkened independently of the experimental image "
-        "to improve visibility of boundaries during alignment."
+        "Edit > Brightness lightens or darkens the image on screen so dim signal is easier to see while you draw regions. "
+        "That slider, and the zoom level, do not change cell counts or axon intensity numbers. "
+        "Measurements use the TIFF as loaded, not the brightened display."
     )
 
     pdf.note_box(
@@ -1965,14 +1993,30 @@ def build_manual():
         "Column A is Image (the TIFF filename). Every column after that matches Region Intensities. "
         "Each zone is its own row. Measuring that TIFF again replaces its rows and leaves other images in place. "
         "Count Cells still writes {project name}_Counts.xlsx in the same folder. "
-        "If the workbook is open in Excel, BARCC writes a CSV with the same stem."
+        "If the workbook is open in Excel, BARCC writes a CSV with the same stem. "
+        "Batch Recalculate Intensities does not change this workbook. It writes a new timestamped master beside it."
     )
+    pdf.chapter_title("Batch Recalculate Intensities", 1)
     pdf.body(
-        "Axons and Nets > Batch Recalculate Intensities remeasures every TIFF in a folder that already has "
-        "output/paint/{image}_paint_with_regions.barccpaint, without opening each image. "
-        "Change the background percentile (and, optionally, the counterstain file) and run it again. "
-        "Each per-image workbook is overwritten. When a project folder is set, {project}_Intensities.xlsx "
-        "is updated. Otherwise BARCC writes output/intensities/{folder name}_Intensities.xlsx."
+        "Use this when a folder of TIFFs already has paint files and you want a new background percentile "
+        "(or a new counterstain file) for the whole set. You do not open each image. "
+        "Each run writes new files. Earlier intensity workbooks stay on disk, so you can compare percentiles."
+    )
+    pdf.body("Axons and Nets > Batch Recalculate Intensities:")
+    pdf.bullet_list([
+        "TIFF folder: the folder that contains the images. The File Browser folder is filled in when one is open. Paint files must already be at output/paint/{image}_paint_with_regions.barccpaint (written by Measure Region Intensities or Count Cells).",
+        "Background subtraction is on by default. Type a new percentile (typical 5-20) and click Recalculate. Uncheck it to store the raw regional mean.",
+        "Counterstain normalization is optional. Browse to a workbook from Counterstain Normalization Measurement.",
+        "BARCC lists how many images will run, and which TIFFs have no paint file. Those are skipped.",
+        "Each image is saved as output/intensities/{image}_intensities_YYYYMMDD_HHMMSS.xlsx. Every file from one run shares the same timestamp. Regions come from that image's paint file, registered to the TIFF the same way a single measurement does.",
+        "The untimestamped {image}_intensities.xlsx from Measure Region Intensities is left in place.",
+        "If File > Select Project Output Directory is set, BARCC writes {project folder}/{project name}_Intensities_YYYYMMDD_HHMMSS.xlsx and leaves {project name}_Intensities.xlsx unchanged. If it is not set, BARCC writes output/intensities/{folder name}_Intensities_YYYYMMDD_HHMMSS.xlsx.",
+        "The File Browser lists the timestamped workbooks under the TIFF.",
+    ])
+    pdf.note_box(
+        "Run Measure Region Intensities or Count Cells once on each image so the paint file exists. "
+        "After that, change only the percentile and run Batch Recalculate Intensities again. "
+        "Each run adds a new set of files. It does not replace the previous run."
     )
 
     pdf.chapter_title("Counterstain Normalization Measurement", 1)
@@ -2142,7 +2186,7 @@ def build_manual():
     pdf.bullet_list([
         "output/counts/ — Count Cells: {name}.xlsx (Cell Counts + Detection Parameters), _masked.tif, centroids CSV, metadata (used by Reload Last Count Session). Also overwrites output/paint/{name}_paint_with_regions.barccpaint.",
         "Project workbooks — {project folder}/{project name}_Counts.xlsx and {project name}_Intensities.xlsx when Select Project Output Directory was used (not under output/).",
-        "output/intensities/ — {name}_intensities.xlsx (one sheet, Region Intensities) and {name}_counterstain_norm.xlsx. Measure Region Intensities also overwrites the paint bundle and {stem}_atlas.catlas.",
+        "output/intensities/ — {name}_intensities.xlsx (one sheet, Region Intensities) from Measure Region Intensities, plus {name}_intensities_YYYYMMDD_HHMMSS.xlsx from each Batch Recalculate Intensities run, and {name}_counterstain_norm.xlsx. Measure Region Intensities also overwrites the paint bundle and {stem}_atlas.catlas.",
         "output/pnn/ — _pnn_by_structure.xlsx, _pnn_cells_true.xlsx, _pnn_cells_random.xlsx",
         "output/atlas/ — .catlas schematics for multi-channel reuse. Measure Region Intensities writes {stem}_atlas.catlas here.",
         "output/cell_masks/ — .barccmask / cellmask PNG; random cell masks (_random_cellmask.png + JSON)",
@@ -2193,6 +2237,9 @@ def build_manual():
     pdf.body("- Count Cells re-detects after Load Cell Mask or Reload Last Count: mask is locked until Cell > Show Mask recalculates.")
     pdf.body("- Random cells not in counts: By design — only the ground-truth cell mask is counted.")
     pdf.body("- Combined project xlsx not updating: set File > Select Project Output Directory; close the workbook in Excel if it is locked (CSV fallback).")
+    pdf.body("- Negative control intensity is higher than the positive: the mean includes every pixel. A haze across the region outscores sparse axons. Turn on background subtraction (percentile about 10), or use Batch Recalculate Intensities to rerun the folder.")
+    pdf.body("- Batch Recalculate finds no images: the TIFFs and output/paint/ must be in the folder you selected. The paint file name is {image}_paint_with_regions.barccpaint.")
+    pdf.body("- File > Update says this copy cannot update: the folder came from Download ZIP. Clone with git once, then use File > Update in that folder. After an update, close BARCC and open it again.")
     pdf.body("- Excel not written: pip install openpyxl xlsxwriter; check output/<feature>/ is writable.")
     pdf.body("- Count Cells crashes: Use v8.06+ (TIFF deflate fix); open TIFF after the window is laid out.")
     pdf.body("- Performance is slow: Close other apps; large frames use viewer downscale — 16 GB+ RAM helps. Adaptive dual-pass on huge TIFFs is heavier than a single Blob pass.")

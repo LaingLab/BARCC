@@ -21,7 +21,7 @@ https://github.com/LaingLab/BARCC/archive/refs/heads/main.zip
 
 Unzip it. The folder is named `BARCC-main`. Open a terminal in that folder (the one that contains `environment.yml`, `requirements.txt`, and the `Application` folder).
 
-A frozen snapshot of release 8.11.000 is at https://github.com/LaingLab/BARCC/releases/tag/v8.11.000 (Source code zip). Use `main` if you want the latest documentation.
+A frozen snapshot of release 8.11.001 is at https://github.com/LaingLab/BARCC/releases/tag/v8.11.001 (Source code zip). Use `main` if you want the latest documentation.
 
 ### 2. Install Miniconda or Anaconda (once per computer)
 
@@ -102,7 +102,11 @@ The longer click-by-click workflow is in [Basic Usage](#basic-usage) below and i
 - **Count Cells writes a `.csv` instead of `.xlsx`.** `pip install "openpyxl>=3.0.10" "xlsxwriter>=3.0.0"`.
 - **Images fail to load.** Use an uncompressed or lossless TIFF. JPEG is not supported.
 
-**v8.11.000 Highlights** (current)
+**v8.11.001 Highlights** (current)
+- **Timestamped batch intensity files**: Batch Recalculate Intensities writes `output/intensities/{image}_intensities_YYYYMMDD_HHMMSS.xlsx` and a new master `{name}_Intensities_YYYYMMDD_HHMMSS.xlsx`. Earlier workbooks stay on disk.
+- Version: **8.11.001**. See [release-notes-v8.11.001.md](release-notes-v8.11.001.md).
+
+**v8.11.000 Highlights**
 - **File → Update**: checks GitHub and fast-forwards a Git clone. Close and reopen BARCC afterward.
 - **Batch Recalculate Intensities**: Axons and Nets remeasures every TIFF that already has a paint file, without opening each image. Change the background percentile and run again.
 - **One intensity workbook**: `output/intensities/{image}_intensities.xlsx` (sheet Region Intensities only). Measuring also overwrites the paint bundle and `{stem}_atlas.catlas`.
